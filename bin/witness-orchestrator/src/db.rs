@@ -370,6 +370,21 @@ impl Db {
             .map(|v| v as u64)
     }
 
+    /// `MAX(block_number)` across `block_responses` rows. Used at startup to
+    /// seed `orchestrator_tip` so that responses persisted in a prior run
+    /// (which the steady-state feeder will skip via cache-hit, bypassing the
+    /// per-block tip advance in `handle_block_result`) are accounted for in
+    /// the initial tip.
+    pub(crate) fn highest_responded_block(&self) -> Option<u64> {
+        self.conn
+            .query_row("SELECT MAX(block_number) FROM block_responses", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .ok()
+            .flatten()
+            .map(|v| v as u64)
+    }
+
     /// `MAX(nonce) + 1` across all batches that have a recorded nonce — the
     /// floor for the `NonceAllocator` bootstrap on startup.
     pub(crate) fn stored_nonce_floor(&self) -> Option<u64> {

@@ -181,8 +181,6 @@ async fn main() -> eyre::Result<()> {
         std::env::var("L1_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
     let l2_safe_blocks: u64 =
         std::env::var("L2_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let max_lookahead_blocks: u64 =
-        std::env::var("MAX_LOOKAHEAD_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
 
     // Optional destructive knob. Hard error on malformed value so a typo does
     // not silently skip the unwind (operator would then believe it ran).
@@ -445,31 +443,36 @@ async fn main() -> eyre::Result<()> {
     //
     // Priority:
     //   1. Explicit `UNWIND_TO_BLOCK` env — operator override, always wins.
-    //   2. Auto-align to SQLite checkpoint — triggered when `orchestrator_checkpoint < mdbx_tip`,
-    //   so MDBX never retains blocks past the last orchestrator-confirmed watermark. Rolls MDBX
-    //   back to `orchestrator_checkpoint` (reth-CLI semantic: target is `orchestrator_checkpoint
-    //   + 1`, so the checkpoint block itself is kept and everything above is dropped).
+    //   2. Cold-aware auto-align — unwind to `cold_last` when cold trails
+    //   MDBX. The re-witness branch falls through to `execute_exex_with_block`
+    //   on cold-miss, whose multiproof construction is OOM-prone at depth, so
+    //   we keep re-witness on the cold-hit path and let the fresh-tip path
+    //   rebuild below `cold_last` (allocation-bounded per block).
     let unwind_target: Option<u64> = if let Some(t) = unwind_to_block {
         Some(t)
-    } else if orchestrator_checkpoint > 0 {
+    } else {
         let mdbx_tip = factory
             .best_block_number()
             .map_err(|e| eyre::eyre!("startup best_block_number: {e}"))?;
-        if orchestrator_checkpoint < mdbx_tip {
+        let cold_last = hub
+            .last_committed_block()
+            .map_err(|e| eyre::eyre!("startup hub.last_committed_block: {e}"))?
+            .unwrap_or(0);
+        if mdbx_tip > cold_last {
             info!(
-                orchestrator_checkpoint,
-                mdbx_tip, "MDBX ahead of SQLite checkpoint — auto-unwind to checkpoint"
+                cold_last,
+                mdbx_tip,
+                gap = mdbx_tip - cold_last,
+                "Cold trails MDBX — auto-unwind to cold_last to keep re-witness on cold-hit path"
             );
-            Some(orchestrator_checkpoint)
+            Some(cold_last)
         } else {
             None
         }
-    } else {
-        None
     };
 
     if let Some(target) = unwind_target {
-        if target < orchestrator_checkpoint {
+        if unwind_to_block.is_some() && target < orchestrator_checkpoint {
             tracing::warn!(
                 target,
                 orchestrator_checkpoint,
@@ -515,7 +518,6 @@ async fn main() -> eyre::Result<()> {
             witness_from_block,
             orchestrator_checkpoint,
             l2_safe_blocks,
-            max_lookahead_blocks,
         })
         .expect("Driver::new failed"),
     );
@@ -571,16 +573,13 @@ async fn main() -> eyre::Result<()> {
         on_chain_program_vkey,
     };
 
-    // Spawn the driver's autonomous background loop into the top-level JoinSet.
-    // It produces witnesses into `WitnessHub` up to the `max_lookahead_blocks`
-    // cap beyond the shared `orchestrator_tip` — decoupled from the feeder so
-    // proxy back-pressure never idles MDBX.
+    // Driver background loop is decoupled from the feeder so proxy
+    // back-pressure never idles MDBX.
     {
         let driver = Arc::clone(&driver);
-        let tip = Arc::clone(&orchestrator_tip);
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
-            let r = driver.run_background_loop(tip, shutdown).await;
+            let r = driver.run_background_loop(shutdown).await;
             ("driver_loop", r)
         });
     }

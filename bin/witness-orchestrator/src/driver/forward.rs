@@ -282,11 +282,6 @@ pub(crate) struct DriverConfig {
     /// `advance_to_witness_from_block` and the background loop as
     /// `remote_tip.saturating_sub(l2_safe_blocks)`.
     pub l2_safe_blocks: u64,
-    /// Maximum number of blocks the background loop may run ahead of the
-    /// orchestrator's shared watermark. When `state.next - orchestrator_tip`
-    /// exceeds `max_lookahead_blocks`, the loop sleeps until the orchestrator
-    /// catches up — keeps cold-store retention and memory pressure bounded.
-    pub max_lookahead_blocks: u64,
 }
 
 /// A block fetched from RPC together with the time it took to pull.
@@ -329,7 +324,6 @@ pub(crate) struct Driver {
     /// here while another call is in flight (MDBX writable txn is single-writer).
     state: AsyncMutex<DriverState>,
     l2_safe_blocks: u64,
-    max_lookahead_blocks: u64,
 }
 
 struct DriverState {
@@ -421,7 +415,6 @@ impl Driver {
             ready: AtomicBool::new(false),
             state: AsyncMutex::new(DriverState { next, pruner: cfg.pruner }),
             l2_safe_blocks: cfg.l2_safe_blocks,
-            max_lookahead_blocks: cfg.max_lookahead_blocks,
         })
     }
 
@@ -623,18 +616,18 @@ impl Driver {
     }
 
     /// Run the autonomous forward-sync loop until `shutdown` fires. Waits for
-    /// `advance_to_witness_from_block` to flip `ready`, then repeatedly:
-    /// (a) checks the shared `orchestrator_tip` lookahead gate, sleeping when
-    /// too far ahead; (b) produces the next witness (re-witness branch for
-    /// `state.next <= start_tip`, tip-following branch above); (c) pushes the
-    /// payload into `WitnessHub`. Consumers read from the hub directly.
+    /// `advance_to_witness_from_block` to flip `ready`, then repeatedly produces
+    /// the next witness (re-witness branch for `state.next <= start_tip`,
+    /// tip-following branch above) and pushes the payload into `WitnessHub`.
+    /// Production is bounded by the live L2 chain via
+    /// `remote_tip - l2_safe_blocks` inside the tip-following branch; consumers
+    /// read from the hub directly.
     ///
     /// Returns `Err(_)` only on an unrecoverable MDBX / witness-build / hub
     /// push failure — the caller should cancel the root shutdown token on
     /// that signal.
     pub(crate) async fn run_background_loop(
         self: Arc<Self>,
-        orchestrator_tip: Arc<std::sync::atomic::AtomicU64>,
         shutdown: CancellationToken,
     ) -> eyre::Result<()> {
         // Wait for one-shot catch-up to flip `ready`. Short poll interval so
@@ -655,32 +648,8 @@ impl Driver {
                 return Ok(());
             }
 
-            // Lookahead gate: don't run more than `max_lookahead_blocks`
-            // ahead of the orchestrator's published watermark. `state.next`
-            // is the block we're about to produce, so the comparison
-            // quantifies "blocks already produced above the watermark".
-            let (next_snapshot, ahead) = {
-                let s = self.state.lock().await;
-                let tip = orchestrator_tip.load(Ordering::Relaxed);
-                (s.next, s.next.saturating_sub(tip).saturating_sub(1))
-            };
-            if ahead > self.max_lookahead_blocks {
-                tracing::debug!(
-                    next = next_snapshot,
-                    orchestrator_tip = orchestrator_tip.load(Ordering::Relaxed),
-                    max_lookahead_blocks = self.max_lookahead_blocks,
-                    "Driver loop: at lookahead cap — sleeping"
-                );
-                tokio::select! {
-                    _ = shutdown.cancelled() => return Ok(()),
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => continue,
-                }
-            }
-
             match self.produce_next_witness(&shutdown).await? {
-                Produced::Pushed => {
-                    // Continue immediately — next iteration will check gate.
-                }
+                Produced::Pushed => {}
                 Produced::Idle => {
                     tokio::select! {
                         _ = shutdown.cancelled() => return Ok(()),

@@ -491,11 +491,17 @@ impl Orchestrator {
             .expect("NonceAllocator bootstrap failed — L1 RPC unreachable at startup"),
         );
 
-        let target_tip = initial_checkpoint.max(initial_last_batch_end.unwrap_or(0));
+        let highest_responded: Option<u64> = {
+            let g = db.lock().unwrap_or_else(|e| e.into_inner());
+            g.highest_responded_block()
+        };
+
+        let target_tip = initial_checkpoint
+            .max(initial_last_batch_end.unwrap_or(0))
+            .max(highest_responded.unwrap_or(0));
         if target_tip > orchestrator_tip.load(Ordering::Relaxed) {
             orchestrator_tip.store(target_tip, Ordering::Relaxed);
         }
-        let _ = initial_last_batch_end;
 
         let shared = Arc::new(OrchestratorShared {
             config,
