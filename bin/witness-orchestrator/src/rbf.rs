@@ -4,8 +4,8 @@
 //! Layout:
 //! - [`run`] — entry point called by the dispatcher worker.
 //! - [`preflight`] — on-chain status check that decides whether to broadcast.
-//! - [`build_template`] / [`initial_fees`] — set up nonce, calldata, EIP-1559 fees for the first
-//!   iteration of the bump loop.
+//! - [`prepare_partial`] / [`estimate_initial_fees_fresh`] — set up calldata, gas-limit, EIP-1559
+//!   fees BEFORE allocating a nonce (defer-allocate ordering).
 //! - [`bump_loop`] — broadcast → sleep+poll → bump → broadcast cycle.
 //! - [`try_broadcast`] / [`poll_for_terminal`] — extracted phases of the loop.
 //! - [`handle_submitted`] / [`handle_reverted`] / [`handle_failed_then_undispatch`] — terminal
@@ -17,8 +17,8 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
 use alloy_provider::Provider;
 use l1_rollup_client::{
-    batch_status, broadcast_rollup_tx, build_preconfirm_tx, find_batch_preconfirm_event,
-    get_batch_on_chain, is_nonce_too_low_error, RollupTxTemplate,
+    batch_status, broadcast_rollup_tx, find_batch_preconfirm_event, get_batch_on_chain,
+    is_nonce_too_low_error, prepare_preconfirm_tx, RollupTxPartial, RollupTxTemplate,
 };
 use tracing::{error, info, warn};
 
@@ -211,22 +211,45 @@ pub(crate) async fn run(
         return;
     }
 
-    let nonce = match &resume {
-        Some(r) => r.nonce,
-        None => shared.nonce_allocator.allocate(),
-    };
-    let is_resume = resume.is_some();
+    if let Some(resume) = resume {
+        // Resume path — nonce was allocated in a prior process and persisted.
+        // Re-run prepare (estimate_gas etc.) but skip allocation entirely.
+        let Some(partial) = prepare_partial(shared, batch_index, signature, backoff).await else {
+            return;
+        };
+        let template = partial.with_nonce(resume.nonce);
+        let observer = PreconfirmObserver::new(shared, batch_index, resume.nonce);
+        run_generic(
+            shared,
+            batch_index,
+            &template,
+            resume.nonce,
+            Some(resume),
+            resume.max_fee_per_gas,
+            resume.max_priority_fee_per_gas,
+            STUCK_AT_CAP_TIMEOUT,
+            &observer,
+            backoff,
+        )
+        .await;
+        return;
+    }
 
-    let Some(template) =
-        build_template(shared, batch_index, signature, nonce, is_resume, backoff).await
-    else {
+    // Fresh dispatch — defer-allocate. All RPC-revert-prone preparation
+    // runs BEFORE the allocator is touched, so a permission-revert here
+    // can never burn a nonce.
+    let Some(partial) = prepare_partial(shared, batch_index, signature, backoff).await else {
         return;
     };
 
-    let Some((fee, tip)) = initial_fees(shared, batch_index, resume.as_ref(), nonce, backoff).await
-    else {
+    let Some((fee, tip)) = estimate_initial_fees_fresh(shared, batch_index, backoff).await else {
         return;
     };
+
+    let nonce = shared.nonce_allocator.allocate();
+    crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
+
+    let template = partial.with_nonce(nonce);
 
     let observer = PreconfirmObserver::new(shared, batch_index, nonce);
     run_generic(
@@ -234,7 +257,7 @@ pub(crate) async fn run(
         batch_index,
         &template,
         nonce,
-        resume,
+        None,
         fee,
         tip,
         STUCK_AT_CAP_TIMEOUT,
@@ -439,14 +462,16 @@ async fn handle_already_preconfirmed(
     backoff.reset();
 }
 
-async fn build_template(
+/// Build the calldata + gas-limit envelope for a `preconfirmBatch` dispatch.
+/// Runs `estimate_gas` against the L1 provider — failure here surfaces a
+/// terminal contract revert (e.g. `InvalidBatchStatus`) BEFORE any nonce
+/// is allocated. Used by both fresh and resume paths.
+async fn prepare_partial(
     shared: &OrchestratorShared,
     batch_index: u64,
     signature: Vec<u8>,
-    nonce: u64,
-    is_resume: bool,
     backoff: &mut DispatchBackoff,
-) -> Option<RollupTxTemplate> {
+) -> Option<RollupTxPartial> {
     let provider = &shared.config.l1_provider;
     let contract = shared.config.l1_rollup_addr;
     let verifier = shared.config.nitro_verifier_addr;
@@ -454,54 +479,37 @@ async fn build_template(
     let cancel = &shared.shutdown;
 
     tokio::select! {
-        _ = cancel.cancelled() => {
-            if !is_resume {
-                shared.nonce_allocator.release(nonce);
-            }
-            None
-        }
-        res = build_preconfirm_tx(
-            provider, contract, verifier, batch_index, signature, signer_addr, nonce,
+        _ = cancel.cancelled() => None,
+        res = prepare_preconfirm_tx(
+            provider, contract, verifier, batch_index, signature, signer_addr,
         ) => match res {
-            Ok(t) => Some(t),
+            Ok(p) => Some(p),
             Err(e) => {
-                if !is_resume {
-                    shared.nonce_allocator.release(nonce);
-                }
-                warn!(batch_index, err = %e, "build_preconfirm_tx failed");
-                backoff.apply("build_preconfirm_tx failed");
+                warn!(batch_index, err = %e, "prepare_preconfirm_tx failed");
+                backoff.apply("prepare_preconfirm_tx failed");
                 None
             }
         }
     }
 }
 
-/// Resume reuses the persisted RBF state; fresh dispatches estimate
-/// EIP-1559 fees and clamp at the configured cap.
-async fn initial_fees(
+/// Estimate initial EIP-1559 fees for a fresh dispatch. Resume paths
+/// reuse the persisted fees and skip this. Runs before nonce allocation
+/// so that an RPC failure here cannot leak a nonce.
+async fn estimate_initial_fees_fresh(
     shared: &OrchestratorShared,
     batch_index: u64,
-    resume: Option<&RbfResumeState>,
-    nonce: u64,
     backoff: &mut DispatchBackoff,
 ) -> Option<(u128, u128)> {
-    if let Some(r) = resume {
-        return Some((r.max_fee_per_gas, r.max_priority_fee_per_gas));
-    }
-
     let provider = &shared.config.l1_provider;
     let cancel = &shared.shutdown;
     let max_fee_cap = shared.config.rbf_max_fee_per_gas_wei;
 
     let est = tokio::select! {
-        _ = cancel.cancelled() => {
-            shared.nonce_allocator.release(nonce);
-            return None;
-        }
+        _ = cancel.cancelled() => return None,
         res = provider.estimate_eip1559_fees() => match res {
             Ok(v) => v,
             Err(e) => {
-                shared.nonce_allocator.release(nonce);
                 warn!(batch_index, err = %e, "estimate_eip1559_fees failed");
                 backoff.apply("estimate_eip1559_fees failed");
                 return None;
@@ -642,9 +650,11 @@ async fn try_broadcast(
 
     let res = tokio::select! {
         _ = cancel.cancelled() => {
-            if was_first {
-                shared.nonce_allocator.release(nonce);
+            if was_first && !shared.nonce_allocator.release_with_outcome(nonce) {
+                crate::metrics::count_nonce_leak();
+                warn!(batch_index, nonce, "NonceAllocator: release lost race — leaked");
             }
+            crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
             info!(batch_index, "RBF dispatch cancelled (shutdown)");
             return BroadcastResult::Done;
         }
@@ -704,21 +714,32 @@ async fn handle_broadcast_error(
     .increment(1);
 
     let Some(prior) = current_hash else {
-        // Initial broadcast `nonce-too-low` means a tx at this nonce already
-        // exists on-chain; resyncing the allocator preserves it (so the next
-        // pre-flight surfaces `AlreadyPreconfirmed` if it was ours).
-        // Releasing here would hand the same nonce out again and create
-        // duplicates.
+        // After defer-allocate this branch fires only when the wallet-
+        // exclusivity invariant is broken (an external tx ate our slot
+        // between allocate and the very first broadcast — a tiny race
+        // window). Resync rebases the allocator to the new pending so
+        // future allocations land on a free slot. Releasing here would
+        // re-issue the same nonce we just lost, producing duplicates.
         if is_nonce_too_low_error(&msg) {
-            if let Err(sync_err) = shared
+            match shared
                 .nonce_allocator
                 .resync(&shared.config.l1_provider, shared.config.l1_signer_address)
                 .await
             {
-                warn!(batch_index, err = %sync_err, "NonceAllocator resync after nonce-too-low failed");
+                Ok((_new_next, pending)) => {
+                    crate::metrics::set_nonce_pending_l1(pending);
+                    crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
+                }
+                Err(sync_err) => {
+                    warn!(batch_index, err = %sync_err, "NonceAllocator resync after nonce-too-low failed");
+                }
             }
         } else {
-            shared.nonce_allocator.release(nonce);
+            if !shared.nonce_allocator.release_with_outcome(nonce) {
+                crate::metrics::count_nonce_leak();
+                warn!(batch_index, nonce, "NonceAllocator: release lost race — leaked");
+            }
+            crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
         }
         warn!(batch_index, err = %msg, "initial broadcast failed");
         backoff.apply("initial broadcast failed");
@@ -775,13 +796,23 @@ async fn bump_nonce_too_low_fastfail(
             BroadcastResult::Done
         }
         Ok(None) | Err(_) => {
-            warn!(
+            // Wallet is exclusively used by this orchestrator (operational
+            // invariant — see CLAUDE.md). `nonce-too-low` during a bump while
+            // the latest broadcast hash has no receipt means an EARLIER bump
+            // in this RBF chain (a replacement-tx in the same nonce slot)
+            // already mined. The L1 listener will fire `BatchPreconfirmed`
+            // shortly and `should_abort()` will exit the bump_loop on
+            // `status > Dispatched`. Stay in the loop with the prior hash —
+            // rolling back here would clear `nonce` and produce a
+            // `finalized + nonce=NULL` row when the listener event arrives.
+            // If the tx was actually dropped from mempool with no replacement
+            // mining, `STUCK_AT_CAP_TIMEOUT` in `bump_loop` is the backstop.
+            info!(
                 batch_index,
                 prior_hash = %prior,
-                "RBF: nonce advanced but latest hash has no receipt — failing"
+                "RBF: bump nonce-too-low — earlier bump won the slot; awaiting BatchPreconfirmed"
             );
-            handle_failed_then_undispatch(observer, backoff, "nonce advanced, no receipt").await;
-            BroadcastResult::Done
+            BroadcastResult::Continue { hash: prior }
         }
     }
 }

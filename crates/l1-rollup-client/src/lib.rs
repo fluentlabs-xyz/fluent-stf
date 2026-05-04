@@ -513,12 +513,37 @@ pub async fn find_batch_preconfirm_event(
 // Write helpers (RBF-aware)
 // =====================================================================
 
-/// Immutable metadata for an in-flight rollup-write transaction. Built
-/// once at dispatch start by [`build_preconfirm_tx`] /
-/// [`build_resolve_block_challenge_tx`] /
-/// [`build_resolve_batch_root_challenge_tx`] and reused across RBF
-/// bumps — only `max_fee_per_gas` / `max_priority_fee_per_gas` change on
-/// each rebroadcast.
+/// Same fields as [`RollupTxTemplate`] except `nonce`. Returned by the
+/// `prepare_*_tx` builders so callers can run their nonce allocation
+/// AFTER the gas-estimation / pre-broadcast simulation steps that may
+/// revert with terminal errors (`AccessControlUnauthorizedAccount`,
+/// `InvalidBatchStatus`, etc.). Convert with [`Self::with_nonce`] just
+/// before broadcast.
+#[derive(Debug, Clone)]
+pub struct RollupTxPartial {
+    pub to: Address,
+    pub input: Bytes,
+    pub gas_limit: u64,
+    pub chain_id: u64,
+    /// Log correlation id only — never read from the calldata.
+    pub batch_index: u64,
+    /// Tag included in broadcast logs (`"preconfirm"`,
+    /// `"resolve_block_challenge"`, `"resolve_batch_root_challenge"`).
+    pub tx_kind: &'static str,
+}
+
+impl RollupTxPartial {
+    /// Attach an allocated nonce to produce a ready-to-sign template.
+    pub fn with_nonce(self, nonce: u64) -> RollupTxTemplate {
+        let RollupTxPartial { to, input, gas_limit, chain_id, batch_index, tx_kind } = self;
+        RollupTxTemplate { to, input, nonce, gas_limit, chain_id, batch_index, tx_kind }
+    }
+}
+
+/// Immutable metadata for an in-flight rollup-write transaction. Produced
+/// by [`RollupTxPartial::with_nonce`] just before the first broadcast and
+/// reused across RBF bumps — only `max_fee_per_gas` /
+/// `max_priority_fee_per_gas` change on each rebroadcast.
 #[derive(Debug, Clone)]
 pub struct RollupTxTemplate {
     pub to: Address,
@@ -541,43 +566,30 @@ pub fn apply_gas_buffer(estimate: u64) -> u64 {
     (estimate as f64 * 1.2) as u64
 }
 
-/// Build the calldata + gas-limit for a `preconfirmBatch` dispatch using an
-/// explicit `nonce` supplied by the caller.
-///
-/// Nonce allocation is intentionally lifted OUT of this helper: fresh dispatches
-/// pull from a shared [`NonceAllocator`] (so concurrent resume workers and fresh
-/// workers never race on `get_transaction_count(pending)`), and startup-resume
-/// paths pass the persisted nonce verbatim so the rebroadcast replaces the
-/// still-in-mempool tx rather than opening a new slot.
-pub async fn build_preconfirm_tx(
+/// Build the calldata + gas-limit for a `preconfirmBatch` dispatch.
+/// Returns a [`RollupTxPartial`] — the caller attaches a nonce via
+/// [`RollupTxPartial::with_nonce`] just before broadcast, after pulling
+/// from a shared [`NonceAllocator`].
+pub async fn prepare_preconfirm_tx(
     provider: &impl Provider,
     contract_addr: Address,
     nitro_verifier_addr: Address,
     batch_index: u64,
     signature: Vec<u8>,
     signer: Address,
-    nonce: u64,
-) -> Result<RollupTxTemplate> {
+) -> Result<RollupTxPartial> {
     let call = preconfirmBatchCall {
         nitroVerifier: nitro_verifier_addr,
         batchIndex: U256::from(batch_index),
         signature: Bytes::from(signature),
     };
-    build_template(
-        provider,
-        contract_addr,
-        batch_index,
-        "preconfirm",
-        call.abi_encode(),
-        signer,
-        nonce,
-    )
-    .await
+    build_partial(provider, contract_addr, batch_index, "preconfirm", call.abi_encode(), signer)
+        .await
 }
 
-/// Build calldata + gas-limit for `resolveBlockChallenge`.
-#[allow(clippy::too_many_arguments)]
-pub async fn build_resolve_block_challenge_tx(
+/// Build calldata + gas-limit for `resolveBlockChallenge`. Returns a
+/// [`RollupTxPartial`]; caller attaches a nonce just before broadcast.
+pub async fn prepare_resolve_block_challenge_tx(
     provider: &impl Provider,
     contract_addr: Address,
     batch_index: u64,
@@ -585,30 +597,29 @@ pub async fn build_resolve_block_challenge_tx(
     block_proof: MerkleProof,
     sp1_proof: Vec<u8>,
     signer: Address,
-    nonce: u64,
-) -> Result<RollupTxTemplate> {
+) -> Result<RollupTxPartial> {
     let call = resolveBlockChallengeCall {
         batchIndex: U256::from(batch_index),
         blockHeader: block_header,
         blockProof: block_proof,
         sp1Proof: Bytes::from(sp1_proof),
     };
-    build_template(
+    build_partial(
         provider,
         contract_addr,
         batch_index,
         "resolve_block_challenge",
         call.abi_encode(),
         signer,
-        nonce,
     )
     .await
 }
 
 /// Build calldata + gas-limit for `resolveBatchRootChallenge`. No SP1
 /// proof; the contract re-derives the merkle root from `block_headers`.
-#[allow(clippy::too_many_arguments)]
-pub async fn build_resolve_batch_root_challenge_tx(
+/// Returns a [`RollupTxPartial`]; caller attaches a nonce just before
+/// broadcast.
+pub async fn prepare_resolve_batch_root_challenge_tx(
     provider: &impl Provider,
     contract_addr: Address,
     batch_index: u64,
@@ -616,35 +627,32 @@ pub async fn build_resolve_batch_root_challenge_tx(
     block_headers: Vec<L2BlockHeader>,
     last_block_proof: MerkleProof,
     signer: Address,
-    nonce: u64,
-) -> Result<RollupTxTemplate> {
+) -> Result<RollupTxPartial> {
     let call = resolveBatchRootChallengeCall {
         batchIndex: U256::from(batch_index),
         lastBlockHeaderInPreviousBatch: last_block_header_in_previous_batch,
         blockHeaders: block_headers,
         lastBlockProof: last_block_proof,
     };
-    build_template(
+    build_partial(
         provider,
         contract_addr,
         batch_index,
         "resolve_batch_root_challenge",
         call.abi_encode(),
         signer,
-        nonce,
     )
     .await
 }
 
-async fn build_template(
+async fn build_partial(
     provider: &impl Provider,
     contract_addr: Address,
     batch_index: u64,
     tx_kind: &'static str,
     encoded_call: Vec<u8>,
     signer: Address,
-    nonce: u64,
-) -> Result<RollupTxTemplate> {
+) -> Result<RollupTxPartial> {
     let input = Bytes::from(encoded_call);
 
     let chain_id = provider.get_chain_id().await.map_err(|e| eyre!("get_chain_id failed: {e}"))?;
@@ -659,15 +667,7 @@ async fn build_template(
         provider.estimate_gas(est_req).await.map_err(|e| eyre!("estimate_gas failed: {e}"))?;
     let gas_limit = apply_gas_buffer(estimate);
 
-    Ok(RollupTxTemplate {
-        to: contract_addr,
-        input,
-        nonce,
-        gas_limit,
-        chain_id,
-        batch_index,
-        tx_kind,
-    })
+    Ok(RollupTxPartial { to: contract_addr, input, gas_limit, chain_id, batch_index, tx_kind })
 }
 
 /// Returns true when the JSON-RPC error string from `send_raw_transaction`
@@ -726,11 +726,14 @@ impl NonceAllocator {
     /// `max(persisted_dispatched_nonce) + 1`, or `None` when no
     /// dispatched rows exist. The effective start is
     /// `max(rpc_pending, stored_floor)`.
+    ///
+    /// Returns `(start, pending)` so the caller can update both the
+    /// allocator-next gauge and the L1-pending gauge from one call.
     pub async fn bootstrap(
         provider: &impl Provider,
         signer: Address,
         stored_floor: Option<u64>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, u64)> {
         let pending =
             provider.get_transaction_count(signer).pending().await.map_err(|e| {
                 eyre!("NonceAllocator::bootstrap: get_transaction_count(pending): {e}")
@@ -742,7 +745,8 @@ impl NonceAllocator {
             start,
             "NonceAllocator bootstrapped"
         );
-        Ok(Self { next: AtomicU64::new(start), resync_lock: AsyncMutex::new(()) })
+        let allocator = Self { next: AtomicU64::new(start), resync_lock: AsyncMutex::new(()) };
+        Ok((allocator, pending))
     }
 
     /// Hand out the next nonce. Monotonic; never returns the same value twice.
@@ -750,21 +754,32 @@ impl NonceAllocator {
         self.next.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Attempt to reclaim `nonce` when a pre-broadcast step failed (e.g.,
-    /// `estimate_gas` hiccup). Only succeeds when `nonce + 1` is still the
-    /// head of the counter — if another allocation happened in between, the
-    /// gap cannot be closed and is left as-is (the next successful broadcast
-    /// at a higher nonce will eventually be unblocked by manual top-up, or
-    /// the gap is filled by an admin tx).
+    /// Same as [`Self::release_with_outcome`] but discards the result.
+    /// Use when the caller does not record leak metrics.
     pub fn release(&self, nonce: u64) {
-        let _ = self.next.compare_exchange(nonce + 1, nonce, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = self.release_with_outcome(nonce);
+    }
+
+    /// Attempt to reclaim `nonce` when a pre-broadcast step failed (e.g.,
+    /// shutdown signal between allocate and broadcast). Only succeeds when
+    /// `nonce + 1` is still the head of the counter — if another allocation
+    /// raced ahead, returns `false` and the nonce is permanently un-issued.
+    /// Callers that observe `false` should increment a leak metric: a
+    /// non-zero leak counter signals a regression of the defer-allocate
+    /// invariant (allocation should run AFTER all RPC-revert-prone steps,
+    /// so the `release` window is bounded to a tiny cancel race).
+    pub fn release_with_outcome(&self, nonce: u64) -> bool {
+        self.next.compare_exchange(nonce + 1, nonce, Ordering::SeqCst, Ordering::SeqCst).is_ok()
     }
 
     /// Reread `pending` from RPC under a lock and advance the counter past
     /// it. Used after a broadcast failure with "nonce too low": the chain has
     /// moved beyond what we allocated, so future allocations must not try to
     /// reuse any nonce below RPC's current pending.
-    pub async fn resync(&self, provider: &impl Provider, signer: Address) -> Result<u64> {
+    ///
+    /// Returns `(new_next, pending)` — `new_next` is the post-resync counter
+    /// value, `pending` is the RPC reading used to compute it.
+    pub async fn resync(&self, provider: &impl Provider, signer: Address) -> Result<(u64, u64)> {
         let _guard = self.resync_lock.lock().await;
         let pending =
             provider.get_transaction_count(signer).pending().await.map_err(|e| {
@@ -781,7 +796,7 @@ impl NonceAllocator {
             );
             self.next.store(new, Ordering::SeqCst);
         }
-        Ok(new)
+        Ok((new, pending))
     }
 
     /// Peek the next nonce that would be handed out. Test/diagnostic only.
@@ -891,5 +906,45 @@ mod tests {
         let _n1 = alloc.allocate(); // 11
         alloc.release(n0);
         assert_eq!(alloc.peek(), 12, "release of non-tail must not rewind — the gap is accepted");
+    }
+
+    #[test]
+    fn release_with_outcome_returns_true_on_tail_release() {
+        let alloc = NonceAllocator { next: AtomicU64::new(10), resync_lock: AsyncMutex::new(()) };
+        let n = alloc.allocate();
+        assert!(alloc.release_with_outcome(n), "tail release must succeed");
+        assert_eq!(alloc.peek(), 10);
+    }
+
+    #[test]
+    fn release_with_outcome_returns_false_on_lost_race() {
+        let alloc = NonceAllocator { next: AtomicU64::new(10), resync_lock: AsyncMutex::new(()) };
+        let n0 = alloc.allocate();
+        let _n1 = alloc.allocate();
+        assert!(
+            !alloc.release_with_outcome(n0),
+            "release of non-tail must report failure (leak signal)"
+        );
+        assert_eq!(alloc.peek(), 12);
+    }
+
+    #[test]
+    fn rollup_tx_partial_with_nonce_preserves_all_fields() {
+        let partial = RollupTxPartial {
+            to: Address::from([0x11u8; 20]),
+            input: Bytes::from(vec![0xab, 0xcd]),
+            gas_limit: 123_456,
+            chain_id: 11_155_111,
+            batch_index: 42,
+            tx_kind: "preconfirm",
+        };
+        let template = partial.with_nonce(99);
+        assert_eq!(template.to, Address::from([0x11u8; 20]));
+        assert_eq!(template.input.as_ref(), &[0xab, 0xcd]);
+        assert_eq!(template.gas_limit, 123_456);
+        assert_eq!(template.chain_id, 11_155_111);
+        assert_eq!(template.batch_index, 42);
+        assert_eq!(template.tx_kind, "preconfirm");
+        assert_eq!(template.nonce, 99);
     }
 }

@@ -481,15 +481,16 @@ impl Orchestrator {
             let g = db.lock().unwrap_or_else(|e| e.into_inner());
             g.stored_nonce_floor()
         };
-        let nonce_allocator = Arc::new(
-            NonceAllocator::bootstrap(
-                &config.l1_provider,
-                config.l1_signer_address,
-                stored_nonce_floor,
-            )
-            .await
-            .expect("NonceAllocator bootstrap failed — L1 RPC unreachable at startup"),
-        );
+        let (allocator, pending) = NonceAllocator::bootstrap(
+            &config.l1_provider,
+            config.l1_signer_address,
+            stored_nonce_floor,
+        )
+        .await
+        .expect("NonceAllocator bootstrap failed — L1 RPC unreachable at startup");
+        crate::metrics::set_nonce_pending_l1(pending);
+        crate::metrics::set_nonce_allocator_next(allocator.peek());
+        let nonce_allocator = Arc::new(allocator);
 
         let highest_responded: Option<u64> = {
             let g = db.lock().unwrap_or_else(|e| e.into_inner());

@@ -67,6 +67,15 @@ pub(crate) const L1_RESOLVE_PRE_RECEIPT_FAILURE_TOTAL: &str =
 // (`0.002 as u64 == 0`); cumulative spend is read from the histogram's `_sum`.
 pub(crate) const L1_DISPATCH_COST_ETH: &str = "orchestrator_l1_dispatch_cost_eth";
 
+// Nonce allocator drift surface. The pair of gauges
+// (NONCE_ALLOCATOR_NEXT, NONCE_PENDING_L1) lets the operator visually
+// detect drift; NONCE_LEAKS_TOTAL is the regression sentinel for the
+// defer-allocate invariant (allocate runs only after RPC-revert-prone
+// preparation succeeds, so release races should never fire).
+pub(crate) const NONCE_ALLOCATOR_NEXT: &str = "orchestrator_nonce_allocator_next";
+pub(crate) const NONCE_PENDING_L1: &str = "orchestrator_nonce_pending_l1";
+pub(crate) const NONCE_LEAKS_TOTAL: &str = "orchestrator_nonce_leaks_total";
+
 // ─── Bucket configs (exponential, Go-reference parity) ───────────────────────
 
 /// Go reference: `ExponentialBuckets(0.5, 2, 12)` — 0.5s .. ~2048s.
@@ -196,6 +205,23 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
          Cumulative via `_sum`."
     );
 
+    metrics::describe_gauge!(
+        NONCE_ALLOCATOR_NEXT,
+        "NonceAllocator's next-to-issue nonce (peek of the atomic counter). \
+         Compare with NONCE_PENDING_L1 to spot drift."
+    );
+    metrics::describe_gauge!(
+        NONCE_PENDING_L1,
+        "Last observed eth_getTransactionCount(signer, pending) value. Updated on \
+         bootstrap and on resync."
+    );
+    metrics::describe_counter!(
+        NONCE_LEAKS_TOTAL,
+        "Times NonceAllocator::release_with_outcome could not rewind the counter \
+         due to a concurrent allocate(). Should remain 0 after the defer-allocate \
+         refactor — non-zero increments indicate a regression of that invariant."
+    );
+
     Ok(handle)
 }
 
@@ -307,6 +333,22 @@ pub(crate) fn seed_gauges_on_startup(
     if let Some((idx, from, to)) = preconfirmed {
         set_last_batch_preconfirmed(idx, from, to);
     }
+}
+
+/// Update the gauge tracking the allocator's next-to-issue nonce.
+pub(crate) fn set_nonce_allocator_next(value: u64) {
+    metrics::gauge!(NONCE_ALLOCATOR_NEXT).set(value as f64);
+}
+
+/// Update the gauge tracking the last observed L1 pending nonce for the
+/// submitter wallet. Set on bootstrap and on every resync.
+pub(crate) fn set_nonce_pending_l1(value: u64) {
+    metrics::gauge!(NONCE_PENDING_L1).set(value as f64);
+}
+
+/// Increment the regression sentinel for the defer-allocate invariant.
+pub(crate) fn count_nonce_leak() {
+    metrics::counter!(NONCE_LEAKS_TOTAL).increment(1);
 }
 
 /// Classify a `send_raw_transaction` failure string into a stable label

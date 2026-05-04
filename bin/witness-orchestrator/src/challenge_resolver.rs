@@ -33,8 +33,8 @@ use fluent_stf_primitives::{
     LEGACY_BRIDGE_WITHDRAWAL_TOPIC,
 };
 use l1_rollup_client::{
-    build_resolve_batch_root_challenge_tx, build_resolve_block_challenge_tx, L2BlockHeader,
-    MerkleProof, RollupTxTemplate,
+    prepare_resolve_batch_root_challenge_tx, prepare_resolve_block_challenge_tx, L2BlockHeader,
+    MerkleProof, RollupTxPartial,
 };
 use nitro_types::ChallengeSp1Request;
 use rsp_host_executor::events_hash::{
@@ -405,13 +405,39 @@ async fn handle_dispatched_resume(
     row: &ChallengeRow,
     backoff: &mut DispatchBackoff,
 ) {
-    // Stored-or-allocate: prefer the persisted nonce when present so a
-    // partial RBF tear (e.g. tx_hash cleared but nonce lingering) does
-    // not leak nonces by allocating a fresh one.
-    let nonce = match row.nonce {
-        Some(n) => n,
-        None => shared.nonce_allocator.allocate(),
+    let Some(nonce) = row.nonce else {
+        // `Dispatched + nonce=NULL` is an invariant violation: a row in
+        // Dispatched was either entered via `on_first_broadcast` (which
+        // writes nonce) or via cross-process resume (which preserves
+        // nonce). Failure paths (`on_reverted`, `on_pre_receipt_failure`)
+        // roll the row back out of Dispatched to the per-kind fresh-
+        // dispatch entry point. Reaching this branch implies DB
+        // corruption or a regression of that rollback contract.
+        error!(
+            challenge_id = row.challenge_id,
+            kind = row.kind.as_str(),
+            "BUG: Dispatched challenge row without persisted nonce — skipping resume"
+        );
+        return;
     };
+
+    let partial = match prepare_resolve_partial(shared, row).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                challenge_id = row.challenge_id,
+                err = %e,
+                "prepare_resolve_partial (resume) failed"
+            );
+            return;
+        }
+    };
+
+    if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &partial).await {
+        fail_with_reason(shared, row, reason).await;
+        return;
+    }
+
     let resume = match (row.tx_hash, row.max_fee_per_gas, row.max_priority_fee_per_gas) {
         (Some(h), Some(fee), Some(tip)) => Some(crate::db::RbfResumeState {
             nonce,
@@ -422,43 +448,15 @@ async fn handle_dispatched_resume(
         _ => None,
     };
 
-    let template = match build_resolve_template(shared, row, nonce).await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(
-                challenge_id = row.challenge_id,
-                err = %e,
-                "build_resolve_template (resume) failed"
-            );
-            // Only release if we just allocated a fresh nonce (row.nonce was None).
-            if row.nonce.is_none() {
-                shared.nonce_allocator.release(nonce);
-            }
-            return;
-        }
-    };
-
-    if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &template).await {
-        fail_with_reason(shared, row, reason).await;
-        if row.nonce.is_none() {
-            shared.nonce_allocator.release(nonce);
-        }
-        return;
-    }
-
     let (fee, tip) = match resume.as_ref() {
         Some(r) => (r.max_fee_per_gas, r.max_priority_fee_per_gas),
         None => match estimate_initial_fees(shared, row).await {
             Some(v) => v,
-            None => {
-                if row.nonce.is_none() {
-                    shared.nonce_allocator.release(nonce);
-                }
-                return;
-            }
+            None => return,
         },
     };
 
+    let template = partial.with_nonce(nonce);
     let observer = ResolveObserver {
         shared,
         challenge_id: row.challenge_id,
@@ -482,42 +480,46 @@ async fn handle_dispatched_resume(
     .await;
 }
 
-/// Allocate a fresh nonce, build the calldata, run pre-broadcast validation,
-/// estimate fees, then enter the RBF lifecycle. Used by both kinds for the
-/// initial dispatch from `Received` (BatchRoot) or `Sp1Proved` (Block).
+/// Build the calldata, run pre-broadcast validation, estimate fees, allocate
+/// the nonce only after every RPC-revert-prone step succeeded, then enter
+/// the RBF lifecycle. Used by both kinds for the initial dispatch from
+/// `Received` (BatchRoot) or `Sp1Proved` (Block).
+///
+/// The defer-allocate ordering is the load-bearing invariant: a permission
+/// revert during prepare (e.g. `AccessControlUnauthorizedAccount`) must NOT
+/// burn a nonce, because tail-CAS `release` cannot rewind past concurrent
+/// allocations from other workers.
 async fn run_resolve_lifecycle(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
     backoff: &mut DispatchBackoff,
 ) {
-    let nonce = shared.nonce_allocator.allocate();
-    let template = match build_resolve_template(shared, row, nonce).await {
-        Ok(t) => t,
+    let partial = match prepare_resolve_partial(shared, row).await {
+        Ok(p) => p,
         Err(e) => {
             warn!(
                 challenge_id = row.challenge_id,
                 err = %e,
-                "build_resolve_template failed"
+                "prepare_resolve_partial failed"
             );
-            shared.nonce_allocator.release(nonce);
             return;
         }
     };
 
-    if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &template).await {
+    if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &partial).await {
         fail_with_reason(shared, row, reason).await;
-        shared.nonce_allocator.release(nonce);
         return;
     }
 
     let (fee, tip) = match estimate_initial_fees(shared, row).await {
         Some(v) => v,
-        None => {
-            shared.nonce_allocator.release(nonce);
-            return;
-        }
+        None => return,
     };
 
+    let nonce = shared.nonce_allocator.allocate();
+    crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
+
+    let template = partial.with_nonce(nonce);
     let observer = ResolveObserver {
         shared,
         challenge_id: row.challenge_id,
@@ -611,19 +613,19 @@ async fn fail_with_reason(shared: &OrchestratorShared, row: &ChallengeRow, reaso
 /// same inputs, retry is wasted gas.
 ///
 /// Local merkle / chain-linkage assertions are NOT duplicated here
-/// because they are already implicit in `build_resolve_template` (which
+/// because they are already implicit in `prepare_resolve_partial` (which
 /// produces calldata derived from the same headers/leaves the contract
 /// re-validates). The simulation is the catch-all; it covers any future
 /// contract revert path automatically.
 async fn validate_resolve_pre_broadcast(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
-    template: &RollupTxTemplate,
+    partial: &RollupTxPartial,
 ) -> Result<(), String> {
     let req = TransactionRequest {
         from: Some(shared.config.l1_signer_address),
-        to: Some(template.to.into()),
-        input: template.input.clone().into(),
+        to: Some(partial.to.into()),
+        input: partial.input.clone().into(),
         ..Default::default()
     };
     match shared.config.l1_provider.call(req).await {
@@ -641,23 +643,23 @@ async fn validate_resolve_pre_broadcast(
 // ============================================================================
 
 /// Per-kind dispatcher: builds either a `resolveBlockChallenge` or a
-/// `resolveBatchRootChallenge` template.
-async fn build_resolve_template(
+/// `resolveBatchRootChallenge` envelope without a nonce. Caller attaches
+/// the allocated nonce via `RollupTxPartial::with_nonce` just before
+/// broadcast.
+async fn prepare_resolve_partial(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
-    nonce: u64,
-) -> eyre::Result<RollupTxTemplate> {
+) -> eyre::Result<RollupTxPartial> {
     match row.kind {
-        ChallengeKind::Block => build_block_resolve_template(shared, row, nonce).await,
-        ChallengeKind::BatchRoot => build_batch_root_resolve_template(shared, row, nonce).await,
+        ChallengeKind::Block => prepare_block_resolve_partial(shared, row).await,
+        ChallengeKind::BatchRoot => prepare_batch_root_resolve_partial(shared, row).await,
     }
 }
 
-async fn build_block_resolve_template(
+async fn prepare_block_resolve_partial(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
-    nonce: u64,
-) -> eyre::Result<RollupTxTemplate> {
+) -> eyre::Result<RollupTxPartial> {
     let cfg = &shared.config;
     let commitment =
         row.commitment.ok_or_else(|| eyre::eyre!("block challenge row missing commitment"))?;
@@ -681,7 +683,7 @@ async fn build_block_resolve_template(
     let merkle_proof =
         MerkleProof { nonce: U256::from(proof_nonce), proof: Bytes::from(proof_bytes) };
 
-    build_resolve_block_challenge_tx(
+    prepare_resolve_block_challenge_tx(
         &cfg.l1_provider,
         cfg.l1_rollup_addr,
         row.batch_index,
@@ -689,16 +691,14 @@ async fn build_block_resolve_template(
         merkle_proof,
         sp1_proof,
         cfg.l1_signer_address,
-        nonce,
     )
     .await
 }
 
-async fn build_batch_root_resolve_template(
+async fn prepare_batch_root_resolve_partial(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
-    nonce: u64,
-) -> eyre::Result<RollupTxTemplate> {
+) -> eyre::Result<RollupTxPartial> {
     let cfg = &shared.config;
     if row.batch_index == 0 {
         return Err(eyre::eyre!("batch 0 is genesis — cannot resolve batch-root challenge"));
@@ -722,7 +722,7 @@ async fn build_batch_root_resolve_template(
     let last_block_proof =
         MerkleProof { nonce: U256::from(proof_nonce), proof: Bytes::from(proof_bytes) };
 
-    build_resolve_batch_root_challenge_tx(
+    prepare_resolve_batch_root_challenge_tx(
         &cfg.l1_provider,
         cfg.l1_rollup_addr,
         row.batch_index,
@@ -730,7 +730,6 @@ async fn build_batch_root_resolve_template(
         headers,
         last_block_proof,
         cfg.l1_signer_address,
-        nonce,
     )
     .await
 }
@@ -784,6 +783,17 @@ async fn persist_patch(shared: &OrchestratorShared, challenge_id: i64, patch: Ch
         db_send_sync(&shared.db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
     {
         tracing::error!(challenge_id, err = %e, "persist_patch (challenge) failed");
+    }
+}
+
+/// Status to roll back to when a dispatched challenge tx fails (revert
+/// receipt, stuck-at-cap timeout). The rollback target is the fresh-
+/// dispatch entry point in the per-kind worker so `run_resolve_lifecycle`
+/// re-runs the full defer-allocate cycle on the next tick.
+fn rollback_status_for(kind: ChallengeKind) -> ChallengeStatus {
+    match kind {
+        ChallengeKind::Block => ChallengeStatus::Sp1Proved,
+        ChallengeKind::BatchRoot => ChallengeStatus::Received,
     }
 }
 
@@ -1071,9 +1081,13 @@ impl RbfObserver for ResolveObserver<'_> {
             "resolve REVERTED on L1 — alert + retry"
         );
         crate::metrics::counter_resolve_rejected(self.kind.as_str());
-        // Clear RBF state so the worker re-broadcasts on its next tick.
-        // Status stays `Dispatched` with `l1_block IS NULL`.
+        // Roll back to the fresh-dispatch entry point so the worker re-runs
+        // the full defer-allocate cycle (prepare → validate → fees →
+        // allocate) on its next tick. Block kind keeps `sp1_proof_bytes`
+        // and resumes from `Sp1Proved` (skips the SP1 round-trip);
+        // batch_root resumes from `Received` (no SP1 phase).
         let patch = ChallengePatch {
+            status: Some(rollback_status_for(self.kind)),
             tx_hash: Some(None),
             nonce: Some(None),
             max_fee_per_gas: Some(None),
@@ -1093,6 +1107,7 @@ impl RbfObserver for ResolveObserver<'_> {
         );
         crate::metrics::counter_resolve_pre_receipt_failure(self.kind.as_str());
         let patch = ChallengePatch {
+            status: Some(rollback_status_for(self.kind)),
             tx_hash: Some(None),
             nonce: Some(None),
             max_fee_per_gas: Some(None),
