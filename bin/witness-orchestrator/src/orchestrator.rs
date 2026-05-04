@@ -106,7 +106,6 @@ pub(crate) struct OrchestratorConfig {
     pub nitro_verifier_addr: Address,
     pub l1_provider: L1WriteProvider,
     pub api_key: String,
-    pub l2_provider: alloy_provider::RootProvider,
     /// Held alongside `l1_provider` so the RBF worker can sign with an
     /// explicit nonce and fees, bypassing alloy's `NonceFiller` /
     /// `GasFiller`.
@@ -791,7 +790,7 @@ async fn sign_batch_io(
     from_block: u64,
     to_block: u64,
     responses: Vec<EthExecutionResponse>,
-    l2_provider: &alloy_provider::RootProvider,
+    driver: &Arc<Driver>,
     shutdown: &CancellationToken,
 ) -> SignOutcome {
     info!(batch_index, from_block, to_block, "Signing batch root");
@@ -799,17 +798,32 @@ async fn sign_batch_io(
     let blobs = {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match rsp_blob_builder::build_blobs_from_l2(l2_provider, from_block, to_block).await {
-                Ok(blobs) => break blobs,
-                Err(e) => {
-                    warn!(batch_index, err = %e, ?backoff, "Blob construction failed — retrying");
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
-                        _ = shutdown.cancelled() => return SignOutcome::TaskFailed,
-                    }
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                }
+            match crate::blob_builder_mdbx::build_blobs_from_mdbx(driver, from_block, to_block)
+                .await
+            {
+                Ok(Some(b)) => break b,
+                // `Accepted` batches always have every block MDBX-committed (the
+                // driver produced the witness that fed every response), so an
+                // MDBX-tip-behind miss here is a real invariant violation.
+                Ok(None) => error!(
+                    batch_index,
+                    from_block,
+                    to_block,
+                    ?backoff,
+                    "MDBX tip behind Accepted batch range — invariant violation; sign_batch_io waiting"
+                ),
+                Err(e) => warn!(
+                    batch_index,
+                    err = %e,
+                    ?backoff,
+                    "MDBX blob construction failed — retrying"
+                ),
             }
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = shutdown.cancelled() => return SignOutcome::TaskFailed,
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     };
 
@@ -1270,7 +1284,7 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
                 from_block,
                 to_block,
                 responses,
-                &shared.config.l2_provider,
+                &shared.driver,
                 &shared.shutdown,
             )
             .await;

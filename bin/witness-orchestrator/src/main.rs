@@ -60,10 +60,12 @@
 //! | `orchestrator_l1_dispatch_cost_eth` | **histogram** | Per-tx ETH cost of L1 `preconfirmBatch` (`gas_used` × `effective_gas_price` / 1e18). Cumulative sum available via the Prometheus-emitted `_sum` counterpart. |
 
 mod accumulator;
+mod blob_builder_mdbx;
 mod challenge_db;
 mod challenge_resolver;
 mod db;
 mod driver;
+mod events_hash_reth;
 mod hub;
 mod l1_listener;
 mod metrics;
@@ -564,7 +566,6 @@ async fn main() -> eyre::Result<()> {
         nitro_verifier_addr,
         l1_provider: l1_write_provider,
         api_key,
-        l2_provider,
         l1_signer,
         l1_signer_address,
         rbf_bump_interval,

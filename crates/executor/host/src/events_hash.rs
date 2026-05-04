@@ -1,15 +1,17 @@
 //! Host-side computation of `withdrawal_root` and `deposit_root` from
-//! L2 RPC transaction receipts. Mirror of
-//! `crates/executor/client/src/events_hash.rs` but operates on
-//! `alloy_rpc_types::TransactionReceipt` instead of `ExecutionOutcome`,
-//! so callers can avoid full block re-execution.
+//! block log streams. The pure-inner functions operate on
+//! `&alloy_primitives::Log` (the shape every receipt type ultimately
+//! exposes), so they can be driven from either alloy RPC receipts or
+//! reth's MDBX-shaped receipts.
 //!
 //! Used by the witness-orchestrator's challenge resolver to derive the
-//! `withdrawalRoot` / `depositRoot` fields of `L2BlockHeader` directly
-//! from `eth_getBlockReceipts(block)`.
+//! `withdrawalRoot` / `depositRoot` fields of `L2BlockHeader`. Mirror of
+//! `crates/executor/client/src/events_hash.rs`, but operates over receipt
+//! collections instead of `ExecutionOutcome`, so callers avoid full
+//! block re-execution.
 
 use alloy_primitives::{keccak256, Address, B256};
-use alloy_rpc_types::{Log, TransactionReceipt};
+use alloy_rpc_types::TransactionReceipt;
 
 /// keccak256 of empty input. Used as the convention "no events"
 /// placeholder for the merkle-root output of an empty leaf set.
@@ -26,6 +28,33 @@ const ROLLBACK_EVENT_MESSAGE_HASH_OFFSET: usize = 0;
 // Legacy `BridgeWithdrawal` event uses a different layout.
 const LEGACY_SEND_EVENT_MESSAGE_HASH_OFFSET: usize = 128;
 
+/// `keccak256(messageHashes[0] ‖ … ‖ messageHashes[N-1])` over an
+/// arbitrary stream of bare logs already filtered to "from successful
+/// receipts". Returns `ZERO_BYTES_HASH` when no `ReceivedMessage`
+/// events occurred.
+pub fn calculate_deposit_hash_inner<'a>(
+    logs: impl Iterator<Item = &'a alloy_primitives::Log>,
+    bridge_address: Address,
+    receive_topic: B256,
+) -> B256 {
+    let mut buf: Vec<u8> = Vec::new();
+    for log in logs {
+        if log.address != bridge_address {
+            continue;
+        }
+        let Some(topic) = log.data.topics().first().copied() else { continue };
+        if topic != receive_topic {
+            continue;
+        }
+        let data = log.data.data.as_ref();
+        if data.len() < RECEIVE_EVENT_MESSAGE_HASH_OFFSET + 32 {
+            continue;
+        }
+        buf.extend_from_slice(&data[RECEIVE_EVENT_MESSAGE_HASH_OFFSET..][..32]);
+    }
+    keccak256(buf)
+}
+
 /// `keccak256(messageHashes[0] ‖ … ‖ messageHashes[N-1])`. Returns
 /// `ZERO_BYTES_HASH` when no `ReceivedMessage` events occurred.
 pub fn calculate_deposit_hash(
@@ -33,26 +62,54 @@ pub fn calculate_deposit_hash(
     bridge_address: Address,
     receive_topic: B256,
 ) -> B256 {
-    let mut buf: Vec<u8> = Vec::new();
-    for receipt in receipts {
-        if !receipt.status() {
+    calculate_deposit_hash_inner(successful_receipt_logs(receipts), bridge_address, receive_topic)
+}
+
+/// Stream of bare logs from successful receipts — the shape every
+/// `*_inner` helper takes.
+fn successful_receipt_logs(
+    receipts: &[TransactionReceipt],
+) -> impl Iterator<Item = &alloy_primitives::Log> {
+    receipts.iter().filter(|r| r.status()).flat_map(|r| r.inner.logs().iter().map(|l| &l.inner))
+}
+
+/// Merkle root over all `SentMessage` (and legacy / rollback) log
+/// `messageHash` values from the bridge address, fed as a stream of bare
+/// logs already filtered to "from successful receipts". Returns
+/// `ZERO_BYTES_HASH` when no such events occurred.
+pub fn calculate_withdrawal_root_inner<'a>(
+    logs: impl Iterator<Item = &'a alloy_primitives::Log>,
+    bridge_address: Address,
+    send_topic: B256,
+    legacy_withdrawal_topic: B256,
+    rollback_topic: B256,
+) -> B256 {
+    let mut hashes: Vec<B256> = Vec::new();
+    for log in logs {
+        if log.address != bridge_address {
             continue;
         }
-        for log in receipt.inner.logs() {
-            if log_address(log) != bridge_address {
-                continue;
-            }
-            if log_topic0(log) != Some(receive_topic) {
-                continue;
-            }
-            let data = log_data(log);
-            if data.len() < RECEIVE_EVENT_MESSAGE_HASH_OFFSET + 32 {
-                continue;
-            }
-            buf.extend_from_slice(&data[RECEIVE_EVENT_MESSAGE_HASH_OFFSET..][..32]);
+        let Some(topic) = log.data.topics().first().copied() else { continue };
+        let data = log.data.data.as_ref();
+        let off = if topic == send_topic {
+            Some(SEND_EVENT_MESSAGE_HASH_OFFSET)
+        } else if topic == legacy_withdrawal_topic {
+            Some(LEGACY_SEND_EVENT_MESSAGE_HASH_OFFSET)
+        } else if topic == rollback_topic {
+            Some(ROLLBACK_EVENT_MESSAGE_HASH_OFFSET)
+        } else {
+            None
+        };
+        let Some(off) = off else { continue };
+        if data.len() < off + 32 {
+            continue;
         }
+        hashes.push(B256::from_slice(&data[off..][..32]));
     }
-    keccak256(buf)
+    if hashes.is_empty() {
+        return ZERO_BYTES_HASH;
+    }
+    batch_merkle::calculate_merkle_root(&hashes)
 }
 
 /// Merkle root over all `SentMessage` (and legacy / rollback) log
@@ -65,71 +122,44 @@ pub fn calculate_withdrawal_root(
     legacy_withdrawal_topic: B256,
     rollback_topic: B256,
 ) -> B256 {
-    let mut hashes: Vec<B256> = Vec::new();
-    for receipt in receipts {
-        if !receipt.status() {
-            continue;
-        }
-        for log in receipt.inner.logs() {
-            if log_address(log) != bridge_address {
-                continue;
-            }
-            let Some(topic) = log_topic0(log) else { continue };
-            let data = log_data(log);
-            let off = if topic == send_topic {
-                Some(SEND_EVENT_MESSAGE_HASH_OFFSET)
-            } else if topic == legacy_withdrawal_topic {
-                Some(LEGACY_SEND_EVENT_MESSAGE_HASH_OFFSET)
-            } else if topic == rollback_topic {
-                Some(ROLLBACK_EVENT_MESSAGE_HASH_OFFSET)
-            } else {
-                None
-            };
-            let Some(off) = off else { continue };
-            if data.len() < off + 32 {
-                continue;
-            }
-            hashes.push(B256::from_slice(&data[off..][..32]));
-        }
-    }
-    if hashes.is_empty() {
-        return ZERO_BYTES_HASH;
-    }
-    batch_merkle::calculate_merkle_root(&hashes)
+    calculate_withdrawal_root_inner(
+        successful_receipt_logs(receipts),
+        bridge_address,
+        send_topic,
+        legacy_withdrawal_topic,
+        rollback_topic,
+    )
 }
 
-/// Count `ReceivedMessage` events from `bridge_address` in successful
-/// receipts. Used to populate `L2BlockHeader.depositCount` for
-/// `resolveBlockChallenge` calldata.
-pub fn count_deposits(
-    receipts: &[TransactionReceipt],
+/// Count `ReceivedMessage` events from `bridge_address` in a stream of
+/// bare logs already filtered to "from successful receipts". Used to
+/// populate `L2BlockHeader.depositCount` for `resolveBlockChallenge`
+/// calldata.
+pub fn count_deposits_inner<'a>(
+    logs: impl Iterator<Item = &'a alloy_primitives::Log>,
     bridge_address: Address,
     receive_topic: B256,
 ) -> u16 {
     let mut count: u16 = 0;
-    for receipt in receipts {
-        if !receipt.status() {
+    for log in logs {
+        if log.address != bridge_address {
             continue;
         }
-        for log in receipt.inner.logs() {
-            if log_address(log) == bridge_address && log_topic0(log) == Some(receive_topic) {
-                count = count.saturating_add(1);
-            }
+        if log.data.topics().first().copied() == Some(receive_topic) {
+            count = count.saturating_add(1);
         }
     }
     count
 }
 
-fn log_address(log: &Log) -> Address {
-    log.inner.address
-}
-
-fn log_topic0(log: &Log) -> Option<B256> {
-    log.inner.topics().first().copied()
-}
-
-fn log_data(log: &Log) -> &[u8] {
-    log.inner.data.data.as_ref()
+/// Count `ReceivedMessage` events from `bridge_address` in successful
+/// receipts.
+pub fn count_deposits(
+    receipts: &[TransactionReceipt],
+    bridge_address: Address,
+    receive_topic: B256,
+) -> u16 {
+    count_deposits_inner(successful_receipt_logs(receipts), bridge_address, receive_topic)
 }
 
 #[cfg(test)]

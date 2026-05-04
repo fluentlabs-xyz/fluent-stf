@@ -9,6 +9,7 @@
 //! directly.
 
 use std::{
+    ops::RangeInclusive,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -17,12 +18,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_eips::BlockNumberOrTag;
+use alloy_eips::{BlockNumberOrTag, Encodable2718};
 use alloy_network::Ethereum;
+use alloy_primitives::B256;
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_client::BatchRequest;
 use eyre::eyre;
+use fluent_stf_primitives::{
+    BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC, BRIDGE_ROLLBACK_TOPIC, BRIDGE_WITHDRAWAL_TOPIC,
+    LEGACY_BRIDGE_WITHDRAWAL_TOPIC,
+};
 use futures::stream::StreamExt;
+use l1_rollup_client::L2BlockHeader;
 use reth_chain_state::{ComputedTrieData, ExecutedBlock};
 use reth_chainspec::ChainSpec;
 use reth_db::{init_db, mdbx::DatabaseArguments, ClientVersion, DatabaseEnv};
@@ -36,9 +43,9 @@ use reth_provider::{
         StaticFileProvider,
     },
     static_file::StaticFileSegment,
-    BlockBodyIndicesProvider, BlockNumReader, DatabaseProviderFactory, HeaderProvider,
-    LatestStateProviderRef, SaveBlocksMode, StateRootProvider, StaticFileProviderFactory,
-    StaticFileWriter,
+    BlockBodyIndicesProvider, BlockNumReader, BlockReader, DatabaseProviderFactory, HeaderProvider,
+    LatestStateProviderRef, ReceiptProvider, SaveBlocksMode, StateRootProvider,
+    StaticFileProviderFactory, StaticFileWriter,
 };
 use reth_prune::Pruner;
 use reth_prune_types::MINIMUM_UNWIND_SAFE_DISTANCE;
@@ -51,7 +58,13 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::hub::WitnessHub;
+use crate::{
+    events_hash_reth::{
+        calculate_deposit_hash_from_reth_receipts, calculate_withdrawal_root_from_reth_receipts,
+        count_deposits_from_reth_receipts,
+    },
+    hub::WitnessHub,
+};
 
 use super::node_types::FluentMdbxNode;
 
@@ -613,6 +626,130 @@ impl Driver {
         )
         .await?;
         Ok(Some(payload))
+    }
+
+    /// Per-block `(L2BlockHeader, merkle leaf)` for every block in
+    /// `range`, read from MDBX. Returns `Ok(None)` when
+    /// `range.end() > mdbx_tip` so the caller can retry on the next
+    /// worker tick instead of falling back to RPC. Target-leaf lookup
+    /// (`leaves.iter().position(...)`) is left to the caller.
+    pub(crate) async fn collect_l2_block_headers(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> eyre::Result<Option<(Vec<L2BlockHeader>, Vec<B256>)>> {
+        let from = *range.start();
+        let to = *range.end();
+        debug_assert!(from <= to, "collect_l2_block_headers requires from ({from}) <= to ({to})");
+        let mdbx_tip =
+            self.factory.best_block_number().map_err(|e| eyre!("best_block_number: {e}"))?;
+        if to > mdbx_tip {
+            return Ok(None);
+        }
+
+        let factory = self.factory.clone();
+        tokio::task::spawn_blocking(move || -> eyre::Result<_> {
+            let provider =
+                factory.database_provider_ro().map_err(|e| eyre!("database_provider_ro: {e}"))?;
+
+            let sealed = provider
+                .sealed_headers_range(from..=to)
+                .map_err(|e| eyre!("sealed_headers_range: {e}"))?;
+            let receipts_per_block = provider
+                .receipts_by_block_range(from..=to)
+                .map_err(|e| eyre!("receipts_by_block_range: {e}"))?;
+
+            let expected = (to - from + 1) as usize;
+            if sealed.len() != expected || receipts_per_block.len() != expected {
+                return Err(eyre!(
+                    "MDBX read length mismatch for range [{from}..={to}]: \
+                     headers={}, receipts={}, expected={expected}",
+                    sealed.len(),
+                    receipts_per_block.len(),
+                ));
+            }
+
+            let mut headers = Vec::with_capacity(expected);
+            let mut leaves = Vec::with_capacity(expected);
+            for (sh, rxs) in sealed.into_iter().zip(receipts_per_block.iter()) {
+                let parent_hash = sh.header().parent_hash;
+                let block_hash = sh.hash();
+                let withdrawal_root = calculate_withdrawal_root_from_reth_receipts(
+                    rxs,
+                    BRIDGE_ADDRESS,
+                    BRIDGE_WITHDRAWAL_TOPIC,
+                    LEGACY_BRIDGE_WITHDRAWAL_TOPIC,
+                    BRIDGE_ROLLBACK_TOPIC,
+                );
+                let deposit_root = calculate_deposit_hash_from_reth_receipts(
+                    rxs,
+                    BRIDGE_ADDRESS,
+                    BRIDGE_DEPOSIT_TOPIC,
+                );
+                let deposit_count =
+                    count_deposits_from_reth_receipts(rxs, BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC);
+                let leaf = batch_merkle::compute_leaf(
+                    parent_hash,
+                    block_hash,
+                    withdrawal_root,
+                    deposit_root,
+                );
+                headers.push(L2BlockHeader {
+                    previousBlockHash: parent_hash,
+                    blockHash: block_hash,
+                    withdrawalRoot: withdrawal_root,
+                    depositRoot: deposit_root,
+                    depositCount: deposit_count,
+                });
+                leaves.push(leaf);
+            }
+            Ok((headers, leaves))
+        })
+        .await
+        .map_err(|e| eyre!("collect_l2_block_headers join: {e}"))?
+        .map(Some)
+    }
+
+    /// MDBX-backed read of header-RLP + tx-envelope-bytes per block,
+    /// shaped to slot directly into `rsp_blob_builder`'s encoder pipeline.
+    /// Returns `Ok(None)` when `range.end() > mdbx_tip` (caller retries
+    /// next tick).
+    pub(crate) async fn collect_blob_inputs(
+        &self,
+        range: RangeInclusive<u64>,
+    ) -> eyre::Result<Option<Vec<rsp_blob_builder::FetchedBlock>>> {
+        let from = *range.start();
+        let to = *range.end();
+        debug_assert!(from <= to, "collect_blob_inputs requires from ({from}) <= to ({to})");
+        let mdbx_tip =
+            self.factory.best_block_number().map_err(|e| eyre!("best_block_number: {e}"))?;
+        if to > mdbx_tip {
+            return Ok(None);
+        }
+
+        let factory = self.factory.clone();
+        tokio::task::spawn_blocking(move || -> eyre::Result<_> {
+            let provider =
+                factory.database_provider_ro().map_err(|e| eyre!("database_provider_ro: {e}"))?;
+            let blocks = provider.block_range(from..=to).map_err(|e| eyre!("block_range: {e}"))?;
+            let expected = (to - from + 1) as usize;
+            if blocks.len() != expected {
+                return Err(eyre!(
+                    "MDBX block_range returned {} of {expected} expected blocks for [{from}..={to}]",
+                    blocks.len(),
+                ));
+            }
+            let mut out = Vec::with_capacity(expected);
+            for block in blocks {
+                let header_rlp = alloy_rlp::encode(&block.header);
+                let tx_envelopes: Vec<Vec<u8>> =
+                    block.body.transactions.iter().map(|tx| tx.encoded_2718()).collect();
+                out.push(rsp_blob_builder::FetchedBlock { header_rlp, tx_envelopes });
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| eyre!("collect_blob_inputs join: {e}"))?
+        .map(Some)
     }
 
     /// Run the autonomous forward-sync loop until `shutdown` fires. Waits for

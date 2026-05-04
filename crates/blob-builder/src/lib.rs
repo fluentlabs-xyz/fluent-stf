@@ -36,9 +36,13 @@ const FETCH_BATCH_SIZE: u64 = 100;
 /// Placed outside brotli so decoders can dispatch without decompression.
 const BLOB_FORMAT_VERSION: u8 = 0x01;
 
-struct FetchedBlock {
-    header_rlp: Vec<u8>,
-    tx_envelopes: Vec<Vec<u8>>,
+/// Pre-encoded block payload shaped for [`build_blobs_from_fetched`]:
+/// the canonical RLP-encoded header bytes and per-tx EIP-2718 envelope
+/// bytes.
+#[derive(Debug)]
+pub struct FetchedBlock {
+    pub header_rlp: Vec<u8>,
+    pub tx_envelopes: Vec<Vec<u8>>,
 }
 
 /// Fetch L2 blocks and build canonical EIP-4844 blobs.
@@ -50,6 +54,17 @@ pub async fn build_blobs_from_l2(
     to_block: u64,
 ) -> Result<Vec<Vec<u8>>> {
     let blocks = fetch_blocks(provider, from_block, to_block).await?;
+    let blobs = build_blobs_from_fetched(blocks)?;
+    info!(from_block, to_block, num_blobs = blobs.len(), "Built blobs from L2 RPC");
+    Ok(blobs)
+}
+
+/// Build canonical EIP-4844 blobs from already-fetched block data.
+///
+/// Pipeline: RLP encode → brotli (quality=6, lgwin=22, mode=Generic via
+/// `brotlic`) → version-byte prefix → chunk into BYTES_PER_BLOB-length
+/// canonical buffers. Bit-stable on this exact input shape.
+pub fn build_blobs_from_fetched(blocks: Vec<FetchedBlock>) -> Result<Vec<Vec<u8>>> {
     let rlp_payload = encode_batch_payload(&blocks);
     let compressed = brotli_compress(&rlp_payload)?;
 
@@ -57,14 +72,6 @@ pub async fn build_blobs_from_l2(
     let mut stream = Vec::with_capacity(1 + compressed.len());
     stream.push(BLOB_FORMAT_VERSION);
     stream.extend_from_slice(&compressed);
-
-    info!(
-        from_block,
-        to_block,
-        raw_size = rlp_payload.len(),
-        compressed_size = compressed.len(),
-        "Blob payload compressed",
-    );
 
     stream.chunks(MAX_RAW_BYTES_PER_BLOB).map(build_single_blob).collect()
 }

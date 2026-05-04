@@ -25,23 +25,19 @@
 //! the row is marked `Failed` and we do NOT broadcast — there is no
 //! recovery by retry from the same inputs.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::{Bytes, FixedBytes, B256, U256};
 use alloy_provider::Provider;
-use alloy_rpc_types::{TransactionReceipt, TransactionRequest};
-use fluent_stf_primitives::{
-    BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC, BRIDGE_ROLLBACK_TOPIC, BRIDGE_WITHDRAWAL_TOPIC,
-    LEGACY_BRIDGE_WITHDRAWAL_TOPIC,
-};
+use alloy_rpc_types::TransactionRequest;
 use l1_rollup_client::{
-    prepare_resolve_batch_root_challenge_tx, prepare_resolve_block_challenge_tx, L2BlockHeader,
-    L2BlockHeaderV1, MerkleProof, RollupTxPartial,
+    prepare_resolve_batch_root_challenge_tx, prepare_resolve_block_challenge_tx, L2BlockHeaderV1,
+    MerkleProof, RollupTxPartial,
 };
 use nitro_types::ChallengeSp1Request;
-use rsp_host_executor::events_hash::{
-    calculate_deposit_hash, calculate_withdrawal_root, count_deposits,
-};
 use serde::{Deserialize, Serialize};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
@@ -60,6 +56,46 @@ const WORKER_TICK: Duration = Duration::from_secs(1);
 
 /// Average L1 block time used to translate `(deadline - current_block)` into wall-clock seconds.
 const L1_BLOCK_SECS: u64 = 12;
+
+/// Number of L1 blocks remaining-to-deadline at which we start warning
+/// loudly that MDBX is blocking challenge resolution. ~30 L1 blocks ≈ 6 min.
+const DEADLINE_WARN_WINDOW_L1_BLOCKS: u64 = 30;
+
+/// TTL on the cached L1 block-number probe used by
+/// [`challenge_close_to_deadline`]. With two workers each ticking once
+/// per second, an uncached probe spends 2 RPC/s while MDBX is behind;
+/// a 5 s TTL caps that at 0.4 RPC/s.
+const L1_BLOCK_CACHE_TTL: Duration = Duration::from_secs(5);
+
+/// Process-wide cache for the most recently fetched L1 block number.
+/// Both challenge workers consult `challenge_close_to_deadline` on every
+/// retry tick when MDBX is behind the disputed range; without this
+/// cache, that path would issue one L1 RPC per worker per second for
+/// the entire duration of the lag.
+static LAST_L1_BLOCK: StdMutex<Option<(u64, Instant)>> = StdMutex::new(None);
+
+/// True when `(deadline - current_l1_block) <= DEADLINE_WARN_WINDOW_L1_BLOCKS`.
+/// Returns `false` on L1 RPC failure — a transient lookup error must
+/// not elevate into an alert.
+async fn challenge_close_to_deadline(shared: &OrchestratorShared, row: &ChallengeRow) -> bool {
+    let cached = {
+        let g = LAST_L1_BLOCK.lock().unwrap_or_else(|e| e.into_inner());
+        g.and_then(|(bn, at)| (at.elapsed() < L1_BLOCK_CACHE_TTL).then_some(bn))
+    };
+    let current = match cached {
+        Some(bn) => bn,
+        None => {
+            let Ok(bn) = shared.config.l1_provider.get_block_number().await else {
+                return false;
+            };
+            let mut g = LAST_L1_BLOCK.lock().unwrap_or_else(|e| e.into_inner());
+            *g = Some((bn, Instant::now()));
+            bn
+        }
+    };
+    let blocks_left = row.deadline.saturating_sub(current);
+    blocks_left <= DEADLINE_WARN_WINDOW_L1_BLOCKS
+}
 
 // ============================================================================
 // Worker entry point — two parallel workers, one per kind
@@ -267,26 +303,35 @@ async fn handle_block_received(
             }
         };
 
-    // 2. Build canonical EIP-4844 blobs from L2 transaction data.
-    let blobs = match rsp_blob_builder::build_blobs_from_l2(
-        &shared.config.l2_provider,
-        from_block,
-        to_block,
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                challenge_id = row.challenge_id,
-                from_block,
-                to_block,
-                err = %e,
-                "build_blobs_from_l2 failed"
-            );
-            return;
-        }
-    };
+    // 2. Build canonical EIP-4844 blobs.
+    let blobs =
+        match crate::blob_builder_mdbx::build_blobs_from_mdbx(&shared.driver, from_block, to_block)
+            .await
+        {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                if challenge_close_to_deadline(shared, row).await {
+                    warn!(
+                        challenge_id = row.challenge_id,
+                        from_block,
+                        to_block,
+                        "MDBX tip behind challenge blob range; deadline approaching — \
+                     worker will retry next tick"
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    challenge_id = row.challenge_id,
+                    from_block,
+                    to_block,
+                    err = %e,
+                    "build_blobs_from_mdbx failed"
+                );
+                return;
+            }
+        };
 
     // 3. Wrap and POST to the proxy.
     let payload = ChallengeSp1Request { client_input: Box::new(client_input), blobs };
@@ -672,12 +717,22 @@ async fn prepare_block_resolve_partial(
 
     let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)?;
 
-    let (headers, leaves, target_idx) =
-        collect_headers_with_target(&cfg.l2_provider, from_block, to_block, Some(commitment))
-            .await
-            .ok_or_else(|| eyre::eyre!("collect_headers_with_target failed"))?;
+    let Some((headers, leaves)) =
+        shared.driver.collect_l2_block_headers(from_block..=to_block).await?
+    else {
+        if challenge_close_to_deadline(shared, row).await {
+            warn!(
+                challenge_id = row.challenge_id,
+                from_block, to_block, "MDBX tip behind disputed range; deadline approaching"
+            );
+        }
+        return Err(eyre::eyre!(
+            "MDBX tip behind challenge range [{from_block}..={to_block}]; \
+             driver will catch up on next tick"
+        ));
+    };
 
-    let idx = target_idx.ok_or_else(|| {
+    let idx = leaves.iter().position(|l| *l == commitment).ok_or_else(|| {
         eyre::eyre!("no matching leaf in batch {} for commitment {commitment}", row.batch_index)
     })?;
 
@@ -704,10 +759,22 @@ async fn prepare_batch_root_resolve_partial(
     let cfg = &shared.config;
     let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)?;
 
-    let (headers, _leaves, _) =
-        collect_headers_with_target(&cfg.l2_provider, from_block, to_block, None)
-            .await
-            .ok_or_else(|| eyre::eyre!("collect_headers_with_target failed"))?;
+    let Some((headers, _leaves)) =
+        shared.driver.collect_l2_block_headers(from_block..=to_block).await?
+    else {
+        if challenge_close_to_deadline(shared, row).await {
+            warn!(
+                challenge_id = row.challenge_id,
+                from_block,
+                to_block,
+                "MDBX tip behind batch-root challenge range; deadline approaching"
+            );
+        }
+        return Err(eyre::eyre!(
+            "MDBX tip behind batch-root challenge range [{from_block}..={to_block}]; \
+             driver will catch up on next tick"
+        ));
+    };
 
     let v1_headers: Vec<L2BlockHeaderV1> = headers
         .into_iter()
@@ -743,10 +810,11 @@ fn lookup_batch_range(shared: &OrchestratorShared, batch_index: u64) -> eyre::Re
 }
 
 /// Resolve the L2 block number that backs the disputed commitment by
-/// scanning the batch's blocks. Returns `None` on RPC failure or absent
-/// match (caller logs and waits for the next tick).
+/// scanning the batch's blocks. Returns `None` on MDBX-not-yet-caught-up,
+/// MDBX read failure, or absent match (caller logs and waits for the
+/// next tick). Pre-`Sp1Proving` phase, deadline is not pressing yet, so
+/// no warn-near-deadline escalation here.
 async fn resolve_block_target(shared: &OrchestratorShared, row: &ChallengeRow) -> Option<u64> {
-    let cfg = &shared.config;
     let commitment = match row.commitment {
         Some(c) => c,
         None => {
@@ -765,10 +833,19 @@ async fn resolve_block_target(shared: &OrchestratorShared, row: &ChallengeRow) -
             return None;
         }
     };
-    let (_, _leaves, target_idx) =
-        collect_headers_with_target(&cfg.l2_provider, from_block, to_block, Some(commitment))
-            .await?;
-    let idx = target_idx?;
+    let (_, leaves) = match shared.driver.collect_l2_block_headers(from_block..=to_block).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!(
+                challenge_id = row.challenge_id,
+                err = %e,
+                "collect_l2_block_headers failed in resolve_block_target"
+            );
+            return None;
+        }
+    };
+    let idx = leaves.iter().position(|l| *l == commitment)?;
     Some(from_block + idx as u64)
 }
 
@@ -789,83 +866,6 @@ fn rollback_status_for(kind: ChallengeKind) -> ChallengeStatus {
         ChallengeKind::Block => ChallengeStatus::Sp1Proved,
         ChallengeKind::BatchRoot => ChallengeStatus::Received,
     }
-}
-
-// ============================================================================
-// Header construction (RPC + receipts → L2BlockHeader)
-// ============================================================================
-
-/// Walk `[from_block, to_block]`, build an `L2BlockHeader` per block from
-/// L2 RPC, and compute the merkle leaf. If `target_commitment` is set,
-/// returns the index of the matching leaf.
-async fn collect_headers_with_target(
-    l2_provider: &alloy_provider::RootProvider,
-    from_block: u64,
-    to_block: u64,
-    target_commitment: Option<B256>,
-) -> Option<(Vec<L2BlockHeader>, Vec<B256>, Option<usize>)> {
-    let count = (to_block - from_block + 1) as usize;
-    let mut headers: Vec<L2BlockHeader> = Vec::with_capacity(count);
-    let mut leaves: Vec<B256> = Vec::with_capacity(count);
-    let mut target_idx: Option<usize> = None;
-    for (i, block_number) in (from_block..=to_block).enumerate() {
-        let header = match build_l2_block_header(l2_provider, block_number).await {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(block_number, err = %e, "failed to build L2BlockHeader");
-                return None;
-            }
-        };
-        let leaf = batch_merkle::compute_leaf(
-            header.previousBlockHash,
-            header.blockHash,
-            header.withdrawalRoot,
-            header.depositRoot,
-        );
-        if let Some(c) = target_commitment {
-            if leaf == c {
-                target_idx = Some(i);
-            }
-        }
-        headers.push(header);
-        leaves.push(leaf);
-    }
-    Some((headers, leaves, target_idx))
-}
-
-async fn build_l2_block_header(
-    l2_provider: &alloy_provider::RootProvider,
-    block_number: u64,
-) -> eyre::Result<L2BlockHeader> {
-    let block = l2_provider
-        .get_block_by_number(block_number.into())
-        .await
-        .map_err(|e| eyre::eyre!("get_block_by_number({block_number}) failed: {e}"))?
-        .ok_or_else(|| eyre::eyre!("block {block_number} not found on L2"))?;
-
-    let receipts: Vec<TransactionReceipt> = l2_provider
-        .get_block_receipts(block_number.into())
-        .await
-        .map_err(|e| eyre::eyre!("get_block_receipts({block_number}) failed: {e}"))?
-        .unwrap_or_default();
-
-    let withdrawal_root = calculate_withdrawal_root(
-        &receipts,
-        BRIDGE_ADDRESS,
-        BRIDGE_WITHDRAWAL_TOPIC,
-        LEGACY_BRIDGE_WITHDRAWAL_TOPIC,
-        BRIDGE_ROLLBACK_TOPIC,
-    );
-    let deposit_root = calculate_deposit_hash(&receipts, BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC);
-    let deposit_count = count_deposits(&receipts, BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC);
-
-    Ok(L2BlockHeader {
-        previousBlockHash: block.header.parent_hash,
-        blockHash: block.header.hash,
-        withdrawalRoot: withdrawal_root,
-        depositRoot: deposit_root,
-        depositCount: deposit_count,
-    })
 }
 
 // ============================================================================
@@ -1126,6 +1126,88 @@ impl RbfObserver for ResolveObserver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_rpc_types::TransactionReceipt;
+    use fluent_stf_primitives::{
+        BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC, BRIDGE_ROLLBACK_TOPIC, BRIDGE_WITHDRAWAL_TOPIC,
+        LEGACY_BRIDGE_WITHDRAWAL_TOPIC,
+    };
+    use l1_rollup_client::L2BlockHeader;
+    use rsp_host_executor::events_hash::{
+        calculate_deposit_hash, calculate_withdrawal_root, count_deposits,
+    };
+
+    /// RPC walk preserved for `real_batch_877_resolve_validation` so the
+    /// integration test can exercise the on-chain math against a remote
+    /// RPC without standing up an MDBX datadir.
+    async fn collect_headers_with_target_rpc(
+        l2_provider: &alloy_provider::RootProvider,
+        from_block: u64,
+        to_block: u64,
+        target_commitment: Option<B256>,
+    ) -> Option<(Vec<L2BlockHeader>, Vec<B256>, Option<usize>)> {
+        let count = (to_block - from_block + 1) as usize;
+        let mut headers: Vec<L2BlockHeader> = Vec::with_capacity(count);
+        let mut leaves: Vec<B256> = Vec::with_capacity(count);
+        let mut target_idx: Option<usize> = None;
+        for (i, block_number) in (from_block..=to_block).enumerate() {
+            let header = match build_l2_block_header_rpc(l2_provider, block_number).await {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(block_number, err = %e, "failed to build L2BlockHeader (test RPC shim)");
+                    return None;
+                }
+            };
+            let leaf = batch_merkle::compute_leaf(
+                header.previousBlockHash,
+                header.blockHash,
+                header.withdrawalRoot,
+                header.depositRoot,
+            );
+            if let Some(c) = target_commitment {
+                if leaf == c {
+                    target_idx = Some(i);
+                }
+            }
+            headers.push(header);
+            leaves.push(leaf);
+        }
+        Some((headers, leaves, target_idx))
+    }
+
+    async fn build_l2_block_header_rpc(
+        l2_provider: &alloy_provider::RootProvider,
+        block_number: u64,
+    ) -> eyre::Result<L2BlockHeader> {
+        let block = l2_provider
+            .get_block_by_number(block_number.into())
+            .await
+            .map_err(|e| eyre::eyre!("get_block_by_number({block_number}) failed: {e}"))?
+            .ok_or_else(|| eyre::eyre!("block {block_number} not found on L2"))?;
+
+        let receipts: Vec<TransactionReceipt> = l2_provider
+            .get_block_receipts(block_number.into())
+            .await
+            .map_err(|e| eyre::eyre!("get_block_receipts({block_number}) failed: {e}"))?
+            .unwrap_or_default();
+
+        let withdrawal_root = calculate_withdrawal_root(
+            &receipts,
+            BRIDGE_ADDRESS,
+            BRIDGE_WITHDRAWAL_TOPIC,
+            LEGACY_BRIDGE_WITHDRAWAL_TOPIC,
+            BRIDGE_ROLLBACK_TOPIC,
+        );
+        let deposit_root = calculate_deposit_hash(&receipts, BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC);
+        let deposit_count = count_deposits(&receipts, BRIDGE_ADDRESS, BRIDGE_DEPOSIT_TOPIC);
+
+        Ok(L2BlockHeader {
+            previousBlockHash: block.header.parent_hash,
+            blockHash: block.header.hash,
+            withdrawalRoot: withdrawal_root,
+            depositRoot: deposit_root,
+            depositCount: deposit_count,
+        })
+    }
 
     /// End-to-end check of the V1 batch-root resolve invariants against
     /// real Fluent testnet data for batch 877. The contract's
@@ -1154,9 +1236,9 @@ mod tests {
             rsp_provider::create_provider(url).expect("failed to build L2 provider");
 
         let (headers_877, leaves_877, _) =
-            collect_headers_with_target(&l2, BATCH_877_FROM, BATCH_877_TO, None)
+            collect_headers_with_target_rpc(&l2, BATCH_877_FROM, BATCH_877_TO, None)
                 .await
-                .expect("collect_headers_with_target(877) failed");
+                .expect("collect_headers_with_target_rpc(877) failed");
         assert_eq!(
             leaves_877.len() as u64,
             BATCH_877_TO - BATCH_877_FROM + 1,
@@ -1176,9 +1258,9 @@ mod tests {
         }
 
         let (headers_876, _, _) =
-            collect_headers_with_target(&l2, BATCH_876_FROM, BATCH_876_TO, None)
+            collect_headers_with_target_rpc(&l2, BATCH_876_FROM, BATCH_876_TO, None)
                 .await
-                .expect("collect_headers_with_target(876) failed");
+                .expect("collect_headers_with_target_rpc(876) failed");
         let last_header_876 = headers_876.last().expect("batch 876 has at least one block");
 
         assert_eq!(
