@@ -100,7 +100,7 @@ pub fn calculate_withdrawal_root(
 
 /// Count `ReceivedMessage` events from `bridge_address` in successful
 /// receipts. Used to populate `L2BlockHeader.depositCount` for
-/// `resolveBatchRootChallenge` calldata.
+/// `resolveBlockChallenge` calldata.
 pub fn count_deposits(
     receipts: &[TransactionReceipt],
     bridge_address: Address,

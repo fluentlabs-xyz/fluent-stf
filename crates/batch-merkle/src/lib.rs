@@ -6,7 +6,7 @@
 //! the host orchestrator (`bin/witness-orchestrator`). Solidity reference:
 //! `contracts/libraries/MerkleTree.sol` and
 //! `contracts/rollup/Rollup.sol::_computeCommitment` /
-//! `_calculateBatchRoot` at release/v1.0.0.
+//! `_calculateBatchRoot`.
 
 use alloy_primitives::{keccak256, B256};
 

@@ -2,8 +2,6 @@
 //! Fluent rollup contract on L1. Used by `bin/witness-orchestrator` (read +
 //! write) and `bin/proxy` (read only, for batch metadata lookup).
 //!
-//! Targets the `release/v1.0.0` deployment of `Rollup.sol`.
-//!
 //! What lives here:
 //! - sol! ABI: all on-chain events (lifecycle, challenge, rewards) and the `preconfirmBatch`
 //!   function.
@@ -149,6 +147,19 @@ sol! {
         uint16 depositCount;
     }
 
+    /// Mirrors `struct L2BlockHeaderV1` in `IRollupTypes.sol` — the compact
+    /// header passed to `resolveBatchRootChallenge`. Drops `previousBlockHash`
+    /// (the contract chains it from `previousBatch.toBlockHash` storage) and
+    /// `depositCount` (not part of the leaf hash and not consumed by V1
+    /// resolve). Field order is consensus-critical: `_calculateBatchRootV1`
+    /// keccaks `prevBlockHash || blockHash || withdrawalRoot || depositRoot`
+    /// — same layout as V0, only the `prevBlockHash` source moves off-call.
+    struct L2BlockHeaderV1 {
+        bytes32 blockHash;
+        bytes32 withdrawalRoot;
+        bytes32 depositRoot;
+    }
+
     /// Mirrors `MerkleTree.MerkleProof` in `MerkleTree.sol`. `nonce` is
     /// the leaf index; `proof` is a packed sequence of 32-byte sibling
     /// hashes from leaf to root.
@@ -205,14 +216,15 @@ sol! {
         bytes sp1Proof
     ) external;
 
-    /// Resolve a batch-root dispute by reconstructing the merkle root
-    /// over the full batch and chaining against the previous batch's
-    /// last block.
+    /// Resolve a batch-root dispute. The contract reads
+    /// `previousBatch.toBlockHash` from storage and runs
+    /// `_calculateBatchRootV1(prevBlockHash, blockHeaders)` over the
+    /// V1-shaped headers, chaining `prevBlockHash` forward via each
+    /// header's `blockHash`. Reverts with `InvalidBatchRoot` if the
+    /// reconstruction does not match the stored `batch.batchRoot`.
     function resolveBatchRootChallenge(
         uint256 batchIndex,
-        L2BlockHeader lastBlockHeaderInPreviousBatch,
-        L2BlockHeader[] blockHeaders,
-        MerkleProof lastBlockProof
+        L2BlockHeaderV1[] blockHeaders
     ) external;
 }
 
@@ -616,23 +628,20 @@ pub async fn prepare_resolve_block_challenge_tx(
 }
 
 /// Build calldata + gas-limit for `resolveBatchRootChallenge`. No SP1
-/// proof; the contract re-derives the merkle root from `block_headers`.
+/// proof; the contract re-derives the merkle root from `block_headers`
+/// chained against `previousBatch.toBlockHash` from storage.
 /// Returns a [`RollupTxPartial`]; caller attaches a nonce just before
 /// broadcast.
 pub async fn prepare_resolve_batch_root_challenge_tx(
     provider: &impl Provider,
     contract_addr: Address,
     batch_index: u64,
-    last_block_header_in_previous_batch: L2BlockHeader,
-    block_headers: Vec<L2BlockHeader>,
-    last_block_proof: MerkleProof,
+    block_headers: Vec<L2BlockHeaderV1>,
     signer: Address,
 ) -> Result<RollupTxPartial> {
     let call = resolveBatchRootChallengeCall {
         batchIndex: U256::from(batch_index),
-        lastBlockHeaderInPreviousBatch: last_block_header_in_previous_batch,
         blockHeaders: block_headers,
-        lastBlockProof: last_block_proof,
     };
     build_partial(
         provider,

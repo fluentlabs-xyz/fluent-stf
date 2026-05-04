@@ -6,8 +6,10 @@
 //!   before broadcasting the result, asserts the proxy's reported `vk_hash` matches the on-chain
 //!   `programVKey()` cached at startup. Builds a merkle inclusion proof from L2 RPC data and
 //!   submits `resolveBlockChallenge`.
-//! - **Batch-root** challenges: `received → dispatched → resolved`. Reconstructs the merkle root
-//!   locally from L2 RPC headers + receipts (no SP1) and submits `resolveBatchRootChallenge`.
+//! - **Batch-root** challenges: `received → dispatched → resolved`. Builds an `L2BlockHeaderV1[]`
+//!   from L2 RPC headers + receipts (no SP1, no local merkle root reconstruction) and submits
+//!   `resolveBatchRootChallenge` — the contract recomputes the root from these headers chained
+//!   against the previous batch's `toBlockHash` from storage.
 //!
 //! Workers do NOT share state beyond the SQLite handle and the
 //! `NonceAllocator`. A long-running SP1 proof on the Block-worker
@@ -34,7 +36,7 @@ use fluent_stf_primitives::{
 };
 use l1_rollup_client::{
     prepare_resolve_batch_root_challenge_tx, prepare_resolve_block_challenge_tx, L2BlockHeader,
-    MerkleProof, RollupTxPartial,
+    L2BlockHeaderV1, MerkleProof, RollupTxPartial,
 };
 use nitro_types::ChallengeSp1Request;
 use rsp_host_executor::events_hash::{
@@ -700,35 +702,27 @@ async fn prepare_batch_root_resolve_partial(
     row: &ChallengeRow,
 ) -> eyre::Result<RollupTxPartial> {
     let cfg = &shared.config;
-    if row.batch_index == 0 {
-        return Err(eyre::eyre!("batch 0 is genesis — cannot resolve batch-root challenge"));
-    }
-
     let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)?;
-    let (prev_from, prev_to) = lookup_batch_range(shared, row.batch_index - 1)?;
 
     let (headers, _leaves, _) =
         collect_headers_with_target(&cfg.l2_provider, from_block, to_block, None)
             .await
-            .ok_or_else(|| eyre::eyre!("collect_headers_with_target (current) failed"))?;
-    let (prev_headers, prev_leaves, _) =
-        collect_headers_with_target(&cfg.l2_provider, prev_from, prev_to, None)
-            .await
-            .ok_or_else(|| eyre::eyre!("collect_headers_with_target (previous) failed"))?;
+            .ok_or_else(|| eyre::eyre!("collect_headers_with_target failed"))?;
 
-    let prev_last_idx = prev_headers.len() - 1;
-    let last_block_header_in_previous_batch = prev_headers[prev_last_idx].clone();
-    let (proof_nonce, proof_bytes) = batch_merkle::build_merkle_proof(&prev_leaves, prev_last_idx);
-    let last_block_proof =
-        MerkleProof { nonce: U256::from(proof_nonce), proof: Bytes::from(proof_bytes) };
+    let v1_headers: Vec<L2BlockHeaderV1> = headers
+        .into_iter()
+        .map(|h| L2BlockHeaderV1 {
+            blockHash: h.blockHash,
+            withdrawalRoot: h.withdrawalRoot,
+            depositRoot: h.depositRoot,
+        })
+        .collect();
 
     prepare_resolve_batch_root_challenge_tx(
         &cfg.l1_provider,
         cfg.l1_rollup_addr,
         row.batch_index,
-        last_block_header_in_previous_batch,
-        headers,
-        last_block_proof,
+        v1_headers,
         cfg.l1_signer_address,
     )
     .await
@@ -1133,30 +1127,14 @@ impl RbfObserver for ResolveObserver<'_> {
 mod tests {
     use super::*;
 
-    /// Pure-Rust mirror of `MerkleTree.verifyMerkleProof` from the
-    /// rollup contract. `nonce` is the leaf index; `proof` is a packed
-    /// sequence of 32-byte sibling hashes from leaf to root.
-    fn verify_merkle_proof(root: B256, leaf: B256, mut nonce: u64, proof: &[u8]) -> bool {
-        if !proof.len().is_multiple_of(32) {
-            return false;
-        }
-        let mut hash = leaf;
-        for chunk in proof.chunks_exact(32) {
-            let sibling = B256::from_slice(chunk);
-            hash = if nonce.is_multiple_of(2) {
-                batch_merkle::keccak_pair(hash, sibling)
-            } else {
-                batch_merkle::keccak_pair(sibling, hash)
-            };
-            nonce /= 2;
-        }
-        hash == root
-    }
-
-    /// End-to-end mirror of `Rollup.resolveBatchRootChallenge`'s
-    /// validation against real Fluent testnet data for batch 877. Runs
-    /// the four checks the contract performs that depend on real chain
-    /// state.
+    /// End-to-end check of the V1 batch-root resolve invariants against
+    /// real Fluent testnet data for batch 877. The contract's
+    /// `_calculateBatchRootV1` chains `prevBlockHash` from
+    /// `previousBatch.toBlockHash` storage forward through
+    /// `headers[i].blockHash`; for a chain-intact batch the result is
+    /// identical to the V0 commit-time root, so checking the V0
+    /// reconstruction plus the chain-linkage invariants is equivalent
+    /// to mirroring the on-chain V1 path.
     #[tokio::test]
     #[ignore = "requires INTEGRATION_L2_RPC_URL; hits real L2 RPC for ~2k blocks"]
     async fn real_batch_877_resolve_validation() {
@@ -1168,9 +1146,6 @@ mod tests {
 
         const BATCH_876_FROM: u64 = 25_447_799;
         const BATCH_876_TO: u64 = 25_448_822;
-        const BATCH_876_ROOT: B256 = alloy_primitives::b256!(
-            "0x0631672b00a8e80b9750db0b89a32cd4eb58929fd9fb196666f1e637e5ac0020"
-        );
 
         let rpc_url = std::env::var("INTEGRATION_L2_RPC_URL")
             .expect("INTEGRATION_L2_RPC_URL must be set to run this integration test");
@@ -1200,27 +1175,15 @@ mod tests {
             );
         }
 
-        let (headers_876, leaves_876, _) =
+        let (headers_876, _, _) =
             collect_headers_with_target(&l2, BATCH_876_FROM, BATCH_876_TO, None)
                 .await
                 .expect("collect_headers_with_target(876) failed");
-        let last_idx_876 = leaves_876.len() - 1;
-        let last_header_876 = &headers_876[last_idx_876];
+        let last_header_876 = headers_876.last().expect("batch 876 has at least one block");
 
         assert_eq!(
             last_header_876.blockHash, headers_877[0].previousBlockHash,
             "cross-batch chain break: last(876).blockHash != first(877).previousBlockHash"
-        );
-
-        let last_leaf_876 = leaves_876[last_idx_876];
-        let (nonce, proof_bytes) = batch_merkle::build_merkle_proof(&leaves_876, last_idx_876);
-        assert!(
-            verify_merkle_proof(BATCH_876_ROOT, last_leaf_876, nonce, &proof_bytes),
-            "merkle inclusion proof for last leaf of batch 876 failed against on-chain root"
-        );
-
-        println!(
-            "✓ batch 877 resolve calldata validates: root={local_root_877}, chain linkage OK, cross-batch link OK, last-leaf-of-876 inclusion proof OK"
         );
     }
 }
