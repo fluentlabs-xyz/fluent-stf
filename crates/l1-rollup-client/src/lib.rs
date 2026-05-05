@@ -222,6 +222,21 @@ sol! {
         bytes sp1Proof
     ) external;
 
+    /// Open a single-block dispute. Caller must hold `CHALLENGER_ROLE`
+    /// and pay `_challengeDepositAmount` as `msg.value`. The contract
+    /// re-derives the leaf via `_computeCommitment(blockHeader)`,
+    /// verifies `blockProof` against the batch's stored `batchRoot`,
+    /// transitions the batch from `Preconfirmed` to `Challenged`, and
+    /// emits `BlockChallenged(batchIndex, commitment, challenger)`.
+    /// Reverts: `IncorrectChallengeDeposit`, `InvalidBlockProof`,
+    /// `InvalidBatchStatus`, `BlockAlreadyChallenged`,
+    /// `BatchRootChallengeOpen`, `ChallengeTooLate`, `RollupCorrupted`.
+    function challengeBlock(
+        uint256 batchIndex,
+        L2BlockHeader blockHeader,
+        MerkleProof blockProof
+    ) external payable;
+
     /// Resolve a batch-root dispute. The contract reads
     /// `previousBatch.toBlockHash` from storage and runs
     /// `_calculateBatchRootV1(prevBlockHash, blockHeaders)` over the

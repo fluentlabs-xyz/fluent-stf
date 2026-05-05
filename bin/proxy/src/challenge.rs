@@ -104,19 +104,7 @@ pub(crate) async fn run_challenge_proof(
                     "Challenge proof ready"
                 );
 
-                let proof_bytes = match bincode::serialize(&proof.proof) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        if let Some(db) = crate::db::db() {
-                            db.set_challenge_failed(
-                                challenge_id,
-                                &format!("Failed to serialize proof: {e}"),
-                            );
-                        }
-                        return;
-                    }
-                };
-
+                let proof_bytes = proof.bytes();
                 let public_values = proof.public_values.as_slice().to_vec();
                 if let Some(db) = crate::db::db() {
                     db.set_challenge_completed(challenge_id, &proof_bytes, &public_values);
@@ -192,18 +180,7 @@ pub(crate) async fn resume_challenge_proof(
     );
     match client.wait_proof(sp1_request_id, Some(WAIT_PROOF_TIMEOUT), None).await {
         Ok(proof) => {
-            let proof_bytes = match bincode::serialize(&proof.proof) {
-                Ok(b) => b,
-                Err(e) => {
-                    if let Some(db) = crate::db::db() {
-                        db.set_challenge_failed(
-                            challenge_id,
-                            &format!("resume: serialize failed: {e}"),
-                        );
-                    }
-                    return;
-                }
-            };
+            let proof_bytes = proof.bytes();
             let public_values = proof.public_values.as_slice().to_vec();
             if let Some(db) = crate::db::db() {
                 db.set_challenge_completed(challenge_id, &proof_bytes, &public_values);
