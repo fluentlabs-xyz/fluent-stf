@@ -782,12 +782,6 @@ impl NonceAllocator {
         self.next.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Same as [`Self::release_with_outcome`] but discards the result.
-    /// Use when the caller does not record leak metrics.
-    pub fn release(&self, nonce: u64) {
-        let _ = self.release_with_outcome(nonce);
-    }
-
     /// Attempt to reclaim `nonce` when a pre-broadcast step failed (e.g.,
     /// shutdown signal between allocate and broadcast). Only succeeds when
     /// `nonce + 1` is still the head of the counter — if another allocation
@@ -911,7 +905,7 @@ mod tests {
         let alloc = NonceAllocator { next: AtomicU64::new(10), resync_lock: AsyncMutex::new(()) };
         let n = alloc.allocate();
         assert_eq!(n, 10);
-        alloc.release(n);
+        let _ = alloc.release_with_outcome(n);
         assert_eq!(alloc.peek(), 10, "tail release must rewind");
         assert_eq!(alloc.allocate(), 10);
     }
@@ -932,7 +926,7 @@ mod tests {
         let alloc = NonceAllocator { next: AtomicU64::new(10), resync_lock: AsyncMutex::new(()) };
         let n0 = alloc.allocate(); // 10
         let _n1 = alloc.allocate(); // 11
-        alloc.release(n0);
+        let _ = alloc.release_with_outcome(n0);
         assert_eq!(alloc.peek(), 12, "release of non-tail must not rewind — the gap is accepted");
     }
 

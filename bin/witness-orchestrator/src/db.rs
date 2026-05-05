@@ -480,16 +480,16 @@ impl Db {
     }
 
     /// Lowest-index batch ready for `/sign-batch-root`: status=accepted,
-    /// `signature IS NULL`, every block in `[from_block, to_block]` already
-    /// has a row in `block_responses`.
+    /// `signature IS NULL`. Caller must additionally check
+    /// `cache.has_range(from, to)` against the in-memory `ResponseCache` —
+    /// gating on the SQL `block_responses` table would slip an extra writer-
+    /// flush cycle (~100 ms per batch) of latency, since the cache is
+    /// always ahead of the async-flushed DB rows.
     pub(crate) fn first_accepted_unsigned(&self) -> Option<u64> {
         self.conn
             .query_row(
                 "SELECT b.batch_index FROM batches b \
                  WHERE b.status = 'accepted' AND b.signature IS NULL \
-                   AND (b.to_block - b.from_block + 1) = ( \
-                         SELECT COUNT(*) FROM block_responses \
-                         WHERE block_number BETWEEN b.from_block AND b.to_block) \
                  ORDER BY b.batch_index LIMIT 1",
                 [],
                 |row| row.get::<_, i64>(0),
@@ -1562,6 +1562,296 @@ pub(crate) async fn db_send_sync(
     db_tx.send(DbCommand::Sync(op, ack_tx)).map_err(|_| eyre::eyre!("db writer channel closed"))?;
     ack_rx.await.map_err(|_| eyre::eyre!("db writer dropped ack"))?;
     Ok(())
+}
+
+// ============================================================================
+// Typed write wrappers — non-`db` modules call these instead of constructing
+// `SyncOp` / `*Patch` directly.
+// ============================================================================
+
+// ── Batch ops ───────────────────────────────────────────────────────────────
+
+pub(crate) async fn record_signature(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+    response: SubmitBatchResponse,
+) -> eyre::Result<()> {
+    let patch = BatchPatch { signature: Some(Some(response)), ..Default::default() };
+    db_send_sync(db_tx, SyncOp::PatchBatch { batch_index, patch }).await
+}
+
+pub(crate) async fn invalidate_signature(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+) -> eyre::Result<()> {
+    db_send_sync(db_tx, SyncOp::InvalidateSignature { batch_index }).await
+}
+
+pub(crate) async fn record_first_broadcast(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+    tx_hash: B256,
+    nonce: u64,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> eyre::Result<()> {
+    let patch = BatchPatch {
+        status: Some(BatchStatus::Dispatched),
+        tx_hash: Some(Some(tx_hash)),
+        nonce: Some(Some(nonce)),
+        max_fee_per_gas: Some(Some(max_fee_per_gas)),
+        max_priority_fee_per_gas: Some(Some(max_priority_fee_per_gas)),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchBatch { batch_index, patch }).await
+}
+
+pub(crate) async fn record_rebroadcast(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+    tx_hash: B256,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> eyre::Result<()> {
+    let patch = BatchPatch {
+        tx_hash: Some(Some(tx_hash)),
+        max_fee_per_gas: Some(Some(max_fee_per_gas)),
+        max_priority_fee_per_gas: Some(Some(max_priority_fee_per_gas)),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchBatch { batch_index, patch }).await
+}
+
+/// Status stays `Dispatched` — the L1 listener owns the
+/// `Dispatched → Preconfirmed` transition via `ObservePreconfirmed`.
+pub(crate) async fn record_receipt_observed(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+    l1_block: u64,
+) -> eyre::Result<()> {
+    let patch = BatchPatch { l1_block: Some(Some(l1_block)), ..Default::default() };
+    db_send_sync(db_tx, SyncOp::PatchBatch { batch_index, patch }).await
+}
+
+pub(crate) async fn observe_finalized(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+) -> eyre::Result<()> {
+    db_send_sync(db_tx, SyncOp::ObserveFinalized { batch_index }).await
+}
+
+pub(crate) async fn observe_reorg_to_dispatched(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+) -> eyre::Result<()> {
+    db_send_sync(db_tx, SyncOp::ObserveReorgToDispatched { batch_index }).await
+}
+
+pub(crate) async fn rollback_to_accepted(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+) -> eyre::Result<()> {
+    db_send_sync(db_tx, SyncOp::RollbackToAccepted { batch_index }).await
+}
+
+pub(crate) async fn observe_committed(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+    from_block: u64,
+    to_block: u64,
+) -> eyre::Result<()> {
+    db_send_sync(db_tx, SyncOp::ObserveCommitted { batch_index, from_block, to_block }).await
+}
+
+pub(crate) async fn observe_submitted(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+) -> eyre::Result<()> {
+    db_send_sync(db_tx, SyncOp::ObserveSubmitted { batch_index }).await
+}
+
+pub(crate) async fn observe_preconfirmed(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+    tx_hash: B256,
+    l1_block: u64,
+) -> eyre::Result<()> {
+    db_send_sync(db_tx, SyncOp::ObservePreconfirmed { batch_index, tx_hash, l1_block }).await
+}
+
+pub(crate) async fn wipe_for_revert(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    start_batch_id: u64,
+    l1_block: u64,
+) -> eyre::Result<()> {
+    db_send_sync(db_tx, SyncOp::WipeForRevert { start_batch_id, l1_block }).await
+}
+
+// ── Challenge ops ───────────────────────────────────────────────────────────
+
+pub(crate) async fn insert_challenge(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    row: ChallengeRow,
+) -> eyre::Result<()> {
+    db_send_sync(db_tx, SyncOp::InsertChallenge(row)).await
+}
+
+pub(crate) async fn record_challenge_resolved(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch { status: Some(ChallengeStatus::Resolved), ..Default::default() };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+pub(crate) async fn record_challenge_failed(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+pub(crate) async fn record_challenge_sp1_requested(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+    request_id: B256,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch {
+        status: Some(ChallengeStatus::Sp1Proving),
+        sp1_request_id: Some(Some(request_id)),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+pub(crate) async fn record_challenge_sp1_proved(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+    proof_bytes: Vec<u8>,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch {
+        status: Some(ChallengeStatus::Sp1Proved),
+        sp1_proof_bytes: Some(Some(proof_bytes)),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+/// Proxy returned 404 for the request_id we held — reset to Received +
+/// clear the request_id so the worker re-issues from scratch.
+pub(crate) async fn record_challenge_sp1_lost_reset(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch {
+        status: Some(ChallengeStatus::Received),
+        sp1_request_id: Some(None),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+/// Stamp `last_polled_at = now()` BEFORE the SP1 status RPC. The
+/// `find_active_block_challenge` SQL excludes rows polled within the
+/// poll-interval window, so stamping first prevents a tight retry loop
+/// against the proxy if the RPC errors mid-flight.
+pub(crate) async fn stamp_challenge_polled(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch { last_polled_at: Some(Some(now_ts())), ..Default::default() };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+pub(crate) async fn record_challenge_first_broadcast(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+    tx_hash: B256,
+    nonce: u64,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch {
+        status: Some(ChallengeStatus::Dispatched),
+        tx_hash: Some(Some(tx_hash)),
+        nonce: Some(Some(nonce)),
+        max_fee_per_gas: Some(Some(max_fee_per_gas)),
+        max_priority_fee_per_gas: Some(Some(max_priority_fee_per_gas)),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+pub(crate) async fn record_challenge_rebroadcast(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+    tx_hash: B256,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch {
+        tx_hash: Some(Some(tx_hash)),
+        max_fee_per_gas: Some(Some(max_fee_per_gas)),
+        max_priority_fee_per_gas: Some(Some(max_priority_fee_per_gas)),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+pub(crate) async fn record_challenge_submitted(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+    l1_block: u64,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch { l1_block: Some(Some(l1_block)), ..Default::default() };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+/// RBF state (nonce, fees, tx_hash) is intentionally preserved so the
+/// active worker re-broadcasts the same signed tx against the new chain
+/// canonicalisation. Only `l1_block` is cleared.
+pub(crate) async fn clear_challenge_l1_block(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch { l1_block: Some(None), ..Default::default() };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+pub(crate) async fn rollback_challenge_dispatch(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+    rollback_status: ChallengeStatus,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch {
+        status: Some(rollback_status),
+        tx_hash: Some(None),
+        nonce: Some(None),
+        max_fee_per_gas: Some(None),
+        max_priority_fee_per_gas: Some(None),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
+/// Contrast with `rollback_challenge_dispatch`: status is **not** changed
+/// here. The L1 nonce was burned by the reverted tx; the worker re-runs
+/// its lifecycle on the next tick (allocating a fresh nonce) without
+/// regressing through the per-kind status transitions.
+pub(crate) async fn clear_challenge_rbf_state_post_mine_revert(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch {
+        tx_hash: Some(None),
+        nonce: Some(None),
+        max_fee_per_gas: Some(None),
+        max_priority_fee_per_gas: Some(None),
+        l1_block: Some(None),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
 }
 
 #[cfg(test)]

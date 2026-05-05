@@ -4,14 +4,12 @@
 //! Layout:
 //! - [`run`] — entry point called by the dispatcher worker.
 //! - [`preflight`] — on-chain status check that decides whether to broadcast.
-//! - [`prepare_partial`] / [`estimate_initial_fees_fresh`] — set up calldata, gas-limit, EIP-1559
-//!   fees BEFORE allocating a nonce (defer-allocate ordering).
+//! - [`prepare_partial`] / [`estimate_initial_fees`] — set up calldata, gas-limit, EIP-1559 fees
+//!   BEFORE allocating a nonce (defer-allocate ordering).
 //! - [`bump_loop`] — broadcast → sleep+poll → bump → broadcast cycle.
 //! - [`try_broadcast`] / [`poll_for_terminal`] — extracted phases of the loop.
 //! - [`handle_submitted`] / [`handle_reverted`] / [`handle_failed_then_undispatch`] — terminal
 //!   outcome handlers, used by both the loop and `preflight`.
-
-use std::time::Duration;
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
@@ -25,17 +23,17 @@ use tracing::{error, info, warn};
 use async_trait::async_trait;
 
 use crate::{
-    db::{db_send_sync, BatchPatch, BatchStatus, RbfResumeState, SyncOp},
+    db::{self, BatchStatus, RbfResumeState},
     orchestrator::{
-        classify_revert, DispatchBackoff, OrchestratorShared, RevertKind, STUCK_AT_CAP_TIMEOUT,
+        classify_revert, DispatchBackoff, OrchestratorShared, RevertKind, STUCK_AT_CAP_BLOCKS,
     },
 };
 
 /// State-mutation hooks for the RBF lifecycle. Implemented by the
-/// preconfirm dispatcher (writes the `batches` table via `db_send_sync`)
-/// and the challenge resolver (writes the `challenges` table the same way).
-/// Methods are `async fn` because mutations route through the
-/// sync-write actor (`db_send_sync`) and await durability.
+/// preconfirm dispatcher (writes the `batches` table via the typed `db::*`
+/// wrappers) and the challenge resolver (writes the `challenges` table the
+/// same way). Methods are `async fn` because mutations route through the
+/// sync-write actor and await durability.
 #[async_trait]
 pub(crate) trait RbfObserver: Send + Sync {
     /// First successful broadcast. Records `status=Dispatched` + RBF state.
@@ -57,7 +55,7 @@ pub(crate) trait RbfObserver: Send + Sync {
 }
 
 /// Preconfirm-path observer: routes state mutations directly to SQLite via
-/// `db_send_sync`. No in-memory mirror.
+/// typed `db::*` wrappers. No in-memory mirror.
 pub(crate) struct PreconfirmObserver<'a> {
     shared: &'a OrchestratorShared,
     batch_index: u64,
@@ -73,17 +71,13 @@ impl<'a> PreconfirmObserver<'a> {
 #[async_trait]
 impl RbfObserver for PreconfirmObserver<'_> {
     async fn on_first_broadcast(&self, hash: B256, fee: u128, tip: u128) {
-        let patch = BatchPatch {
-            status: Some(BatchStatus::Dispatched),
-            tx_hash: Some(Some(hash)),
-            nonce: Some(Some(self.nonce)),
-            max_fee_per_gas: Some(Some(fee)),
-            max_priority_fee_per_gas: Some(Some(tip)),
-            ..Default::default()
-        };
-        if let Err(e) = db_send_sync(
+        if let Err(e) = db::record_first_broadcast(
             &self.shared.db_tx,
-            SyncOp::PatchBatch { batch_index: self.batch_index, patch },
+            self.batch_index,
+            hash,
+            self.nonce,
+            fee,
+            tip,
         )
         .await
         {
@@ -101,17 +95,8 @@ impl RbfObserver for PreconfirmObserver<'_> {
     }
 
     async fn on_rebroadcast(&self, hash: B256, fee: u128, tip: u128) {
-        let patch = BatchPatch {
-            tx_hash: Some(Some(hash)),
-            max_fee_per_gas: Some(Some(fee)),
-            max_priority_fee_per_gas: Some(Some(tip)),
-            ..Default::default()
-        };
-        if let Err(e) = db_send_sync(
-            &self.shared.db_tx,
-            SyncOp::PatchBatch { batch_index: self.batch_index, patch },
-        )
-        .await
+        if let Err(e) =
+            db::record_rebroadcast(&self.shared.db_tx, self.batch_index, hash, fee, tip).await
         {
             error!(batch_index = self.batch_index, err = %e, "record_rbf_bump failed");
         }
@@ -127,12 +112,8 @@ impl RbfObserver for PreconfirmObserver<'_> {
     async fn on_submitted(&self, hash: B256, l1_block: u64) {
         // Record the L1 block of the receipt; status stays `Dispatched`. The L1
         // listener owns the `Dispatched → Preconfirmed` transition (Q3/Q4).
-        let patch = BatchPatch { l1_block: Some(Some(l1_block)), ..Default::default() };
-        if let Err(e) = db_send_sync(
-            &self.shared.db_tx,
-            SyncOp::PatchBatch { batch_index: self.batch_index, patch },
-        )
-        .await
+        if let Err(e) =
+            db::record_receipt_observed(&self.shared.db_tx, self.batch_index, l1_block).await
         {
             error!(batch_index = self.batch_index, err = %e, "record_receipt_observed failed");
         }
@@ -151,23 +132,13 @@ impl RbfObserver for PreconfirmObserver<'_> {
             ?kind,
             "preconfirmBatch REVERTED on L1 — rolling back to Accepted"
         );
-        if let Err(e) = db_send_sync(
-            &self.shared.db_tx,
-            SyncOp::RollbackToAccepted { batch_index: self.batch_index },
-        )
-        .await
-        {
+        if let Err(e) = db::rollback_to_accepted(&self.shared.db_tx, self.batch_index).await {
             error!(batch_index = self.batch_index, err = %e, "rollback_to_accepted failed");
         }
     }
 
     async fn on_pre_receipt_failure(&self, _reason: &'static str) {
-        if let Err(e) = db_send_sync(
-            &self.shared.db_tx,
-            SyncOp::RollbackToAccepted { batch_index: self.batch_index },
-        )
-        .await
-        {
+        if let Err(e) = db::rollback_to_accepted(&self.shared.db_tx, self.batch_index).await {
             error!(batch_index = self.batch_index, err = %e, "rollback_to_accepted failed");
         }
     }
@@ -227,7 +198,7 @@ pub(crate) async fn run(
             Some(resume),
             resume.max_fee_per_gas,
             resume.max_priority_fee_per_gas,
-            STUCK_AT_CAP_TIMEOUT,
+            STUCK_AT_CAP_BLOCKS,
             &observer,
             backoff,
         )
@@ -242,7 +213,14 @@ pub(crate) async fn run(
         return;
     };
 
-    let Some((fee, tip)) = estimate_initial_fees_fresh(shared, batch_index, backoff).await else {
+    let Some((fee, tip)) = estimate_initial_fees(
+        shared,
+        FeeEstimateLog { batch_index: Some(batch_index), challenge_id: None, kind: None },
+        Some(backoff),
+        "estimate_eip1559_fees failed",
+    )
+    .await
+    else {
         return;
     };
 
@@ -260,7 +238,7 @@ pub(crate) async fn run(
         None,
         fee,
         tip,
-        STUCK_AT_CAP_TIMEOUT,
+        STUCK_AT_CAP_BLOCKS,
         &observer,
         backoff,
     )
@@ -270,11 +248,11 @@ pub(crate) async fn run(
 /// RBF bump-and-poll lifecycle. State mutations are delegated to
 /// `observer`; caller is responsible for pre-flight checks + template
 /// construction, and `nonce` must already be allocated from
-/// `shared.nonce_allocator`. `wall_clock_budget` caps the time spent in
-/// the bump loop after the fee cap is first hit — preconfirm callers pass
-/// `STUCK_AT_CAP_TIMEOUT` directly; challenge callers compute it from the
-/// row's deadline so a late-arriving dispute does not blow its window
-/// inside an at-cap retry storm.
+/// `shared.nonce_allocator`. `block_budget` caps L1 blocks spent at fee
+/// cap before undispatching — preconfirm callers pass `STUCK_AT_CAP_BLOCKS`
+/// directly; challenge callers compute `min(STUCK_AT_CAP_BLOCKS, blocks_to_deadline)`
+/// so a late-arriving dispute does not blow its window inside an at-cap
+/// retry storm.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_generic(
     shared: &OrchestratorShared,
@@ -284,7 +262,7 @@ pub(crate) async fn run_generic(
     resume: Option<RbfResumeState>,
     initial_fee: u128,
     initial_tip: u128,
-    wall_clock_budget: Duration,
+    block_budget: u64,
     observer: &dyn RbfObserver,
     backoff: &mut DispatchBackoff,
 ) {
@@ -296,7 +274,7 @@ pub(crate) async fn run_generic(
         resume,
         initial_fee,
         initial_tip,
-        wall_clock_budget,
+        block_budget,
         observer,
         backoff,
     )
@@ -447,11 +425,8 @@ async fn handle_already_preconfirmed(
         l1_block = info.l1_block,
         "pre-flight: batch already preconfirmed on L1 — recording preconfirmation"
     );
-    if let Err(e) = db_send_sync(
-        &shared.db_tx,
-        SyncOp::ObservePreconfirmed { batch_index, tx_hash: info.tx_hash, l1_block: info.l1_block },
-    )
-    .await
+    if let Err(e) =
+        db::observe_preconfirmed(&shared.db_tx, batch_index, info.tx_hash, info.l1_block).await
     {
         warn!(batch_index, err = %e, "observe_preconfirmed failed");
         backoff.apply("observe_preconfirmed failed");
@@ -493,13 +468,23 @@ async fn prepare_partial(
     }
 }
 
-/// Estimate initial EIP-1559 fees for a fresh dispatch. Resume paths
-/// reuse the persisted fees and skip this. Runs before nonce allocation
-/// so that an RPC failure here cannot leak a nonce.
-async fn estimate_initial_fees_fresh(
+/// Log-keys context for `estimate_initial_fees`. Tracing-only; no
+/// behavioural effect.
+pub(crate) struct FeeEstimateLog<'a> {
+    pub batch_index: Option<u64>,
+    pub challenge_id: Option<i64>,
+    pub kind: Option<&'a str>,
+}
+
+/// Estimate initial EIP-1559 fees, clamped to `rbf_max_fee_per_gas_wei`.
+/// Runs before nonce allocation so an RPC failure here cannot leak a
+/// nonce. `backoff = None` opts out of dispatcher backoff coupling
+/// (challenge path owns its own backoff schedule).
+pub(crate) async fn estimate_initial_fees(
     shared: &OrchestratorShared,
-    batch_index: u64,
-    backoff: &mut DispatchBackoff,
+    log: FeeEstimateLog<'_>,
+    backoff: Option<&mut DispatchBackoff>,
+    backoff_label: &'static str,
 ) -> Option<(u128, u128)> {
     let provider = &shared.config.l1_provider;
     let cancel = &shared.shutdown;
@@ -510,8 +495,16 @@ async fn estimate_initial_fees_fresh(
         res = provider.estimate_eip1559_fees() => match res {
             Ok(v) => v,
             Err(e) => {
-                warn!(batch_index, err = %e, "estimate_eip1559_fees failed");
-                backoff.apply("estimate_eip1559_fees failed");
+                warn!(
+                    batch_index = log.batch_index,
+                    challenge_id = log.challenge_id,
+                    kind = log.kind,
+                    err = %e,
+                    "estimate_eip1559_fees failed"
+                );
+                if let Some(b) = backoff {
+                    b.apply(backoff_label);
+                }
                 return None;
             }
         }
@@ -524,7 +517,13 @@ async fn estimate_initial_fees_fresh(
         if tip > max_fee_cap {
             tip = max_fee_cap;
         }
-        warn!(batch_index, max_fee_cap, "RBF: initial fee at/above cap — clamping and proceeding");
+        warn!(
+            batch_index = log.batch_index,
+            challenge_id = log.challenge_id,
+            kind = log.kind,
+            max_fee_cap,
+            "initial fee at/above cap — clamping and proceeding"
+        );
     }
     Some((fee, tip))
 }
@@ -538,7 +537,7 @@ async fn bump_loop(
     resume: Option<RbfResumeState>,
     initial_fee: u128,
     initial_tip: u128,
-    wall_clock_budget: Duration,
+    block_budget: u64,
     observer: &dyn RbfObserver,
     backoff: &mut DispatchBackoff,
 ) {
@@ -552,8 +551,11 @@ async fn bump_loop(
     // skip the first broadcast so we do not get an "already known" reject.
     let mut just_resumed = resume.is_some();
     let mut at_cap_logged = max_fee_per_gas >= max_fee_cap;
-    let mut stuck_at_cap_since: Option<tokio::time::Instant> =
-        at_cap_logged.then(tokio::time::Instant::now);
+    // Resume already at-cap anchors at the current L1 block — we don't
+    // know when the prior process first hit cap, so the budget restarts
+    // from now rather than running out under a partial timer.
+    let mut stuck_at_cap_first_block: Option<u64> =
+        if at_cap_logged { current_l1_block(shared).await } else { None };
 
     loop {
         if !just_resumed {
@@ -584,22 +586,24 @@ async fn bump_loop(
             PollResult::NotMined => {}
         }
 
-        if let Some(since) = stuck_at_cap_since {
-            let elapsed = since.elapsed();
-            if elapsed >= wall_clock_budget {
-                metrics::counter!(
-                    crate::metrics::L1_BROADCAST_FAILURES_TOTAL,
-                    "kind" => "stuck_at_cap",
-                )
-                .increment(1);
-                warn!(
-                    batch_index,
-                    elapsed_secs = elapsed.as_secs(),
-                    wall_clock_budget_secs = wall_clock_budget.as_secs(),
-                    "RBF: stuck at fee cap past wall-clock budget — giving up so dispatcher can retry"
-                );
-                handle_failed_then_undispatch(observer, backoff, "stuck-at-cap timeout").await;
-                return;
+        if let Some(first_block) = stuck_at_cap_first_block {
+            if let Some(now_block) = current_l1_block(shared).await {
+                let elapsed_blocks = now_block.saturating_sub(first_block);
+                if elapsed_blocks >= block_budget {
+                    metrics::counter!(
+                        crate::metrics::L1_BROADCAST_FAILURES_TOTAL,
+                        "kind" => "stuck_at_cap",
+                    )
+                    .increment(1);
+                    warn!(
+                        batch_index,
+                        elapsed_blocks,
+                        block_budget,
+                        "RBF: stuck at fee cap past L1 block budget — giving up so dispatcher can retry"
+                    );
+                    handle_failed_then_undispatch(observer, backoff, "stuck-at-cap timeout").await;
+                    return;
+                }
             }
         }
 
@@ -609,7 +613,9 @@ async fn bump_loop(
         max_priority_fee_per_gas = new_tip;
 
         if clamped {
-            stuck_at_cap_since.get_or_insert_with(tokio::time::Instant::now);
+            if stuck_at_cap_first_block.is_none() {
+                stuck_at_cap_first_block = current_l1_block(shared).await;
+            }
             if !at_cap_logged {
                 error!(
                     batch_index,
@@ -806,7 +812,7 @@ async fn bump_nonce_too_low_fastfail(
             // rolling back here would clear `nonce` and produce a
             // `finalized + nonce=NULL` row when the listener event arrives.
             // If the tx was actually dropped from mempool with no replacement
-            // mining, `STUCK_AT_CAP_TIMEOUT` in `bump_loop` is the backstop.
+            // mining, `STUCK_AT_CAP_BLOCKS` in `bump_loop` is the backstop.
             info!(
                 batch_index,
                 prior_hash = %prior,
@@ -938,15 +944,22 @@ async fn handle_failed_then_undispatch(
     backoff.apply(reason);
 }
 
+/// Best-effort current L1 block number for the chain-time stuck-at-cap
+/// trigger. Returns `None` on RPC failure so the trigger naturally pauses
+/// during L1 outages — exactly the desired semantics.
+async fn current_l1_block(shared: &OrchestratorShared) -> Option<u64> {
+    shared.config.l1_provider.get_block_number().await.ok()
+}
+
 /// Preflight-time fail path: preconfirm-specific. Runs before any
-/// `RbfObserver` exists, so it touches the accumulator directly.
+/// `RbfObserver` exists, so it writes via `db::*` directly.
 async fn handle_failed_then_undispatch_preflight(
     shared: &OrchestratorShared,
     batch_index: u64,
     backoff: &mut DispatchBackoff,
     reason: &'static str,
 ) {
-    if let Err(e) = db_send_sync(&shared.db_tx, SyncOp::RollbackToAccepted { batch_index }).await {
+    if let Err(e) = db::rollback_to_accepted(&shared.db_tx, batch_index).await {
         warn!(batch_index, err = %e, "preflight rollback failed");
     }
     backoff.apply(reason);

@@ -132,9 +132,6 @@ reth-tasks = { git = "https://github.com/fluentlabs-xyz/reth", default-features 
 reth-db-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-chain-state = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 reth-trie-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-prune = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-prune-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-config = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
 
 
 # --- revm ---

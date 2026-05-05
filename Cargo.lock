@@ -7836,18 +7836,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reth-exex-types"
-version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#a44c31db049cd507f2467c645d9d86b10d24ea40"
-dependencies = [
- "alloy-eips",
- "alloy-primitives",
- "reth-chain-state",
- "reth-execution-types",
- "reth-primitives-traits",
-]
-
-[[package]]
 name = "reth-fs-util"
 version = "1.11.1"
 source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#a44c31db049cd507f2467c645d9d86b10d24ea40"
@@ -8078,35 +8066,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reth-prune"
-version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#a44c31db049cd507f2467c645d9d86b10d24ea40"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-primitives",
- "itertools 0.14.0",
- "metrics",
- "rayon",
- "reth-config",
- "reth-db-api",
- "reth-errors",
- "reth-exex-types",
- "reth-metrics",
- "reth-primitives-traits",
- "reth-provider",
- "reth-prune-types",
- "reth-stages-types",
- "reth-static-file-types",
- "reth-storage-api",
- "reth-tokio-util",
- "rustc-hash",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "reth-prune-types"
 version = "1.11.1"
 source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#a44c31db049cd507f2467c645d9d86b10d24ea40"
@@ -8217,16 +8176,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-futures",
-]
-
-[[package]]
-name = "reth-tokio-util"
-version = "1.11.1"
-source = "git+https://github.com/fluentlabs-xyz/reth?branch=v1.11-patched#a44c31db049cd507f2467c645d9d86b10d24ea40"
-dependencies = [
- "tokio",
- "tokio-stream",
- "tracing",
 ]
 
 [[package]]
@@ -13046,7 +12995,6 @@ dependencies = [
  "reqwest 0.12.28",
  "reth-chain-state",
  "reth-chainspec",
- "reth-config",
  "reth-db",
  "reth-db-common",
  "reth-ethereum-engine-primitives",
@@ -13055,8 +13003,6 @@ dependencies = [
  "reth-node-types",
  "reth-primitives-traits",
  "reth-provider",
- "reth-prune",
- "reth-prune-types",
  "reth-revm",
  "reth-storage-api",
  "reth-tasks",

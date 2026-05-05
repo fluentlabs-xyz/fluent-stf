@@ -35,11 +35,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
-    accumulator::ResponseCache,
-    db::{db_send_sync, AsyncOp, BatchPatch, BatchStatus, Db, DbCommand, RbfResumeState, SyncOp},
+    blob_builder_mdbx::build_blobs_from_mdbx,
+    block_response_cache::ResponseCache,
+    challenge_db, challenge_resolver,
+    db::{self, AsyncOp, BatchStatus, ChallengeKind, Db, DbCommand, RbfResumeState},
     driver::Driver,
+    hub::WitnessHub,
     l1_listener::L1Event,
-    types::{EthExecutionResponse, SignBatchRootRequest, SubmitBatchResponse},
+    rbf,
+    types::{
+        EthExecutionResponse, InvalidSignaturesResponse, SignBatchRootRequest, SubmitBatchResponse,
+    },
 };
 use l1_rollup_client::{nitro_verifier::is_key_registered, NonceAllocator};
 
@@ -68,18 +74,18 @@ pub(crate) type L1WriteProvider = FillProvider<
     Ethereum,
 >;
 
-/// Maximum wall-clock time the RBF worker will keep rebroadcasting at the
-/// fee cap after the cap is first reached. Once this elapses with no
-/// receipt, the worker returns `Failed` so the main loop can undispatch,
-/// apply global backoff, and retry from scratch (including re-running
-/// pre-flight reconciliation). Prevents a stuck-at-cap worker from running
-/// forever against a mempool that refuses to mine it.
+/// Maximum L1 blocks the RBF worker rebroadcasts at the fee cap before
+/// undispatching so the dispatcher retries from scratch (re-estimate fees,
+/// possibly higher cap by then). Without this, batch N stuck at-cap holds
+/// the dispatch slot and N+1, N+2, … queue behind it indefinitely.
 ///
-/// Shared with the challenge resolver via `compute_wall_clock_budget`,
-/// which clamps to `min(STUCK_AT_CAP_TIMEOUT, blocks_to_deadline × 12s)`.
-/// The two paths (preconfirm vs challenge) coincide on this constant; if
-/// they diverge in future, split into per-path constants.
-pub(crate) const STUCK_AT_CAP_TIMEOUT: Duration = Duration::from_secs(300);
+/// Chain-time, not wall-clock: RPC stalls / clock skew do not advance the
+/// trigger, and an L1 finality stall naturally pauses it. ~12 s/block on
+/// Ethereum mainnet → 25 blocks ≈ 5 min.
+///
+/// The challenge resolver clamps its per-row budget to
+/// `min(STUCK_AT_CAP_BLOCKS, blocks_to_deadline)`.
+pub(crate) const STUCK_AT_CAP_BLOCKS: u64 = 25;
 
 /// Number of persistent execution workers sending blocks to the Nitro proxy.
 const EXECUTION_WORKERS: usize = 8;
@@ -363,7 +369,7 @@ async fn execution_worker(
 /// Spawned inside `Orchestrator::run`; feeder exit cancels the orchestrator's
 /// internal task race, which propagates back up to `main.rs`.
 async fn feeder_loop(
-    hub: Arc<crate::hub::WitnessHub>,
+    hub: Arc<WitnessHub>,
     normal_tx: AsyncSender<ExecutionTask>,
     cache: Arc<Mutex<ResponseCache>>,
     starting_block: u64,
@@ -417,7 +423,7 @@ async fn feeder_loop(
 /// blocks until shutdown or any worker exits.
 pub(crate) struct Orchestrator {
     shared: Arc<OrchestratorShared>,
-    hub: Arc<crate::hub::WitnessHub>,
+    hub: Arc<WitnessHub>,
     feeder_starting_block: u64,
     initial_checkpoint: u64,
     high_rx: AsyncReceiver<ExecutionTask>,
@@ -441,7 +447,7 @@ impl Orchestrator {
         orchestrator_tip: Arc<AtomicU64>,
         l1_events: mpsc::Receiver<L1Event>,
         shutdown: CancellationToken,
-        hub: Arc<crate::hub::WitnessHub>,
+        hub: Arc<WitnessHub>,
         feeder_starting_block: u64,
     ) -> Self {
         // Seed startup gauges from SQLite directly (no in-memory mirror).
@@ -464,8 +470,12 @@ impl Orchestrator {
         // The single in-memory cache for `block_responses`; loaded from SQLite
         // on startup, written-through async, used by the feeder for dedup and
         // by the signer for batch-root assembly.
+        let initial_responses: Vec<EthExecutionResponse> = {
+            let g = db.lock().unwrap_or_else(|e| e.into_inner());
+            g.load_responses()
+        };
         let cache: Arc<Mutex<ResponseCache>> =
-            Arc::new(Mutex::new(ResponseCache::with_db(Arc::clone(&db), db_tx.clone())));
+            Arc::new(Mutex::new(ResponseCache::new(initial_responses, db_tx.clone())));
 
         // Capacity tied to `EXECUTION_WORKERS`: each queued `ExecutionTask`
         // can hold a 30-80 MB payload, so larger buffers risk OOM.
@@ -563,20 +573,20 @@ impl Orchestrator {
             ));
         }
 
-        // One-shot startup recovery: priority-replay only the blocks missing
-        // from `block_responses` for any unsent batch. Steady-state workers
-        // self-recover from SQLite each tick (see `Db::*` predicates), so
-        // there is no other "recovery" code path. Spawned fire-and-forget so
-        // its successful exit (expected) does not cancel the root token.
-        {
-            let db = Arc::clone(&shared.db);
-            let driver = Arc::clone(&shared.driver);
-            let high_tx = shared.high_tx.clone();
-            let shutdown = shared.shutdown.clone();
-            tokio::spawn(async move {
-                startup_recovery_feeder(db, driver, high_tx, shutdown).await;
-            });
-        }
+        // One-shot startup recovery: priority-replay blocks missing from
+        // `block_responses` for any unsent batch. Run synchronously before
+        // the JoinSet — putting it inside the JoinSet would tear the whole
+        // process down on its (expected) successful exit, since
+        // `tasks.join_next()` cancels the root token on any task exit.
+        // L1 events buffer in `mpsc::channel(64)` with listener backpressure
+        // for the duration, so events emitted during recovery are not lost.
+        startup_recovery_feeder(
+            Arc::clone(&shared.db),
+            Arc::clone(&shared.driver),
+            shared.high_tx.clone(),
+            shared.shutdown.clone(),
+        )
+        .await;
 
         let mut tasks: JoinSet<&'static str> = JoinSet::new();
         {
@@ -624,7 +634,7 @@ impl Orchestrator {
         {
             let shared = Arc::clone(&shared);
             tasks.spawn(async move {
-                crate::challenge_resolver::run(shared).await;
+                challenge_resolver::run(shared).await;
                 "challenge_resolver"
             });
         }
@@ -728,11 +738,48 @@ impl<P: Provider + Send + Sync> FinalityRpc for P {
     }
 }
 
+/// `finalized_block = None` skips finality classification (challenges
+/// have no per-row finality notion). `classify_revert_kind = false` skips
+/// the gas-limit RPC; the returned `RevertKind::Logic` is a placeholder
+/// that callers ignore.
+async fn poll_receipts<Id: Copy + std::fmt::Debug>(
+    provider: &dyn FinalityRpc,
+    finalized_block: Option<u64>,
+    snapshot: Vec<(Id, B256, u64)>,
+    classify_revert_kind: bool,
+) -> Vec<(Id, B256, ReceiptCheck)> {
+    let mut out = Vec::with_capacity(snapshot.len());
+    for (id, tx_hash, l1_block) in snapshot {
+        let check = match provider.receipt_status(tx_hash).await {
+            Ok(Some((true, _))) => ReceiptCheck::Found {
+                finalized: finalized_block.map(|f| l1_block <= f).unwrap_or(false),
+            },
+            Ok(Some((false, gas_used))) => {
+                let kind = if classify_revert_kind {
+                    let gas_limit =
+                        provider.tx_gas_limit(tx_hash).await.ok().flatten().unwrap_or(0);
+                    classify_revert(gas_used, gas_limit)
+                } else {
+                    RevertKind::Logic
+                };
+                ReceiptCheck::Reverted { kind }
+            }
+            Ok(None) => ReceiptCheck::Missing,
+            Err(e) => {
+                warn!(?id, %tx_hash, err = %e, "Receipt check failed — will retry");
+                ReceiptCheck::CheckFailed
+            }
+        };
+        out.push((id, tx_hash, check));
+    }
+    out
+}
+
 /// Pure-RPC half of the finalization + reorg check: takes a `dispatched`
 /// snapshot and returns receipt observations without touching the DB.
 /// Skips rows whose `l1_block IS NULL` (in-flight initial broadcast — the
 /// dispatcher remains the sole observer until its first broadcast lands).
-async fn check_finalized_batches_query(
+async fn poll_dispatched_receipts(
     provider: &dyn FinalityRpc,
     dispatched_snapshot: Vec<(u64, B256, u64)>,
 ) -> FinalizationDone {
@@ -744,33 +791,16 @@ async fn check_finalized_batches_query(
     if candidates.is_empty() {
         return FinalizationDone::NoOp;
     }
-    let mut observations = Vec::with_capacity(candidates.len());
-    for (batch_index, tx_hash, l1_block) in candidates {
-        let check = match provider.receipt_status(tx_hash).await {
-            Ok(Some((true, _))) => ReceiptCheck::Found { finalized: l1_block <= finalized_block },
-            Ok(Some((false, gas_used))) => {
-                let gas_limit = match provider.tx_gas_limit(tx_hash).await {
-                    Ok(Some(g)) => g,
-                    Ok(None) | Err(_) => 0,
-                };
-                let kind = classify_revert(gas_used, gas_limit);
-                warn!(
-                    batch_index,
-                    %tx_hash,
-                    ?kind,
-                    gas_used,
-                    gas_limit,
-                    "Finalization-ticker observed REVERTED preconfirmBatch"
-                );
-                ReceiptCheck::Reverted { kind }
-            }
-            Ok(None) => ReceiptCheck::Missing,
-            Err(e) => {
-                warn!(batch_index, %tx_hash, err = %e, "Receipt check failed — will retry");
-                ReceiptCheck::CheckFailed
-            }
-        };
-        observations.push((batch_index, tx_hash, check));
+    let observations = poll_receipts(provider, Some(finalized_block), candidates, true).await;
+    for (batch_index, tx_hash, check) in &observations {
+        if let ReceiptCheck::Reverted { kind } = check {
+            warn!(
+                batch_index,
+                %tx_hash,
+                ?kind,
+                "Finalization-ticker observed REVERTED preconfirmBatch"
+            );
+        }
     }
     FinalizationDone::Observed { observations }
 }
@@ -797,7 +827,7 @@ async fn sign_batch_io(
     let blobs = {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match crate::blob_builder_mdbx::build_blobs_from_mdbx(driver, from_block, to_block)
+            match build_blobs_from_mdbx(driver, from_block, to_block)
                 .await
             {
                 Ok(Some(b)) => break b,
@@ -932,7 +962,7 @@ async fn call_sign_batch_root(
     let status = resp.status();
 
     if status == reqwest::StatusCode::CONFLICT {
-        let parsed: crate::types::InvalidSignaturesResponse = resp
+        let parsed: InvalidSignaturesResponse = resp
             .json()
             .await
             .map_err(|e| SignBatchError::Other(eyre::eyre!("Failed to parse 409: {e}")))?;
@@ -1225,11 +1255,10 @@ async fn dispatcher_worker(shared: Arc<OrchestratorShared>) {
                         stored_max_priority_fee_per_gas = resume.max_priority_fee_per_gas,
                         "RBF: resuming dispatched batch from persisted state"
                     );
-                    crate::rbf::run(&shared, batch_index, signature, Some(resume), &mut backoff)
-                        .await;
+                    rbf::run(&shared, batch_index, signature, Some(resume), &mut backoff).await;
                 }
                 DispatchTarget::Fresh { batch_index, signature } => {
-                    crate::rbf::run(&shared, batch_index, signature, None, &mut backoff).await;
+                    rbf::run(&shared, batch_index, signature, None, &mut backoff).await;
                 }
                 DispatchTarget::None => {}
             }
@@ -1256,19 +1285,18 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
         }
 
         'work: {
-            // Snapshot current state: pick the next batch eligible to sign
-            // (status=Accepted, signature IS NULL, all responses present) and
-            // copy out its responses. Drop the locks before the HTTP call.
+            // Cache-completeness gate (not SQL): see `Db::first_accepted_unsigned`.
             let pick: Option<(u64, u64, u64, Vec<EthExecutionResponse>)> = {
                 let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
                 g.first_accepted_unsigned().and_then(|batch_index| {
                     let batch = g.find_batch(batch_index)?;
                     let from_block = batch.from_block;
                     let to_block = batch.to_block;
-                    let responses = {
-                        let c = shared.cache.lock().unwrap_or_else(|e| e.into_inner());
-                        c.get_range(from_block, to_block)
-                    };
+                    let cache = shared.cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if !cache.has_range(from_block, to_block) {
+                        return None;
+                    }
+                    let responses = cache.get_range(from_block, to_block);
                     Some((batch_index, from_block, to_block, responses))
                 })
             };
@@ -1291,10 +1319,7 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
             match outcome {
                 SignOutcome::Signed { response } => {
                     info!(batch_index, "Batch signed — available for dispatch");
-                    let patch =
-                        BatchPatch { signature: Some(Some(response)), ..Default::default() };
-                    if let Err(e) =
-                        db_send_sync(&shared.db_tx, SyncOp::PatchBatch { batch_index, patch }).await
+                    if let Err(e) = db::record_signature(&shared.db_tx, batch_index, response).await
                     {
                         error!(batch_index, err = %e, "record_signature failed");
                         break 'work;
@@ -1314,10 +1339,7 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
                         "Key rotation detected — invalidating signature and re-executing"
                     );
 
-                    if let Err(e) =
-                        db_send_sync(&shared.db_tx, SyncOp::InvalidateSignature { batch_index })
-                            .await
-                    {
+                    if let Err(e) = db::invalidate_signature(&shared.db_tx, batch_index).await {
                         error!(batch_index, err = %e, "invalidate_signature failed");
                     }
 
@@ -1368,8 +1390,7 @@ async fn finalization_worker(shared: Arc<OrchestratorShared>) {
             g.dispatched_for_finalization_check()
         };
         if !batch_snapshot.is_empty() {
-            let done =
-                check_finalized_batches_query(&shared.config.l1_provider, batch_snapshot).await;
+            let done = poll_dispatched_receipts(&shared.config.l1_provider, batch_snapshot).await;
             apply_finalization_changes(
                 &shared.db,
                 &shared.db_tx,
@@ -1413,56 +1434,38 @@ async fn finalization_worker(shared: Arc<OrchestratorShared>) {
 /// alert.
 async fn apply_challenge_reorg_check(
     provider: &dyn FinalityRpc,
-    db_tx: &mpsc::UnboundedSender<crate::db::DbCommand>,
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
     snapshot: Vec<(i64, B256, u64)>,
 ) {
-    use crate::db::{db_send_sync, ChallengePatch, SyncOp};
-
-    for (challenge_id, tx_hash, recorded_l1_block) in snapshot {
-        match provider.receipt_status(tx_hash).await {
-            Ok(Some((true, _gas_used))) => {}
-            Ok(Some((false, _))) => {
+    let observations = poll_receipts(provider, None, snapshot, false).await;
+    for (challenge_id, tx_hash, check) in observations {
+        match check {
+            ReceiptCheck::Found { .. } => {} // challenge tx mined fine; nothing to do
+            ReceiptCheck::Reverted { .. } => {
                 metrics::counter!("orchestrator_challenge_reverted_post_mine_total").increment(1);
                 warn!(
                     challenge_id,
                     %tx_hash,
-                    recorded_l1_block,
                     "challenge tx receipt status=0 post-mine — clearing RBF state for retry"
                 );
-                // The L1 nonce was consumed by the reverted tx; clearing
-                // `nonce: Some(None)` here intentionally drops our reference
-                // to it. `handle_dispatched_resume` allocates a fresh nonce
-                // via the rollback path (Block→Sp1Proved or BatchRoot→Received).
-                let patch = ChallengePatch {
-                    tx_hash: Some(None),
-                    nonce: Some(None),
-                    max_fee_per_gas: Some(None),
-                    max_priority_fee_per_gas: Some(None),
-                    l1_block: Some(None),
-                    ..Default::default()
-                };
                 if let Err(e) =
-                    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+                    db::clear_challenge_rbf_state_post_mine_revert(db_tx, challenge_id).await
                 {
-                    error!(challenge_id, err = %e, "patch_challenge (reverted post-mine) failed");
+                    error!(challenge_id, err = %e, "clear_challenge_rbf_state_post_mine_revert failed");
                 }
             }
-            Ok(None) => {
+            ReceiptCheck::Missing => {
                 metrics::counter!("orchestrator_challenge_reorg_detected_total").increment(1);
                 warn!(
                     challenge_id,
                     %tx_hash,
-                    recorded_l1_block,
                     "challenge tx receipt missing — suspecting reorg, clearing l1_block"
                 );
-                let patch = ChallengePatch { l1_block: Some(None), ..Default::default() };
-                if let Err(e) =
-                    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
-                {
-                    error!(challenge_id, err = %e, "patch_challenge (reorg) failed");
+                if let Err(e) = db::clear_challenge_l1_block(db_tx, challenge_id).await {
+                    error!(challenge_id, err = %e, "clear_challenge_l1_block failed");
                 }
             }
-            Err(e) => warn!(challenge_id, %tx_hash, err = %e, "challenge receipt check failed"),
+            ReceiptCheck::CheckFailed => {} // RPC flake — retry next tick
         }
     }
 }
@@ -1484,8 +1487,7 @@ async fn apply_finalization_changes(
                     let g = db.lock().unwrap_or_else(|e| e.into_inner());
                     g.find_batch(batch_index).map(|b| (b.from_block, b.to_block))
                 };
-                if let Err(e) = db_send_sync(db_tx, SyncOp::ObserveFinalized { batch_index }).await
-                {
+                if let Err(e) = db::observe_finalized(db_tx, batch_index).await {
                     error!(batch_index, err = %e, "observe_finalized failed");
                     continue;
                 }
@@ -1529,9 +1531,7 @@ async fn apply_finalization_changes(
                         ?kind,
                         "Finalization-ticker rolling back reverted batch"
                     );
-                    if let Err(e) =
-                        db_send_sync(db_tx, SyncOp::RollbackToAccepted { batch_index }).await
-                    {
+                    if let Err(e) = db::rollback_to_accepted(db_tx, batch_index).await {
                         error!(batch_index, err = %e, "rollback_to_accepted failed");
                     }
                 }
@@ -1560,9 +1560,7 @@ async fn apply_finalization_changes(
                     %tx_hash,
                     "Batch tx receipt missing — suspecting reorg, rolling back to Dispatched"
                 );
-                if let Err(e) =
-                    db_send_sync(db_tx, SyncOp::ObserveReorgToDispatched { batch_index }).await
-                {
+                if let Err(e) = db::observe_reorg_to_dispatched(db_tx, batch_index).await {
                     error!(batch_index, err = %e, "observe_reorg_to_dispatched failed");
                 }
             }
@@ -1600,19 +1598,12 @@ async fn router(
 async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
     match event {
         L1Event::BatchCommitted { batch_index, from, to } => {
-            if let Err(e) = db_send_sync(
-                &shared.db_tx,
-                SyncOp::ObserveCommitted { batch_index, from_block: from, to_block: to },
-            )
-            .await
-            {
+            if let Err(e) = db::observe_committed(&shared.db_tx, batch_index, from, to).await {
                 error!(batch_index, err = %e, "observe_committed failed");
             }
         }
         L1Event::BatchSubmitted { batch_index } => {
-            if let Err(e) =
-                db_send_sync(&shared.db_tx, SyncOp::ObserveSubmitted { batch_index }).await
-            {
+            if let Err(e) = db::observe_submitted(&shared.db_tx, batch_index).await {
                 error!(batch_index, err = %e, "observe_submitted failed");
             }
         }
@@ -1622,11 +1613,8 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
             // Otherwise (external takeover edge case) clear nonce/fees and
             // adopt the event's tx_hash. The decision happens atomically
             // inside the writer actor — see `SyncOp::ObservePreconfirmed`.
-            if let Err(e) = db_send_sync(
-                &shared.db_tx,
-                SyncOp::ObservePreconfirmed { batch_index, tx_hash, l1_block },
-            )
-            .await
+            if let Err(e) =
+                db::observe_preconfirmed(&shared.db_tx, batch_index, tx_hash, l1_block).await
             {
                 error!(batch_index, err = %e, "observe_preconfirmed failed");
                 return;
@@ -1652,18 +1640,13 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
             // supervisor's restart can re-resolve the L2 checkpoint from
             // the reverted batch via `resolve_l2_start_checkpoint`.
             info!(from_batch_index, l1_block, "BatchReverted — wiping DB and scheduling restart");
-            if let Err(e) = db_send_sync(
-                &shared.db_tx,
-                SyncOp::WipeForRevert { start_batch_id: from_batch_index, l1_block },
-            )
-            .await
-            {
+            if let Err(e) = db::wipe_for_revert(&shared.db_tx, from_batch_index, l1_block).await {
                 error!(from_batch_index, l1_block, err = %e, "wipe_for_revert failed");
             }
             shared.shutdown.cancel();
         }
         L1Event::BlockChallenged { batch_index, commitment } => {
-            if let Err(e) = crate::challenge_db::observe_block_challenged(
+            if let Err(e) = challenge_db::observe_block_challenged(
                 &shared.db_tx,
                 &shared.config.l1_provider,
                 shared.config.l1_rollup_addr,
@@ -1679,7 +1662,7 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
             }
         }
         L1Event::BatchRootChallenged { batch_index } => {
-            if let Err(e) = crate::challenge_db::observe_batch_root_challenged(
+            if let Err(e) = challenge_db::observe_batch_root_challenged(
                 &shared.db_tx,
                 &shared.config.l1_provider,
                 shared.config.l1_rollup_addr,
@@ -1692,10 +1675,10 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
             }
         }
         L1Event::ChallengeResolved { batch_index, commitment } => {
-            if let Err(e) = crate::challenge_db::observe_resolved(
+            if let Err(e) = challenge_db::observe_resolved(
                 &shared.db,
                 &shared.db_tx,
-                crate::db::ChallengeKind::Block,
+                ChallengeKind::Block,
                 batch_index,
                 Some(commitment),
             )
@@ -1705,10 +1688,10 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
             }
         }
         L1Event::BatchRootChallengeResolved { batch_index } => {
-            if let Err(e) = crate::challenge_db::observe_resolved(
+            if let Err(e) = challenge_db::observe_resolved(
                 &shared.db,
                 &shared.db_tx,
-                crate::db::ChallengeKind::BatchRoot,
+                ChallengeKind::BatchRoot,
                 batch_index,
                 None,
             )
@@ -1768,7 +1751,7 @@ async fn handle_block_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rbf::bump_fees;
+    use rbf::bump_fees;
 
     #[test]
     fn classify_revert_above_95pct_is_oog() {

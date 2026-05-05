@@ -33,21 +33,20 @@ use l1_rollup_client::{
     MerkleProof, RollupTxPartial,
 };
 use nitro_types::ChallengeSp1Request;
+use rsp_client_executor::io::EthClientExecutorInput;
 use serde::{Deserialize, Serialize};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 use crate::{
-    db::{db_send_sync, ChallengeKind, ChallengePatch, ChallengeRow, ChallengeStatus, SyncOp},
-    orchestrator::{DispatchBackoff, OrchestratorShared, RevertKind, STUCK_AT_CAP_TIMEOUT},
-    rbf::{run_generic, RbfObserver},
+    blob_builder_mdbx::build_blobs_from_mdbx,
+    db::{self, ChallengeKind, ChallengeRow, ChallengeStatus, RbfResumeState},
+    orchestrator::{DispatchBackoff, OrchestratorShared, RevertKind, STUCK_AT_CAP_BLOCKS},
+    rbf::{self, RbfObserver},
 };
 
 /// Active worker tick.
 const WORKER_TICK: Duration = Duration::from_secs(1);
-
-/// Average L1 block time used to translate `(deadline - current_block)` into wall-clock seconds.
-const L1_BLOCK_SECS: u64 = 12;
 
 /// Number of L1 blocks remaining-to-deadline at which we start warning
 /// loudly that MDBX is blocking challenge resolution. ~30 L1 blocks ≈ 6 min.
@@ -228,8 +227,9 @@ async fn check_and_fail_if_deadline_expired(
         "challenge deadline expired — marking failed (rollup will go corrupted; \
          operator must call revertBatches)"
     );
-    let patch = ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
-    persist_patch(shared, row.challenge_id, patch).await;
+    if let Err(e) = db::record_challenge_failed(&shared.db_tx, row.challenge_id).await {
+        tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_failed (deadline) failed");
+    }
     true
 }
 
@@ -263,8 +263,9 @@ async fn mark_invariant_violation(shared: &OrchestratorShared, row: &ChallengeRo
         "kind" => row.kind.as_str(),
     )
     .increment(1);
-    let patch = ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
-    persist_patch(shared, row.challenge_id, patch).await;
+    if let Err(e) = db::record_challenge_failed(&shared.db_tx, row.challenge_id).await {
+        tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_failed (invariant) failed");
+    }
 }
 
 // ============================================================================
@@ -318,52 +319,48 @@ async fn handle_block_received(
             return;
         }
     };
-    let client_input: rsp_client_executor::io::EthClientExecutorInput =
-        match bincode::deserialize(&witness_bytes) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    challenge_id = row.challenge_id,
-                    target_block_number,
-                    err = %e,
-                    "deserialize EthClientExecutorInput from witness payload failed"
-                );
-                backoff.apply("deserialize EthClientExecutorInput");
-                return;
-            }
-        };
+    let client_input: EthClientExecutorInput = match bincode::deserialize(&witness_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                challenge_id = row.challenge_id,
+                target_block_number,
+                err = %e,
+                "deserialize EthClientExecutorInput from witness payload failed"
+            );
+            backoff.apply("deserialize EthClientExecutorInput");
+            return;
+        }
+    };
 
     // 2. Build canonical EIP-4844 blobs.
-    let blobs =
-        match crate::blob_builder_mdbx::build_blobs_from_mdbx(&shared.driver, from_block, to_block)
-            .await
-        {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                if challenge_close_to_deadline(shared, row).await {
-                    warn!(
-                        challenge_id = row.challenge_id,
-                        from_block,
-                        to_block,
-                        "MDBX tip behind challenge blob range; deadline approaching — \
-                     worker will retry next tick"
-                    );
-                }
-                backoff.apply("build_blobs_from_mdbx tip-behind");
-                return;
-            }
-            Err(e) => {
+    let blobs = match build_blobs_from_mdbx(&shared.driver, from_block, to_block).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            if challenge_close_to_deadline(shared, row).await {
                 warn!(
                     challenge_id = row.challenge_id,
                     from_block,
                     to_block,
-                    err = %e,
-                    "build_blobs_from_mdbx failed"
+                    "MDBX tip behind challenge blob range; deadline approaching — \
+                     worker will retry next tick"
                 );
-                backoff.apply("build_blobs_from_mdbx");
-                return;
             }
-        };
+            backoff.apply("build_blobs_from_mdbx tip-behind");
+            return;
+        }
+        Err(e) => {
+            warn!(
+                challenge_id = row.challenge_id,
+                from_block,
+                to_block,
+                err = %e,
+                "build_blobs_from_mdbx failed"
+            );
+            backoff.apply("build_blobs_from_mdbx");
+            return;
+        }
+    };
 
     // 3. Wrap and POST to the proxy.
     let payload = ChallengeSp1Request { client_input: Box::new(client_input), blobs };
@@ -376,12 +373,12 @@ async fn handle_block_received(
     .await
     {
         Ok(request_id) => {
-            let patch = ChallengePatch {
-                status: Some(ChallengeStatus::Sp1Proving),
-                sp1_request_id: Some(Some(request_id)),
-                ..Default::default()
-            };
-            persist_patch(shared, row.challenge_id, patch).await;
+            if let Err(e) =
+                db::record_challenge_sp1_requested(&shared.db_tx, row.challenge_id, request_id)
+                    .await
+            {
+                tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_sp1_requested failed");
+            }
             info!(
                 challenge_id = row.challenge_id,
                 batch_index = row.batch_index,
@@ -421,9 +418,9 @@ async fn handle_sp1_proving(
     // in `find_active_block_challenge` excludes the row from the next
     // ~SP1_STATUS_POLL_INTERVAL_SECS even if the call errors mid-flight,
     // preventing a tight retry loop against the proxy.
-    let stamp_patch =
-        ChallengePatch { last_polled_at: Some(Some(crate::db::now_ts())), ..Default::default() };
-    persist_patch(shared, row.challenge_id, stamp_patch).await;
+    if let Err(e) = db::stamp_challenge_polled(&shared.db_tx, row.challenge_id).await {
+        tracing::error!(challenge_id = row.challenge_id, err = %e, "stamp_challenge_polled failed");
+    }
 
     match poll_sp1_status(
         &shared.config.http_client,
@@ -434,12 +431,11 @@ async fn handle_sp1_proving(
     .await
     {
         Ok(Sp1StatusOutcome::Ready { proof_bytes }) => {
-            let patch = ChallengePatch {
-                status: Some(ChallengeStatus::Sp1Proved),
-                sp1_proof_bytes: Some(Some(proof_bytes)),
-                ..Default::default()
-            };
-            persist_patch(shared, row.challenge_id, patch).await;
+            if let Err(e) =
+                db::record_challenge_sp1_proved(&shared.db_tx, row.challenge_id, proof_bytes).await
+            {
+                tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_sp1_proved failed");
+            }
             info!(challenge_id = row.challenge_id, "SP1 proof ready");
         }
         Ok(Sp1StatusOutcome::Pending) => {}
@@ -454,12 +450,11 @@ async fn handle_sp1_proving(
                 %request_id,
                 "SP1 request lost (proxy 404) — clearing request_id and re-issuing"
             );
-            let patch = ChallengePatch {
-                status: Some(ChallengeStatus::Received),
-                sp1_request_id: Some(None),
-                ..Default::default()
-            };
-            persist_patch(shared, row.challenge_id, patch).await;
+            if let Err(e) =
+                db::record_challenge_sp1_lost_reset(&shared.db_tx, row.challenge_id).await
+            {
+                tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_sp1_lost_reset failed");
+            }
         }
         Err(Sp1StatusError::Other(e)) => {
             warn!(
@@ -541,7 +536,7 @@ async fn handle_dispatched_resume(
     }
 
     let resume = match (row.tx_hash, row.max_fee_per_gas, row.max_priority_fee_per_gas) {
-        (Some(h), Some(fee), Some(tip)) => Some(crate::db::RbfResumeState {
+        (Some(h), Some(fee), Some(tip)) => Some(RbfResumeState {
             nonce,
             tx_hash: h,
             max_fee_per_gas: fee,
@@ -552,7 +547,18 @@ async fn handle_dispatched_resume(
 
     let (fee, tip) = match resume.as_ref() {
         Some(r) => (r.max_fee_per_gas, r.max_priority_fee_per_gas),
-        None => match estimate_initial_fees(shared, row).await {
+        None => match rbf::estimate_initial_fees(
+            shared,
+            rbf::FeeEstimateLog {
+                batch_index: None,
+                challenge_id: Some(row.challenge_id),
+                kind: Some(row.kind.as_str()),
+            },
+            None,
+            "",
+        )
+        .await
+        {
             Some(v) => v,
             None => {
                 backoff.apply("estimate_initial_fees (resume)");
@@ -569,8 +575,8 @@ async fn handle_dispatched_resume(
         nonce,
         batch_index: row.batch_index,
     };
-    let budget = compute_wall_clock_budget(&shared.config.l1_provider, row.deadline).await;
-    run_generic(
+    let budget = compute_block_budget(&shared.config.l1_provider, row.deadline).await;
+    rbf::run_generic(
         shared,
         row.batch_index,
         &template,
@@ -645,7 +651,18 @@ async fn run_resolve_lifecycle(
     }
 
     // 4. Fees + nonce + RBF lifecycle.
-    let (fee, tip) = match estimate_initial_fees(shared, row).await {
+    let (fee, tip) = match rbf::estimate_initial_fees(
+        shared,
+        rbf::FeeEstimateLog {
+            batch_index: None,
+            challenge_id: Some(row.challenge_id),
+            kind: Some(row.kind.as_str()),
+        },
+        None,
+        "",
+    )
+    .await
+    {
         Some(v) => v,
         None => {
             backoff.apply("estimate_initial_fees");
@@ -664,8 +681,8 @@ async fn run_resolve_lifecycle(
         nonce,
         batch_index: row.batch_index,
     };
-    let budget = compute_wall_clock_budget(&shared.config.l1_provider, row.deadline).await;
-    run_generic(
+    let budget = compute_block_budget(&shared.config.l1_provider, row.deadline).await;
+    rbf::run_generic(
         shared,
         row.batch_index,
         &template,
@@ -680,48 +697,14 @@ async fn run_resolve_lifecycle(
     .await;
 }
 
-async fn estimate_initial_fees(
-    shared: &OrchestratorShared,
-    row: &ChallengeRow,
-) -> Option<(u128, u128)> {
-    let cap = shared.config.rbf_max_fee_per_gas_wei;
-    let est = match shared.config.l1_provider.estimate_eip1559_fees().await {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(
-                challenge_id = row.challenge_id,
-                err = %e,
-                "estimate_eip1559_fees failed"
-            );
-            return None;
-        }
-    };
-    let mut fee = est.max_fee_per_gas;
-    let mut tip = est.max_priority_fee_per_gas;
-    if fee >= cap {
-        fee = cap;
-        if tip > cap {
-            tip = cap;
-        }
-        warn!(
-            challenge_id = row.challenge_id,
-            kind = row.kind.as_str(),
-            max_fee_cap = cap,
-            "resolve initial fee at/above cap"
-        );
-    }
-    Some((fee, tip))
-}
-
-/// Compute the per-resolve wall-clock budget for the RBF stuck-at-cap
-/// timeout: the smaller of the preconfirm-tuned default and
-/// `(deadline - current_block) × ~12s`. Caps at the static default so a
-/// huge deadline doesn't extend the budget unnecessarily.
-async fn compute_wall_clock_budget(l1_provider: &impl Provider, deadline: u64) -> Duration {
+/// Compute the per-resolve L1-block budget for the RBF stuck-at-cap
+/// trigger: the smaller of the preconfirm-tuned default and the number of
+/// L1 blocks remaining to the row's deadline. Caps at the static default
+/// so a huge deadline doesn't extend the budget unnecessarily.
+async fn compute_block_budget(l1_provider: &impl Provider, deadline: u64) -> u64 {
     let current = l1_provider.get_block_number().await.unwrap_or(0);
     let blocks_left = deadline.saturating_sub(current);
-    let computed = Duration::from_secs(blocks_left.saturating_mul(L1_BLOCK_SECS));
-    std::cmp::min(STUCK_AT_CAP_TIMEOUT, computed)
+    std::cmp::min(STUCK_AT_CAP_BLOCKS, blocks_left)
 }
 
 async fn fail_with_reason(shared: &OrchestratorShared, row: &ChallengeRow, reason: String) {
@@ -736,8 +719,9 @@ async fn fail_with_reason(shared: &OrchestratorShared, row: &ChallengeRow, reaso
         "kind" => row.kind.as_str(),
     )
     .increment(1);
-    let patch = ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
-    persist_patch(shared, row.challenge_id, patch).await;
+    if let Err(e) = db::record_challenge_failed(&shared.db_tx, row.challenge_id).await {
+        tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_failed (pre-broadcast) failed");
+    }
 }
 
 // ============================================================================
@@ -955,14 +939,6 @@ async fn resolve_block_target(
     )
 }
 
-async fn persist_patch(shared: &OrchestratorShared, challenge_id: i64, patch: ChallengePatch) {
-    if let Err(e) =
-        db_send_sync(&shared.db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
-    {
-        tracing::error!(challenge_id, err = %e, "persist_patch (challenge) failed");
-    }
-}
-
 /// Status to roll back to when a dispatched challenge tx fails (revert
 /// receipt, stuck-at-cap timeout). The rollback target is the fresh-
 /// dispatch entry point in the per-kind worker so `run_resolve_lifecycle`
@@ -1118,15 +1094,18 @@ impl RbfObserver for ResolveObserver<'_> {
             max_priority_fee_per_gas = tip,
             "resolve broadcast (initial)"
         );
-        let patch = ChallengePatch {
-            status: Some(ChallengeStatus::Dispatched),
-            tx_hash: Some(Some(hash)),
-            nonce: Some(Some(self.nonce)),
-            max_fee_per_gas: Some(Some(fee)),
-            max_priority_fee_per_gas: Some(Some(tip)),
-            ..Default::default()
-        };
-        persist_patch(self.shared, self.challenge_id, patch).await;
+        if let Err(e) = db::record_challenge_first_broadcast(
+            &self.shared.db_tx,
+            self.challenge_id,
+            hash,
+            self.nonce,
+            fee,
+            tip,
+        )
+        .await
+        {
+            tracing::error!(challenge_id = self.challenge_id, err = %e, "record_challenge_first_broadcast failed");
+        }
         crate::metrics::counter_resolve_dispatched(self.kind.as_str());
     }
 
@@ -1140,13 +1119,12 @@ impl RbfObserver for ResolveObserver<'_> {
             max_priority_fee_per_gas = tip,
             "resolve RBF rebroadcast"
         );
-        let patch = ChallengePatch {
-            tx_hash: Some(Some(hash)),
-            max_fee_per_gas: Some(Some(fee)),
-            max_priority_fee_per_gas: Some(Some(tip)),
-            ..Default::default()
-        };
-        persist_patch(self.shared, self.challenge_id, patch).await;
+        if let Err(e) =
+            db::record_challenge_rebroadcast(&self.shared.db_tx, self.challenge_id, hash, fee, tip)
+                .await
+        {
+            tracing::error!(challenge_id = self.challenge_id, err = %e, "record_challenge_rebroadcast failed");
+        }
     }
 
     async fn on_submitted(&self, hash: B256, l1_block: u64) {
@@ -1158,8 +1136,11 @@ impl RbfObserver for ResolveObserver<'_> {
             l1_block,
             "resolve confirmed on L1"
         );
-        let patch = ChallengePatch { l1_block: Some(Some(l1_block)), ..Default::default() };
-        persist_patch(self.shared, self.challenge_id, patch).await;
+        if let Err(e) =
+            db::record_challenge_submitted(&self.shared.db_tx, self.challenge_id, l1_block).await
+        {
+            tracing::error!(challenge_id = self.challenge_id, err = %e, "record_challenge_submitted failed");
+        }
         crate::metrics::counter_resolve_submitted(self.kind.as_str());
     }
 
@@ -1178,15 +1159,15 @@ impl RbfObserver for ResolveObserver<'_> {
         // allocate) on its next tick. Block kind keeps `sp1_proof_bytes`
         // and resumes from `Sp1Proved` (skips the SP1 round-trip);
         // batch_root resumes from `Received` (no SP1 phase).
-        let patch = ChallengePatch {
-            status: Some(rollback_status_for(self.kind)),
-            tx_hash: Some(None),
-            nonce: Some(None),
-            max_fee_per_gas: Some(None),
-            max_priority_fee_per_gas: Some(None),
-            ..Default::default()
-        };
-        persist_patch(self.shared, self.challenge_id, patch).await;
+        if let Err(e) = db::rollback_challenge_dispatch(
+            &self.shared.db_tx,
+            self.challenge_id,
+            rollback_status_for(self.kind),
+        )
+        .await
+        {
+            tracing::error!(challenge_id = self.challenge_id, err = %e, "rollback_challenge_dispatch (reverted) failed");
+        }
     }
 
     async fn on_pre_receipt_failure(&self, reason: &'static str) {
@@ -1198,15 +1179,15 @@ impl RbfObserver for ResolveObserver<'_> {
             "resolve pre-receipt failure — alert + retry"
         );
         crate::metrics::counter_resolve_pre_receipt_failure(self.kind.as_str());
-        let patch = ChallengePatch {
-            status: Some(rollback_status_for(self.kind)),
-            tx_hash: Some(None),
-            nonce: Some(None),
-            max_fee_per_gas: Some(None),
-            max_priority_fee_per_gas: Some(None),
-            ..Default::default()
-        };
-        persist_patch(self.shared, self.challenge_id, patch).await;
+        if let Err(e) = db::rollback_challenge_dispatch(
+            &self.shared.db_tx,
+            self.challenge_id,
+            rollback_status_for(self.kind),
+        )
+        .await
+        {
+            tracing::error!(challenge_id = self.challenge_id, err = %e, "rollback_challenge_dispatch (pre-receipt) failed");
+        }
     }
 
     /// Exits the bump loop only on terminal status (`Resolved` | `Failed`).

@@ -26,10 +26,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::db::{
-    db_send_sync, now_ts, ChallengeKind, ChallengePatch, ChallengeRow, ChallengeStatus, Db,
-    DbCommand, SyncOp,
-};
+use crate::db::{self, now_ts, ChallengeKind, ChallengeRow, ChallengeStatus, Db, DbCommand};
 
 pub(crate) async fn observe_block_challenged(
     db_tx: &mpsc::UnboundedSender<DbCommand>,
@@ -69,7 +66,7 @@ pub(crate) async fn observe_block_challenged(
         last_status_change_at: now,
         last_polled_at: None,
     };
-    db_send_sync(db_tx, SyncOp::InsertChallenge(row)).await
+    db::insert_challenge(db_tx, row).await
 }
 
 pub(crate) async fn observe_batch_root_challenged(
@@ -108,7 +105,7 @@ pub(crate) async fn observe_batch_root_challenged(
         last_status_change_at: now,
         last_polled_at: None,
     };
-    db_send_sync(db_tx, SyncOp::InsertChallenge(row)).await
+    db::insert_challenge(db_tx, row).await
 }
 
 pub(crate) async fn observe_resolved(
@@ -126,8 +123,7 @@ pub(crate) async fn observe_resolved(
     if row.status == ChallengeStatus::Resolved {
         return Ok(());
     }
-    let patch = ChallengePatch { status: Some(ChallengeStatus::Resolved), ..Default::default() };
-    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id: row.challenge_id, patch }).await
+    db::record_challenge_resolved(db_tx, row.challenge_id).await
 }
 
 /// Read `getBatch(batchIndex)` from L1, retrying with exponential backoff

@@ -20,7 +20,6 @@
 //! | `RPC_URL` | — | L2 RPC URL — drives forward sync and blob construction |
 //! | `DATADIR` | `./forward-driver` | Driver datadir (MDBX + static_files + RocksDB) |
 //! | `WITNESS_COLD_FILE` | `<datadir>/cold.redb` | redb file for cold witness store |
-//! | `MAX_COLD_BYTES` | `34359738368` (32 GiB) | Size cap for cold witness store |
 //! | `WITNESS_RETENTION_BLOCKS` | `172800` | Cold store retention window in L2 blocks — blocks older than `tip - retention` are pruned on push. `0` disables retention (archive mode). |
 //! | `MDBX_MAX_SIZE` | `549755813888` (512 GiB) | MDBX max size |
 //! | `PROXY_URL` | `http://127.0.0.1:8080` | Remote proxy base URL |
@@ -32,7 +31,6 @@
 //! | `L1_START_BATCH_ID` | — | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
 //! | `L1_ROLLUP_DEPLOY_BLOCK` | `0` | L1 block where Rollup contract was deployed (lower bound for event scans) |
 //! | `API_KEY` | — | API key forwarded to the proxy |
-//! | `PRUNE_FULL` | `false` | If `true`, prune MDBX/static-files using the same defaults as `reth --full` (sender_recovery=Full, receipts/account_history/storage_history distance=10064 blocks, bodies_history=Before(Paris)) |
 //! | `FLUENT_METRICS_ADDR` | `0.0.0.0:9090` | HTTP listen address for the Prometheus `/metrics` endpoint. |
 //!
 //! # Metrics
@@ -59,8 +57,8 @@
 //! | `orchestrator_l1_broadcast_failures_total` | **counter** | `preconfirmBatch` broadcast attempts rejected by the L1 RPC before mempool admission. Labels: `kind=nonce_too_low|stuck_at_cap|other`. |
 //! | `orchestrator_l1_dispatch_cost_eth` | **histogram** | Per-tx ETH cost of L1 `preconfirmBatch` (`gas_used` × `effective_gas_price` / 1e18). Cumulative sum available via the Prometheus-emitted `_sum` counterpart. |
 
-mod accumulator;
 mod blob_builder_mdbx;
+mod block_response_cache;
 mod challenge_db;
 mod challenge_resolver;
 mod db;
@@ -79,7 +77,10 @@ use std::{
     time::Duration,
 };
 
-use crate::hub::{WitnessHub, DEFAULT_COLD_BATCH_SIZE};
+use crate::{
+    db::{Db, DbCommand},
+    hub::{WitnessHub, DEFAULT_COLD_BATCH_SIZE},
+};
 use alloy_network::{Ethereum, EthereumWallet};
 use alloy_primitives::Address;
 use alloy_provider::{ProviderBuilder, RootProvider};
@@ -100,8 +101,6 @@ const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:8080";
 const DEFAULT_DB_PATH: &str = "./witness_orchestrator.db";
 const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_DATADIR: &str = "./forward-driver";
-/// 32 GiB default cap for cold witness storage.
-const DEFAULT_MAX_COLD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// 512 GiB default MDBX geometry max size.
 const DEFAULT_MDBX_MAX_SIZE: u64 = 512 * 1024 * 1024 * 1024;
 /// Default cold-store retention window: 172 800 L2 blocks (~2 days at 1 s/block).
@@ -130,10 +129,6 @@ async fn main() -> eyre::Result<()> {
     let cold_file = std::env::var("WITNESS_COLD_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| datadir.join("cold.redb"));
-    let max_cold_bytes: u64 = std::env::var("MAX_COLD_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MAX_COLD_BYTES);
     let witness_retention_blocks: u64 = std::env::var("WITNESS_RETENTION_BLOCKS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -166,7 +161,7 @@ async fn main() -> eyre::Result<()> {
     let api_key = std::env::var("API_KEY").expect("API_KEY is required");
 
     // RBF dispatch tuning: 15s cycle, +20% bump (safely above EIP-1559's
-    // +12.5% minimum), 500 gwei cap.
+    // +12.5% minimum).
     let rbf_bump_interval = Duration::from_secs(
         std::env::var("RBF_BUMP_INTERVAL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15),
     );
@@ -183,13 +178,6 @@ async fn main() -> eyre::Result<()> {
         std::env::var("L1_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
     let l2_safe_blocks: u64 =
         std::env::var("L2_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
-
-    // Optional destructive knob. Hard error on malformed value so a typo does
-    // not silently skip the unwind (operator would then believe it ran).
-    let unwind_to_block: Option<u64> = match std::env::var("UNWIND_TO_BLOCK") {
-        Ok(s) => Some(s.parse().map_err(|e| eyre::eyre!("UNWIND_TO_BLOCK must be a u64: {e}"))?),
-        Err(_) => None,
-    };
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(http_timeout_secs))
@@ -209,7 +197,7 @@ async fn main() -> eyre::Result<()> {
 
     // ── Startup: resolve L2 checkpoint from START_BATCH_ID ───────────────────────
     let (listener_from_block, witness_from_block, orchestrator_checkpoint): (u64, u64, u64) = {
-        let db_startup = crate::db::Db::open(&db_path).expect("Failed to open DB for startup");
+        let db_startup = Db::open(&db_path).expect("Failed to open DB for startup");
 
         // DB-persisted start batch id takes precedence over the env var.
         // It is written by the BatchReverted handler after wiping all state,
@@ -290,7 +278,6 @@ async fn main() -> eyre::Result<()> {
         %rpc_url,
         ?datadir,
         ?cold_file,
-        max_cold_bytes,
         witness_retention_blocks,
         %proxy_url,
         ?db_path,
@@ -302,7 +289,6 @@ async fn main() -> eyre::Result<()> {
         l1_deploy_block,
         witness_from_block,
         l2_safe_blocks,
-        unwind_to_block,
         "Starting witness orchestrator"
     );
 
@@ -333,14 +319,12 @@ async fn main() -> eyre::Result<()> {
     // statement commands run as their own transaction. Readers still hold the
     // `Arc<Mutex<Db>>` directly — reads are rare and serialize cheaply against
     // the writer actor's own Mutex scope.
-    let db = Arc::new(Mutex::new(
-        crate::db::Db::open(&db_path).expect("Failed to open orchestrator DB"),
-    ));
-    let (db_tx, db_rx) = tokio::sync::mpsc::unbounded_channel::<crate::db::DbCommand>();
+    let db = Arc::new(Mutex::new(Db::open(&db_path).expect("Failed to open orchestrator DB")));
+    let (db_tx, db_rx) = tokio::sync::mpsc::unbounded_channel::<DbCommand>();
     {
         let db = Arc::clone(&db);
         tasks.spawn(async move {
-            crate::db::run_db_writer(db_rx, db).await;
+            db::run_db_writer(db_rx, db).await;
             ("db_writer", Ok::<(), eyre::Report>(()))
         });
     }
@@ -417,12 +401,8 @@ async fn main() -> eyre::Result<()> {
     // indirectly through `Driver::get_or_build_witness`, which also provides
     // the MDBX rebuild fallback on cold miss. Tip-following writes are
     // buffered in batches of `DEFAULT_COLD_BATCH_SIZE` to amortize redb fsync.
-    let hub = Arc::new(WitnessHub::new(
-        cold_file,
-        max_cold_bytes,
-        witness_retention_blocks,
-        DEFAULT_COLD_BATCH_SIZE,
-    )?);
+    let hub =
+        Arc::new(WitnessHub::new(cold_file, witness_retention_blocks, DEFAULT_COLD_BATCH_SIZE)?);
 
     // ── Embedded forward-sync driver ─────────────────────────────────────────────
     let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
@@ -437,21 +417,17 @@ async fn main() -> eyre::Result<()> {
     )
     .expect("failed to open writable ProviderFactory");
 
-    // One-shot unwind, if requested. Must run AFTER heal_static_files_if_needed
+    // Cold-aware auto-align. Must run AFTER heal_static_files_if_needed
     // (performed inside open_writable_factory) and BEFORE Driver::new, since
     // Driver::new snapshots `start_tip` once and never re-reads it. SQLite is
     // NOT reconciled here — operator's responsibility.
     //
-    // Priority:
-    //   1. Explicit `UNWIND_TO_BLOCK` env — operator override, always wins.
-    //   2. Cold-aware auto-align — unwind to `cold_last` when cold trails
-    //   MDBX. The re-witness branch falls through to `execute_exex_with_block`
-    //   on cold-miss, whose multiproof construction is OOM-prone at depth, so
-    //   we keep re-witness on the cold-hit path and let the fresh-tip path
-    //   rebuild below `cold_last` (allocation-bounded per block).
-    let unwind_target: Option<u64> = if let Some(t) = unwind_to_block {
-        Some(t)
-    } else {
+    // Unwind to `cold_last` when cold trails MDBX. The re-witness branch falls
+    // through to `execute_exex_with_block` on cold-miss, whose multiproof
+    // construction is OOM-prone at depth, so we keep re-witness on the cold-hit
+    // path and let the fresh-tip path rebuild below `cold_last` (allocation-
+    // bounded per block).
+    let unwind_target: Option<u64> = {
         let mdbx_tip = factory
             .best_block_number()
             .map_err(|e| eyre::eyre!("startup best_block_number: {e}"))?;
@@ -473,38 +449,10 @@ async fn main() -> eyre::Result<()> {
     };
 
     if let Some(target) = unwind_target {
-        if unwind_to_block.is_some() && target < orchestrator_checkpoint {
-            tracing::warn!(
-                target,
-                orchestrator_checkpoint,
-                "UNWIND_TO_BLOCK below orchestrator SQLite checkpoint — SQLite state is \
-                 NOT reconciled by this unwind; operator must manually reset the \
-                 orchestrator DB if stale batch/response rows matter for recovery"
-            );
-        }
         driver::unwind_to(factory.clone(), Arc::clone(&hub), target).await?;
     }
 
     let host_executor = Arc::new(EthHostExecutor::eth(chain_spec.clone(), None));
-
-    // TODO: re-enable pruner after adding runtime coupling between MDBX
-    // prune floor and WITNESS_RETENTION_BLOCKS. The risk scenario: driver
-    // runs far ahead while L1 is stalled (low ETH on submitter, rollup
-    // contract frozen, etc.); pruner drops state for blocks that still
-    // need re-witnessing on key rotation; re-exec fails with silent None
-    // from `get_or_build_witness` and retries forever. Re-enabling needs:
-    // (a) a runtime guard that stops the pruner when dispatch is lagging,
-    // (b) an explicit StateAtBlockNotAvailable error instead of Ok(None)
-    // from the driver's witness rebuild path. Until then — archive mode.
-    if std::env::var("PRUNE_FULL").as_deref() == Ok("true") {
-        tracing::warn!(
-            "PRUNE_FULL=true ignored — pruner is currently disabled (archive mode). \
-             Re-enabling requires runtime guard against witness retention; see TODO at \
-             bin/witness-orchestrator/src/main.rs:537."
-        );
-    }
-    info!("Pruning disabled — archive mode");
-    let pruner: Option<driver::DriverPruner> = None;
 
     let hub_for_shutdown = Arc::clone(&hub);
     let hub_for_feeder = Arc::clone(&hub);
@@ -515,7 +463,6 @@ async fn main() -> eyre::Result<()> {
             host_executor,
             hub,
             chain_spec,
-            pruner,
             witness_from_block,
             orchestrator_checkpoint,
             l2_safe_blocks,

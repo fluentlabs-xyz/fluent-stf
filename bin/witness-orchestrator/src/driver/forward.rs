@@ -47,8 +47,6 @@ use reth_provider::{
     LatestStateProviderRef, ReceiptProvider, SaveBlocksMode, StateRootProvider,
     StaticFileProviderFactory, StaticFileWriter,
 };
-use reth_prune::Pruner;
-use reth_prune_types::MINIMUM_UNWIND_SAFE_DISTANCE;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::BlockExecutionWriter;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
@@ -72,13 +70,6 @@ use super::node_types::FluentMdbxNode;
 /// `NodeTypesWithDB`, which the adapter supplies by bolting `DatabaseEnv`
 /// onto our bare `NodeTypes` binding.
 type DriverNode = NodeTypesWithDBAdapter<FluentMdbxNode, DatabaseEnv>;
-
-/// Concrete pruner type: built via `PrunerBuilder::build_with_provider_factory`
-/// against the driver's `ProviderFactory`.
-pub(crate) type DriverPruner = Pruner<
-    <ProviderFactory<DriverNode> as DatabaseProviderFactory>::ProviderRW,
-    ProviderFactory<DriverNode>,
->;
 
 /// Idle poll interval — how long to sleep when remote tip has not advanced.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -281,9 +272,6 @@ pub(crate) struct DriverConfig {
     pub host_executor: Arc<EthHostExecutor>,
     pub hub: Arc<WitnessHub>,
     pub chain_spec: Arc<ChainSpec>,
-    /// Optional reth pruner. When `Some`, invoked after every successful
-    /// block commit — the pruner itself throttles via its `block_interval`.
-    pub pruner: Option<DriverPruner>,
     /// First block that requires a full witness. Blocks below this threshold
     /// are commit-only (MDBX sync without witness/cold-store/ProveRequest).
     /// Set to 0 to witness every block (default when L1_START_BATCH_ID is unset).
@@ -333,7 +321,7 @@ pub(crate) struct Driver {
     /// Flipped to `true` by `advance_to_witness_from_block` on completion.
     /// `run_background_loop` waits for this before producing witnesses.
     ready: AtomicBool,
-    /// Mutable cursor + pruner. Held only during actual work; callers wait
+    /// Mutable cursor. Held only during actual work; callers wait
     /// here while another call is in flight (MDBX writable txn is single-writer).
     state: AsyncMutex<DriverState>,
     l2_safe_blocks: u64,
@@ -342,13 +330,12 @@ pub(crate) struct Driver {
 struct DriverState {
     /// Next block number to process.
     next: u64,
-    pruner: Option<DriverPruner>,
 }
 
 impl Driver {
-    /// Construct the driver. Runs genesis init, static-file heal, invariant
-    /// checks (cold_last vs mdbx_tip, PRUNE_FULL vs witness_from_block).
-    /// Fails loudly on any invariant violation.
+    /// Construct the driver. Runs genesis init, static-file heal, and the
+    /// cold_last vs mdbx_tip invariant check. Fails loudly on any
+    /// invariant violation.
     pub(crate) fn new(cfg: DriverConfig) -> eyre::Result<Self> {
         ensure_genesis_initialized(&cfg.factory)?;
 
@@ -380,26 +367,6 @@ impl Driver {
         }
         let start_tip = mdbx_tip;
 
-        // Startup safety: if PRUNE_FULL is on and the tip is far past
-        // witness_from_block, the history needed to re-witness blocks
-        // [witness_from_block..start_tip] may already have been pruned.
-        if cfg.pruner.is_some() &&
-            witness_from_block <= start_tip &&
-            start_tip - witness_from_block > MINIMUM_UNWIND_SAFE_DISTANCE
-        {
-            return Err(eyre!(
-                "PRUNE_FULL=true but mdbx_tip ({start_tip}) is {} blocks past \
-                 witness_from_block ({witness_from_block}) — account_history/storage_history \
-                 needed to re-witness blocks [{witness_from_block}..{start_tip}] may already \
-                 have been pruned (MINIMUM_UNWIND_SAFE_DISTANCE = {}). Either disable \
-                 PRUNE_FULL, or restore from a snapshot whose mdbx_tip is within {} blocks \
-                 of witness_from_block.",
-                start_tip - witness_from_block,
-                MINIMUM_UNWIND_SAFE_DISTANCE,
-                MINIMUM_UNWIND_SAFE_DISTANCE,
-            ));
-        }
-
         // Resume cursor: max of pipeline-confirmed checkpoint and first
         // witness-required block, clamped to `start_tip + 1` so the driver never
         // skips past its own MDBX tip. When MDBX is behind `witness_from_block`
@@ -426,7 +393,7 @@ impl Driver {
             witness_from_block,
             start_tip,
             ready: AtomicBool::new(false),
-            state: AsyncMutex::new(DriverState { next, pruner: cfg.pruner }),
+            state: AsyncMutex::new(DriverState { next }),
             l2_safe_blocks: cfg.l2_safe_blocks,
         })
     }
@@ -561,9 +528,6 @@ impl Driver {
                         "Catch-up complete — switching to full witness mode"
                     );
                 }
-
-                // Pruner reads committed state; must run after `commit_batch`.
-                run_pruner_if_needed(&mut state.pruner, e).await;
 
                 state.next = e + 1;
             }
@@ -843,8 +807,6 @@ impl Driver {
             )
             .await?;
 
-            // Pruner is skipped here — nothing was committed, so there is
-            // nothing new to prune.
             self.hub.push(block_number, &payload).await?;
             metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
             state.next = block_number + 1;
@@ -898,8 +860,6 @@ impl Driver {
         // rewitness_phase).
         self.hub.push_batched(block_number, &payload).await?;
 
-        run_pruner_if_needed(&mut state.pruner, block_number).await;
-
         state.next = block_number + 1;
         Ok(Produced::Pushed)
     }
@@ -911,40 +871,6 @@ enum Produced {
     /// No work this iteration (remote tip caught up, transient RPC error
     /// absorbed, etc.). Caller should sleep before retrying.
     Idle,
-}
-
-/// Run the pruner on `block_number` if it is due. Ownership hops via
-/// `spawn_blocking` because `Pruner::run` does a lot of sync disk work.
-async fn run_pruner_if_needed(slot: &mut Option<DriverPruner>, block_number: u64) {
-    if let Some(p) = slot.take() {
-        if p.is_pruning_needed(block_number) {
-            let res = tokio::task::spawn_blocking(move || {
-                let mut p = p;
-                let out = p.run(block_number);
-                (p, out)
-            })
-            .await;
-            match res {
-                Ok((returned, Ok(out))) => {
-                    info!(block_number, ?out, "Pruner run");
-                    *slot = Some(returned);
-                }
-                Ok((returned, Err(e))) => {
-                    warn!(block_number, err = %e, "Pruner run failed");
-                    *slot = Some(returned);
-                }
-                Err(e) => {
-                    error!(
-                        block_number,
-                        err = %e,
-                        "Pruner join failed — pruning disabled for this run, restart to restore"
-                    );
-                }
-            }
-        } else {
-            *slot = Some(p);
-        }
-    }
 }
 
 async fn fetch_block(

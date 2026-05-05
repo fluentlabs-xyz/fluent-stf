@@ -69,11 +69,6 @@ reth-revm = { workspace = true }
 reth-primitives-traits = { workspace = true }
 reth-storage-api = { workspace = true }
 
-# reth — pruning
-reth-prune = { workspace = true }
-reth-prune-types = { workspace = true }
-reth-config = { workspace = true }
-
 # blob inspection
 c-kzg = "2.1.7"
 sha2 = "0.10"
