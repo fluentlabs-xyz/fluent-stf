@@ -67,6 +67,7 @@ pub(crate) async fn observe_block_challenged(
         l1_block: None,
         committed_at: now,
         last_status_change_at: now,
+        last_polled_at: None,
     };
     db_send_sync(db_tx, SyncOp::InsertChallenge(row)).await
 }
@@ -105,6 +106,7 @@ pub(crate) async fn observe_batch_root_challenged(
         l1_block: None,
         committed_at: now,
         last_status_change_at: now,
+        last_polled_at: None,
     };
     db_send_sync(db_tx, SyncOp::InsertChallenge(row)).await
 }

@@ -2,29 +2,12 @@
 // SP1 proof result
 // ---------------------------------------------------------------------------
 
-use revm_primitives::FixedBytes;
-
-/// Everything a Solidity contract needs to call `ISP1Verifier.verifyProof()`.
-///
-/// ```solidity
-/// ISP1Verifier(verifier).verifyProof(
-///     bytes32(response.vk_hash),  // program verification key hash
-///     response.public_values,      // public outputs of the zkVM program
-///     response.proof_bytes,        // raw Groth16 proof
-/// );
-/// ```
-///
-/// `block_number` and `block_hash` are not required by the verifier contract
-/// but are included for indexing and sanity checks on the caller side.
+/// Wire payload for `/challenge/sp1/status` 200 response. The Rollup
+/// contract reconstructs `publicValues` itself from the block header +
+/// blob hashes, so the orchestrator only needs `proof_bytes` — the Groth16
+/// proof passed to `ISP1Verifier.verifyProof`.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Sp1ProofResponse {
-    // -- Required by ISP1Verifier.verifyProof() ------------------------------
-    /// `bytes32` program verification key hash — first argument to `verifyProof`.
-    pub vk_hash: FixedBytes<32>,
-    /// ABI-encoded public outputs committed by the SP1 program via
-    /// `sp1_zkvm::io::commit`.  Layout: `parent_hash (32 B) ++ block_hash (32 B) ++ …`
-    pub public_values: Vec<u8>,
-    /// Raw Groth16 proof bytes — third argument to `verifyProof`.
     pub proof_bytes: Vec<u8>,
 }
 

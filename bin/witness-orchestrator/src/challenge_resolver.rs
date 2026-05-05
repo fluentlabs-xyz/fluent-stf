@@ -2,10 +2,8 @@
 //! drive challenge rows through the DB-backed status machine.
 //!
 //! - **Block-level** challenges: `received → sp1_proving → sp1_proved → dispatched → resolved`.
-//!   Delegates SP1 Groth16 proof generation to the proxy `/challenge/sp1/{request,status}` API;
-//!   before broadcasting the result, asserts the proxy's reported `vk_hash` matches the on-chain
-//!   `programVKey()` cached at startup. Builds a merkle inclusion proof from L2 RPC data and
-//!   submits `resolveBlockChallenge`.
+//!   Delegates SP1 Groth16 proof generation to the proxy `/challenge/sp1/{request,status}` API.
+//!   Builds a merkle inclusion proof from L2 RPC data and submits `resolveBlockChallenge`.
 //! - **Batch-root** challenges: `received → dispatched → resolved`. Builds an `L2BlockHeaderV1[]`
 //!   from L2 RPC headers + receipts (no SP1, no local merkle root reconstruction) and submits
 //!   `resolveBatchRootChallenge` — the contract recomputes the root from these headers chained
@@ -25,12 +23,9 @@
 //! the row is marked `Failed` and we do NOT broadcast — there is no
 //! recovery by retry from the same inputs.
 
-use std::{
-    sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
-use alloy_primitives::{Bytes, FixedBytes, B256, U256};
+use alloy_primitives::{Bytes, B256, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionRequest;
 use l1_rollup_client::{
@@ -48,9 +43,6 @@ use crate::{
     rbf::{run_generic, RbfObserver},
 };
 
-/// Polling interval for `/challenge/sp1/status`.
-const SP1_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(15);
-
 /// Active worker tick.
 const WORKER_TICK: Duration = Duration::from_secs(1);
 
@@ -61,40 +53,16 @@ const L1_BLOCK_SECS: u64 = 12;
 /// loudly that MDBX is blocking challenge resolution. ~30 L1 blocks ≈ 6 min.
 const DEADLINE_WARN_WINDOW_L1_BLOCKS: u64 = 30;
 
-/// TTL on the cached L1 block-number probe used by
-/// [`challenge_close_to_deadline`]. With two workers each ticking once
-/// per second, an uncached probe spends 2 RPC/s while MDBX is behind;
-/// a 5 s TTL caps that at 0.4 RPC/s.
-const L1_BLOCK_CACHE_TTL: Duration = Duration::from_secs(5);
-
-/// Process-wide cache for the most recently fetched L1 block number.
-/// Both challenge workers consult `challenge_close_to_deadline` on every
-/// retry tick when MDBX is behind the disputed range; without this
-/// cache, that path would issue one L1 RPC per worker per second for
-/// the entire duration of the lag.
-static LAST_L1_BLOCK: StdMutex<Option<(u64, Instant)>> = StdMutex::new(None);
-
 /// True when `(deadline - current_l1_block) <= DEADLINE_WARN_WINDOW_L1_BLOCKS`.
-/// Returns `false` on L1 RPC failure — a transient lookup error must
-/// not elevate into an alert.
+/// Used to gate noisy MDBX-lag warnings — silent during normal lag, loud
+/// when the deadline is close enough that an unrecovered lag means the
+/// challenge will fail. Returns `false` on L1 RPC failure so a transient
+/// lookup error never elevates into an alert.
 async fn challenge_close_to_deadline(shared: &OrchestratorShared, row: &ChallengeRow) -> bool {
-    let cached = {
-        let g = LAST_L1_BLOCK.lock().unwrap_or_else(|e| e.into_inner());
-        g.and_then(|(bn, at)| (at.elapsed() < L1_BLOCK_CACHE_TTL).then_some(bn))
+    let Ok(current) = shared.config.l1_provider.get_block_number().await else {
+        return false;
     };
-    let current = match cached {
-        Some(bn) => bn,
-        None => {
-            let Ok(bn) = shared.config.l1_provider.get_block_number().await else {
-                return false;
-            };
-            let mut g = LAST_L1_BLOCK.lock().unwrap_or_else(|e| e.into_inner());
-            *g = Some((bn, Instant::now()));
-            bn
-        }
-    };
-    let blocks_left = row.deadline.saturating_sub(current);
-    blocks_left <= DEADLINE_WARN_WINDOW_L1_BLOCKS
+    row.deadline.saturating_sub(current) <= DEADLINE_WARN_WINDOW_L1_BLOCKS
 }
 
 // ============================================================================
@@ -126,6 +94,14 @@ async fn run_block_worker(shared: Arc<OrchestratorShared>) {
             break;
         }
 
+        if backoff.is_blocking() {
+            tokio::select! {
+                biased;
+                _ = shared.shutdown.cancelled() => break,
+                _ = tick.tick() => continue,
+            }
+        }
+
         'work: {
             let row = {
                 let guard = shared.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -141,7 +117,9 @@ async fn run_block_worker(shared: Arc<OrchestratorShared>) {
                 ChallengeStatus::Received => {
                     handle_block_received(&shared, &row, &mut backoff).await
                 }
-                ChallengeStatus::Sp1Proving => handle_sp1_proving(&shared, &row).await,
+                ChallengeStatus::Sp1Proving => {
+                    handle_sp1_proving(&shared, &row, &mut backoff).await
+                }
                 ChallengeStatus::Sp1Proved => handle_sp1_proved(&shared, &row, &mut backoff).await,
                 ChallengeStatus::Dispatched => {
                     handle_dispatched_resume(&shared, &row, &mut backoff).await;
@@ -174,6 +152,14 @@ async fn run_batch_root_worker(shared: Arc<OrchestratorShared>) {
     loop {
         if shared.shutdown.is_cancelled() {
             break;
+        }
+
+        if backoff.is_blocking() {
+            tokio::select! {
+                biased;
+                _ = shared.shutdown.cancelled() => break,
+                _ = tick.tick() => continue,
+            }
         }
 
         'work: {
@@ -248,22 +234,63 @@ async fn check_and_fail_if_deadline_expired(
 }
 
 // ============================================================================
+// Resolve error classification
+// ============================================================================
+
+/// Per-step failure classification for the resolve pipeline.
+/// `InvariantViolation` ⇒ operator action required (rollup wedged); the
+/// worker marks the row Failed and stops retrying. `Transient` ⇒ wait +
+/// retry on backoff. Silent loops on either branch were the bug class
+/// the e2e audit was filed against.
+enum ResolveError {
+    InvariantViolation(String),
+    Transient(eyre::Report),
+}
+
+/// Mark a challenge row `Failed` with operator-loud logging. Reserved
+/// for invariant violations the worker cannot recover from by retrying
+/// (missing batch in DB, commitment not in batch's L2 range, etc.).
+async fn mark_invariant_violation(shared: &OrchestratorShared, row: &ChallengeRow, reason: &str) {
+    error!(
+        challenge_id = row.challenge_id,
+        kind = row.kind.as_str(),
+        batch_index = row.batch_index,
+        reason,
+        "INVARIANT VIOLATION — marking challenge Failed; operator action required"
+    );
+    metrics::counter!(
+        "orchestrator_challenge_invariant_violation_total",
+        "kind" => row.kind.as_str(),
+    )
+    .increment(1);
+    let patch = ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
+    persist_patch(shared, row.challenge_id, patch).await;
+}
+
+// ============================================================================
 // Block-kind status handlers
 // ============================================================================
 
 async fn handle_block_received(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
-    _backoff: &mut DispatchBackoff,
+    backoff: &mut DispatchBackoff,
 ) {
     let target_block_number = match resolve_block_target(shared, row).await {
-        Some(n) => n,
-        None => return,
+        Ok(n) => n,
+        Err(ResolveError::InvariantViolation(reason)) => {
+            mark_invariant_violation(shared, row, &reason).await;
+            return;
+        }
+        Err(ResolveError::Transient(_)) => {
+            backoff.apply("resolve_block_target transient");
+            return;
+        }
     };
     let (from_block, to_block) = match lookup_batch_range(shared, row.batch_index) {
         Ok(r) => r,
         Err(e) => {
-            warn!(challenge_id = row.challenge_id, err = %e, "lookup_batch_range failed");
+            mark_invariant_violation(shared, row, &format!("lookup_batch_range: {e}")).await;
             return;
         }
     };
@@ -277,6 +304,7 @@ async fn handle_block_received(
                 challenge_id = row.challenge_id,
                 target_block_number, "witness not available (block beyond MDBX tip or zero)"
             );
+            backoff.apply("witness not available");
             return;
         }
         Err(e) => {
@@ -286,6 +314,7 @@ async fn handle_block_received(
                 err = %e,
                 "Driver::get_or_build_witness failed"
             );
+            backoff.apply("get_or_build_witness");
             return;
         }
     };
@@ -299,6 +328,7 @@ async fn handle_block_received(
                     err = %e,
                     "deserialize EthClientExecutorInput from witness payload failed"
                 );
+                backoff.apply("deserialize EthClientExecutorInput");
                 return;
             }
         };
@@ -319,6 +349,7 @@ async fn handle_block_received(
                      worker will retry next tick"
                     );
                 }
+                backoff.apply("build_blobs_from_mdbx tip-behind");
                 return;
             }
             Err(e) => {
@@ -329,6 +360,7 @@ async fn handle_block_received(
                     err = %e,
                     "build_blobs_from_mdbx failed"
                 );
+                backoff.apply("build_blobs_from_mdbx");
                 return;
             }
         };
@@ -365,11 +397,16 @@ async fn handle_block_received(
                 err = %e,
                 "post_sp1_request failed"
             );
+            backoff.apply("post_sp1_request");
         }
     }
 }
 
-async fn handle_sp1_proving(shared: &OrchestratorShared, row: &ChallengeRow) {
+async fn handle_sp1_proving(
+    shared: &OrchestratorShared,
+    row: &ChallengeRow,
+    backoff: &mut DispatchBackoff,
+) {
     // CHECK constraint guarantees Sp1Proving rows always carry sp1_request_id.
     // This `else` is defensive only — real divergence would mean DB corruption.
     let Some(request_id) = row.sp1_request_id else {
@@ -379,6 +416,15 @@ async fn handle_sp1_proving(shared: &OrchestratorShared, row: &ChallengeRow) {
         );
         return;
     };
+
+    // Stamp `last_polled_at` BEFORE the HTTP call — the SQL predicate
+    // in `find_active_block_challenge` excludes the row from the next
+    // ~SP1_STATUS_POLL_INTERVAL_SECS even if the call errors mid-flight,
+    // preventing a tight retry loop against the proxy.
+    let stamp_patch =
+        ChallengePatch { last_polled_at: Some(Some(crate::db::now_ts())), ..Default::default() };
+    persist_patch(shared, row.challenge_id, stamp_patch).await;
+
     match poll_sp1_status(
         &shared.config.http_client,
         &shared.config.proxy_url,
@@ -387,21 +433,7 @@ async fn handle_sp1_proving(shared: &OrchestratorShared, row: &ChallengeRow) {
     )
     .await
     {
-        Ok(Sp1StatusOutcome::Ready { vk_hash, proof_bytes }) => {
-            let on_chain = shared.config.on_chain_program_vkey;
-            if vk_hash != on_chain {
-                error!(
-                    challenge_id = row.challenge_id,
-                    proxy_vk_hash = %vk_hash,
-                    on_chain_vk_hash = %shared.config.on_chain_program_vkey,
-                    "vk_hash mismatch — proxy SP1 ELF diverged from on-chain programVKey; \
-                     marking challenge failed (proxy redeploy required)"
-                );
-                let patch =
-                    ChallengePatch { status: Some(ChallengeStatus::Failed), ..Default::default() };
-                persist_patch(shared, row.challenge_id, patch).await;
-                return;
-            }
+        Ok(Sp1StatusOutcome::Ready { proof_bytes }) => {
             let patch = ChallengePatch {
                 status: Some(ChallengeStatus::Sp1Proved),
                 sp1_proof_bytes: Some(Some(proof_bytes)),
@@ -433,8 +465,9 @@ async fn handle_sp1_proving(shared: &OrchestratorShared, row: &ChallengeRow) {
             warn!(
                 challenge_id = row.challenge_id,
                 err = %e,
-                "poll_sp1_status failed — retrying next tick"
+                "poll_sp1_status failed — retrying after SP1_STATUS_POLL_INTERVAL"
             );
+            backoff.apply("poll_sp1_status");
         }
     }
 }
@@ -468,20 +501,42 @@ async fn handle_dispatched_resume(
         return;
     };
 
-    let partial = match prepare_resolve_partial(shared, row).await {
+    // Same calldata-only → simulate → finalize order as run_resolve_lifecycle.
+    let mut partial = match prepare_resolve_partial(shared, row).await {
         Ok(p) => p,
-        Err(e) => {
+        Err(ResolveError::InvariantViolation(reason)) => {
+            mark_invariant_violation(shared, row, &reason).await;
+            return;
+        }
+        Err(ResolveError::Transient(e)) => {
             warn!(
                 challenge_id = row.challenge_id,
                 err = %e,
-                "prepare_resolve_partial (resume) failed"
+                "prepare_resolve_partial (resume) transient — backoff"
             );
+            backoff.apply("prepare_resolve_partial (resume) transient");
             return;
         }
     };
 
     if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &partial).await {
         fail_with_reason(shared, row, reason).await;
+        return;
+    }
+
+    if let Err(e) = l1_rollup_client::finalize_partial(
+        &shared.config.l1_provider,
+        &mut partial,
+        shared.config.l1_signer_address,
+    )
+    .await
+    {
+        warn!(
+            challenge_id = row.challenge_id,
+            err = %e,
+            "finalize_partial (resume gas estimate) failed after sim passed"
+        );
+        backoff.apply("finalize_partial (resume)");
         return;
     }
 
@@ -499,7 +554,10 @@ async fn handle_dispatched_resume(
         Some(r) => (r.max_fee_per_gas, r.max_priority_fee_per_gas),
         None => match estimate_initial_fees(shared, row).await {
             Some(v) => v,
-            None => return,
+            None => {
+                backoff.apply("estimate_initial_fees (resume)");
+                return;
+            }
         },
     };
 
@@ -541,26 +599,58 @@ async fn run_resolve_lifecycle(
     row: &ChallengeRow,
     backoff: &mut DispatchBackoff,
 ) {
-    let partial = match prepare_resolve_partial(shared, row).await {
+    // 1. Calldata-only partial. NO `eth_estimateGas` here — a permanent contract revert (missing
+    //    PROVER_ROLE, paused, corrupted) must surface in step 2 via `eth_call` simulation, not as a
+    //    transient `Err` that loops the worker until deadline.
+    let mut partial = match prepare_resolve_partial(shared, row).await {
         Ok(p) => p,
-        Err(e) => {
+        Err(ResolveError::InvariantViolation(reason)) => {
+            mark_invariant_violation(shared, row, &reason).await;
+            return;
+        }
+        Err(ResolveError::Transient(e)) => {
             warn!(
                 challenge_id = row.challenge_id,
                 err = %e,
-                "prepare_resolve_partial failed"
+                "prepare_resolve_partial transient — backoff"
             );
+            backoff.apply("prepare_resolve_partial transient");
             return;
         }
     };
 
+    // 2. Pre-broadcast simulation. Catches any contract revert (AccessControl, RollupCorrupted,
+    //    EnforcedPause, BlockNotChallenged, ChallengeResolutionTooLate, etc.) deterministically
+    //    before we pay for `estimate_gas`.
     if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &partial).await {
         fail_with_reason(shared, row, reason).await;
         return;
     }
 
+    // 3. Now safe to estimate gas — contract accepts the call.
+    if let Err(e) = l1_rollup_client::finalize_partial(
+        &shared.config.l1_provider,
+        &mut partial,
+        shared.config.l1_signer_address,
+    )
+    .await
+    {
+        warn!(
+            challenge_id = row.challenge_id,
+            err = %e,
+            "finalize_partial (gas estimate) failed after sim passed"
+        );
+        backoff.apply("finalize_partial");
+        return;
+    }
+
+    // 4. Fees + nonce + RBF lifecycle.
     let (fee, tip) = match estimate_initial_fees(shared, row).await {
         Some(v) => v,
-        None => return,
+        None => {
+            backoff.apply("estimate_initial_fees");
+            return;
+        }
     };
 
     let nonce = shared.nonce_allocator.allocate();
@@ -690,13 +780,13 @@ async fn validate_resolve_pre_broadcast(
 // ============================================================================
 
 /// Per-kind dispatcher: builds either a `resolveBlockChallenge` or a
-/// `resolveBatchRootChallenge` envelope without a nonce. Caller attaches
-/// the allocated nonce via `RollupTxPartial::with_nonce` just before
-/// broadcast.
+/// `resolveBatchRootChallenge` calldata-only partial. Caller runs
+/// `validate_resolve_pre_broadcast`, then `finalize_partial`, then
+/// `RollupTxPartial::with_nonce` just before broadcast.
 async fn prepare_resolve_partial(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
-) -> eyre::Result<RollupTxPartial> {
+) -> Result<RollupTxPartial, ResolveError> {
     match row.kind {
         ChallengeKind::Block => prepare_block_resolve_partial(shared, row).await,
         ChallengeKind::BatchRoot => prepare_batch_root_resolve_partial(shared, row).await,
@@ -706,35 +796,50 @@ async fn prepare_resolve_partial(
 async fn prepare_block_resolve_partial(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
-) -> eyre::Result<RollupTxPartial> {
+) -> Result<RollupTxPartial, ResolveError> {
     let cfg = &shared.config;
-    let commitment =
-        row.commitment.ok_or_else(|| eyre::eyre!("block challenge row missing commitment"))?;
-    let sp1_proof = row
-        .sp1_proof_bytes
-        .clone()
-        .ok_or_else(|| eyre::eyre!("block challenge row missing sp1_proof_bytes"))?;
-
-    let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)?;
-
-    let Some((headers, leaves)) =
-        shared.driver.collect_l2_block_headers(from_block..=to_block).await?
-    else {
-        if challenge_close_to_deadline(shared, row).await {
-            warn!(
-                challenge_id = row.challenge_id,
-                from_block, to_block, "MDBX tip behind disputed range; deadline approaching"
-            );
-        }
-        return Err(eyre::eyre!(
-            "MDBX tip behind challenge range [{from_block}..={to_block}]; \
-             driver will catch up on next tick"
+    let Some(commitment) = row.commitment else {
+        return Err(ResolveError::InvariantViolation(
+            "block challenge row missing commitment".to_string(),
+        ));
+    };
+    let Some(sp1_proof) = row.sp1_proof_bytes.clone() else {
+        return Err(ResolveError::InvariantViolation(
+            "block challenge row missing sp1_proof_bytes".to_string(),
         ));
     };
 
-    let idx = leaves.iter().position(|l| *l == commitment).ok_or_else(|| {
-        eyre::eyre!("no matching leaf in batch {} for commitment {commitment}", row.batch_index)
-    })?;
+    let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)
+        .map_err(|e| ResolveError::InvariantViolation(format!("{e}")))?;
+
+    let (headers, leaves) = match shared
+        .driver
+        .collect_l2_block_headers(from_block..=to_block)
+        .await
+        .map_err(ResolveError::Transient)?
+    {
+        Some(v) => v,
+        None => {
+            if challenge_close_to_deadline(shared, row).await {
+                warn!(
+                    challenge_id = row.challenge_id,
+                    from_block, to_block, "MDBX tip behind disputed range; deadline approaching"
+                );
+            }
+            return Err(ResolveError::Transient(eyre::eyre!(
+                "MDBX tip behind challenge range [{from_block}..={to_block}]; \
+                 driver will catch up on next tick"
+            )));
+        }
+    };
+
+    let Some(idx) = leaves.iter().position(|l| *l == commitment) else {
+        return Err(ResolveError::InvariantViolation(format!(
+            "no matching leaf in batch {} for commitment {commitment} — \
+             L2 chain may have forked away from sequencer-submitted blob data",
+            row.batch_index
+        )));
+    };
 
     let (proof_nonce, proof_bytes) = batch_merkle::build_merkle_proof(&leaves, idx);
     let merkle_proof =
@@ -747,33 +852,40 @@ async fn prepare_block_resolve_partial(
         headers[idx].clone(),
         merkle_proof,
         sp1_proof,
-        cfg.l1_signer_address,
     )
     .await
+    .map_err(ResolveError::Transient)
 }
 
 async fn prepare_batch_root_resolve_partial(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
-) -> eyre::Result<RollupTxPartial> {
+) -> Result<RollupTxPartial, ResolveError> {
     let cfg = &shared.config;
-    let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)?;
+    let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)
+        .map_err(|e| ResolveError::InvariantViolation(format!("{e}")))?;
 
-    let Some((headers, _leaves)) =
-        shared.driver.collect_l2_block_headers(from_block..=to_block).await?
-    else {
-        if challenge_close_to_deadline(shared, row).await {
-            warn!(
-                challenge_id = row.challenge_id,
-                from_block,
-                to_block,
-                "MDBX tip behind batch-root challenge range; deadline approaching"
-            );
+    let (headers, _leaves) = match shared
+        .driver
+        .collect_l2_block_headers(from_block..=to_block)
+        .await
+        .map_err(ResolveError::Transient)?
+    {
+        Some(v) => v,
+        None => {
+            if challenge_close_to_deadline(shared, row).await {
+                warn!(
+                    challenge_id = row.challenge_id,
+                    from_block,
+                    to_block,
+                    "MDBX tip behind batch-root challenge range; deadline approaching"
+                );
+            }
+            return Err(ResolveError::Transient(eyre::eyre!(
+                "MDBX tip behind batch-root challenge range [{from_block}..={to_block}]; \
+                 driver will catch up on next tick"
+            )));
         }
-        return Err(eyre::eyre!(
-            "MDBX tip behind batch-root challenge range [{from_block}..={to_block}]; \
-             driver will catch up on next tick"
-        ));
     };
 
     let v1_headers: Vec<L2BlockHeaderV1> = headers
@@ -790,9 +902,9 @@ async fn prepare_batch_root_resolve_partial(
         cfg.l1_rollup_addr,
         row.batch_index,
         v1_headers,
-        cfg.l1_signer_address,
     )
     .await
+    .map_err(ResolveError::Transient)
 }
 
 /// Local lookup of `(from_block, to_block)` for a batch. The orchestrator
@@ -809,44 +921,38 @@ fn lookup_batch_range(shared: &OrchestratorShared, batch_index: u64) -> eyre::Re
     })
 }
 
-/// Resolve the L2 block number that backs the disputed commitment by
-/// scanning the batch's blocks. Returns `None` on MDBX-not-yet-caught-up,
-/// MDBX read failure, or absent match (caller logs and waits for the
-/// next tick). Pre-`Sp1Proving` phase, deadline is not pressing yet, so
-/// no warn-near-deadline escalation here.
-async fn resolve_block_target(shared: &OrchestratorShared, row: &ChallengeRow) -> Option<u64> {
-    let commitment = match row.commitment {
-        Some(c) => c,
-        None => {
-            warn!(challenge_id = row.challenge_id, "block challenge row missing commitment");
-            return None;
-        }
+/// Resolve the L2 block number that backs the disputed commitment.
+/// `InvariantViolation` ⇒ commitment matches no leaf in the batch's MDBX
+/// range (L2 may have forked); `Transient` ⇒ batch row not yet seen,
+/// MDBX behind, or read error.
+async fn resolve_block_target(
+    shared: &OrchestratorShared,
+    row: &ChallengeRow,
+) -> Result<u64, ResolveError> {
+    let Some(commitment) = row.commitment else {
+        return Err(ResolveError::InvariantViolation(
+            "block challenge row missing commitment".to_string(),
+        ));
     };
-    let (from_block, to_block) = match lookup_batch_range(shared, row.batch_index) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                challenge_id = row.challenge_id,
-                err = %e,
-                "lookup_batch_range failed"
-            );
-            return None;
-        }
-    };
-    let (_, leaves) = match shared.driver.collect_l2_block_headers(from_block..=to_block).await {
-        Ok(Some(v)) => v,
-        Ok(None) => return None,
-        Err(e) => {
-            warn!(
-                challenge_id = row.challenge_id,
-                err = %e,
-                "collect_l2_block_headers failed in resolve_block_target"
-            );
-            return None;
-        }
-    };
-    let idx = leaves.iter().position(|l| *l == commitment)?;
-    Some(from_block + idx as u64)
+    let (from_block, to_block) = lookup_batch_range(shared, row.batch_index)
+        .map_err(|e| ResolveError::Transient(eyre::eyre!("{e}")))?;
+    let (_, leaves) = shared
+        .driver
+        .collect_l2_block_headers(from_block..=to_block)
+        .await
+        .map_err(ResolveError::Transient)?
+        .ok_or_else(|| {
+            ResolveError::Transient(eyre::eyre!(
+                "MDBX tip behind challenge range [{from_block}..={to_block}]"
+            ))
+        })?;
+    leaves.iter().position(|l| *l == commitment).map(|idx| from_block + idx as u64).ok_or_else(
+        || {
+            ResolveError::InvariantViolation(
+                "commitment not in batch L2 range — L2 chain may have forked".to_string(),
+            )
+        },
+    )
 }
 
 async fn persist_patch(shared: &OrchestratorShared, challenge_id: i64, patch: ChallengePatch) {
@@ -890,17 +996,11 @@ struct Sp1RequestResponse {
 
 #[derive(Deserialize)]
 struct Sp1ProofResponse {
-    vk_hash: FixedBytes<32>,
-    /// The contract reconstructs publicValues from the block header +
-    /// blob hashes; we don't forward this field to L1. Kept for symmetry
-    /// with the proxy schema and operator inspection.
-    #[allow(dead_code)]
-    public_values: Vec<u8>,
     proof_bytes: Vec<u8>,
 }
 
 enum Sp1StatusOutcome {
-    Ready { vk_hash: FixedBytes<32>, proof_bytes: Vec<u8> },
+    Ready { proof_bytes: Vec<u8> },
     Pending,
 }
 
@@ -962,11 +1062,9 @@ async fn poll_sp1_status(
     api_key: &str,
     request_id: B256,
 ) -> Result<Sp1StatusOutcome, Sp1StatusError> {
-    // Pace successive polls inside a single tick. The active worker re-enters
-    // this function on its 1s tick; this short sleep prevents the unlikely
-    // case of double-polling from back-to-back ticks.
-    tokio::time::sleep(SP1_STATUS_POLL_INTERVAL).await;
-
+    // Pacing is handled by the SQL predicate in `find_active_block_challenge`
+    // via the `last_polled_at` column — `handle_sp1_proving` stamps it
+    // before calling here, so the row is excluded from the next ~15 s.
     let resp = http_client
         .post(format!("{proxy_url}/challenge/sp1/status"))
         .header("x-api-key", api_key)
@@ -983,7 +1081,7 @@ async fn poll_sp1_status(
                 .json()
                 .await
                 .map_err(|e| Sp1StatusError::Other(eyre::eyre!("decode proof body: {e}")))?;
-            Ok(Sp1StatusOutcome::Ready { vk_hash: proof.vk_hash, proof_bytes: proof.proof_bytes })
+            Ok(Sp1StatusOutcome::Ready { proof_bytes: proof.proof_bytes })
         }
         202 => Ok(Sp1StatusOutcome::Pending),
         404 => Err(Sp1StatusError::Lost),
@@ -1111,6 +1209,14 @@ impl RbfObserver for ResolveObserver<'_> {
         persist_patch(self.shared, self.challenge_id, patch).await;
     }
 
+    /// Exits the bump loop only on terminal status (`Resolved` | `Failed`).
+    /// There is a narrow race window: the bump loop may broadcast a tx at
+    /// fee-bump time before this check runs. If the listener flipped status
+    /// to Resolved between the broadcast and the next abort poll, our
+    /// newly-broadcast tx will revert with `BlockNotChallenged` /
+    /// `BatchRootNotChallenged` on chain — wasted gas, no other harm.
+    /// Acceptable: polling status before EVERY broadcast would double the
+    /// L1 RPC load.
     async fn should_abort(&self) -> bool {
         let row = {
             let guard = self.shared.db.lock().unwrap_or_else(|e| e.into_inner());

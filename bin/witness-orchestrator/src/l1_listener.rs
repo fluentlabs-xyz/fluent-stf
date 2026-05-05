@@ -69,6 +69,12 @@ pub(crate) enum L1Event {
 
 const MAX_POLL_BACKOFF_SECS: u64 = 120;
 
+/// Number of consecutive successful poll cycles between heartbeat INFO
+/// logs. With the default `poll_interval_secs = 12` (one L1 block),
+/// 100 cycles ≈ 20 minutes between heartbeats — enough to confirm
+/// liveness without flooding the operator log.
+const CHECKPOINT_LOG_EVERY: u64 = 100;
+
 const MIN_PAGE: u64 = 100;
 const MAX_PAGE: u64 = 10_000;
 const INITIAL_PAGE: u64 = 2_000;
@@ -117,6 +123,7 @@ pub(crate) async fn run(
 
     let mut backoff_secs = poll_interval_secs;
     let mut page_size: u64 = INITIAL_PAGE;
+    let mut polls_since_log: u64 = 0;
 
     loop {
         if shutdown.is_cancelled() {
@@ -150,6 +157,11 @@ pub(crate) async fn run(
                 }
                 from_block = latest + 1;
                 backoff_secs = poll_interval_secs; // reset on full success
+                polls_since_log += 1;
+                if polls_since_log >= CHECKPOINT_LOG_EVERY {
+                    info!(latest_l1_block = latest, "L1 listener checkpoint heartbeat");
+                    polls_since_log = 0;
+                }
             }
             Ok(PollOutcome::Partial(last_ok)) => {
                 if tx.send(L1Event::Checkpoint(last_ok)).await.is_err() {
@@ -369,7 +381,8 @@ async fn process_page(
                 .try_into()
                 .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
             let commitment = event.commitment;
-            info!(batch_index, %commitment, "BlockChallenged event");
+            // observe_block_challenged emits a single info! line with the
+            // computed deadline — no need for a separate event-only log here.
             if tx.send(L1Event::BlockChallenged { batch_index, commitment }).await.is_err() {
                 return Err(eyre!("L1 event channel closed"));
             }
@@ -384,7 +397,8 @@ async fn process_page(
                 .batchIndex
                 .try_into()
                 .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-            info!(batch_index, "BatchRootChallenged event");
+            // observe_batch_root_challenged emits a single info! line with
+            // the computed deadline — no need for a separate event-only log.
             if tx.send(L1Event::BatchRootChallenged { batch_index }).await.is_err() {
                 return Err(eyre!("L1 event channel closed"));
             }

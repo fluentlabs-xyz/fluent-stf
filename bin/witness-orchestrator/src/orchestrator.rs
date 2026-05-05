@@ -74,6 +74,11 @@ pub(crate) type L1WriteProvider = FillProvider<
 /// apply global backoff, and retry from scratch (including re-running
 /// pre-flight reconciliation). Prevents a stuck-at-cap worker from running
 /// forever against a mempool that refuses to mine it.
+///
+/// Shared with the challenge resolver via `compute_wall_clock_budget`,
+/// which clamps to `min(STUCK_AT_CAP_TIMEOUT, blocks_to_deadline × 12s)`.
+/// The two paths (preconfirm vs challenge) coincide on this constant; if
+/// they diverge in future, split into per-path constants.
 pub(crate) const STUCK_AT_CAP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Number of persistent execution workers sending blocks to the Nitro proxy.
@@ -118,12 +123,6 @@ pub(crate) struct OrchestratorConfig {
     /// Hitting this cap is a loud operator-attention event; the worker
     /// continues rebroadcasting at the cap.
     pub rbf_max_fee_per_gas_wei: u128,
-    /// On-chain `Rollup.programVKey()` read once at startup. The
-    /// challenge resolver checks the proxy's per-proof `vk_hash`
-    /// against this before broadcasting `resolveBlockChallenge` so a
-    /// stale proxy ELF is caught locally rather than at on-chain
-    /// verifyProof revert.
-    pub on_chain_program_vkey: B256,
 }
 
 /// All batch state lives in SQLite — `db` is the read path, `db_tx` is the
@@ -1016,7 +1015,7 @@ impl DispatchBackoff {
         self.next_allowed = None;
     }
 
-    fn is_blocking(&self) -> bool {
+    pub(crate) fn is_blocking(&self) -> bool {
         match self.next_allowed {
             Some(deadline) => tokio::time::Instant::now() < deadline,
             None => false,
@@ -1430,6 +1429,10 @@ async fn apply_challenge_reorg_check(
                     recorded_l1_block,
                     "challenge tx receipt status=0 post-mine — clearing RBF state for retry"
                 );
+                // The L1 nonce was consumed by the reverted tx; clearing
+                // `nonce: Some(None)` here intentionally drops our reference
+                // to it. `handle_dispatched_resume` allocates a fresh nonce
+                // via the rollback path (Block→Sp1Proved or BatchRoot→Received).
                 let patch = ChallengePatch {
                     tx_hash: Some(None),
                     nonce: Some(None),

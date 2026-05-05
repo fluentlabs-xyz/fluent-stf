@@ -392,7 +392,6 @@ async fn main() -> eyre::Result<()> {
     }
 
     let l1_listened_l2_provider = l2_provider.clone();
-    let l1_read_provider_for_config = l1_read_provider.clone();
 
     // Start L1 event listener
     let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(64);
@@ -547,18 +546,6 @@ async fn main() -> eyre::Result<()> {
         })
     };
 
-    // Read the on-chain SP1 program verification key once at startup.
-    // The challenge resolver uses it to detect proxy ELF / vkey drift
-    // before broadcasting `resolveBlockChallenge`.
-    let on_chain_program_vkey =
-        l1_rollup_client::get_program_vkey(&l1_read_provider_for_config, l1_rollup_addr)
-            .await
-            .map_err(|e| eyre::eyre!("Failed to read on-chain programVKey at startup: {e}"))?;
-    tracing::info!(
-        on_chain_program_vkey = %on_chain_program_vkey,
-        "Cached on-chain programVKey for challenge resolver vk_hash check"
-    );
-
     let config = OrchestratorConfig {
         proxy_url,
         http_client,
@@ -571,7 +558,6 @@ async fn main() -> eyre::Result<()> {
         rbf_bump_interval,
         rbf_bump_percent,
         rbf_max_fee_per_gas_wei,
-        on_chain_program_vkey,
     };
 
     // Driver background loop is decoupled from the feeder so proxy

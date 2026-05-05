@@ -149,9 +149,9 @@ pub(crate) enum ChallengeStatus {
     Sp1Proved = 2,
     Dispatched = 3,
     Resolved = 4,
-    /// Terminal — challenge cannot be resolved (deadline expired, vk_hash
-    /// mismatch, pre-broadcast simulation reverted, etc). Operator must
-    /// call `revertBatches` on L1 to recover the rollup. The worker skips
+    /// Terminal — challenge cannot be resolved (deadline expired,
+    /// pre-broadcast simulation reverted, etc). Operator must call
+    /// `revertBatches` on L1 to recover the rollup. The worker skips
     /// rows in this status.
     Failed = 5,
 }
@@ -198,6 +198,12 @@ pub(crate) struct ChallengeRow {
     pub l1_block: Option<u64>,
     pub committed_at: u64,
     pub last_status_change_at: u64,
+    /// Unix-seconds timestamp of the most recent `/challenge/sp1/status`
+    /// poll. `None` until the first poll. Used by the SQL predicate in
+    /// `find_active_block_challenge` to skip rows still inside the
+    /// `SP1_STATUS_POLL_INTERVAL_SECS` window — replaces the old
+    /// in-handler `tokio::sleep` that was blocking the worker.
+    pub last_polled_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -210,7 +216,12 @@ pub(crate) struct ChallengePatch {
     pub max_fee_per_gas: Option<Option<u128>>,
     pub max_priority_fee_per_gas: Option<Option<u128>>,
     pub l1_block: Option<Option<u64>>,
+    pub last_polled_at: Option<Option<u64>>,
 }
+
+/// Pacing window for `/challenge/sp1/status` polls. Mirrored in
+/// `challenge_resolver` as `SP1_STATUS_POLL_INTERVAL`.
+pub(crate) const SP1_STATUS_POLL_INTERVAL_SECS: u64 = 15;
 
 // ============================================================================
 // Db handle
@@ -270,6 +281,7 @@ const SCHEMA_DDL: &str = "
         l1_block                  INTEGER,
         committed_at              INTEGER NOT NULL,
         last_status_change_at     INTEGER NOT NULL,
+        last_polled_at            INTEGER,
         CHECK (kind IN ('block','batch_root')),
         CHECK (status IN ('received','sp1_proving','sp1_proved','dispatched','resolved','failed')),
         CHECK (kind = 'batch_root' OR commitment IS NOT NULL),
@@ -284,6 +296,13 @@ const SCHEMA_DDL: &str = "
     CREATE INDEX IF NOT EXISTS challenges_active_idx
         ON challenges(kind, status, deadline);
 ";
+
+/// Column list used by every `SELECT ... FROM challenges` in this module.
+/// Order is consensus with `row_to_challenge_row` indices.
+const CHALLENGE_COLS: &str = "challenge_id, kind, batch_index, commitment, status, deadline, \
+     sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
+     max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
+     committed_at, last_status_change_at, last_polled_at";
 
 impl Db {
     /// Open or create the SQLite database at `path`.
@@ -771,8 +790,8 @@ impl Db {
                 kind, batch_index, commitment, status, deadline, \
                 sp1_request_id, sp1_proof_bytes, \
                 tx_hash, nonce, max_fee_per_gas, max_priority_fee_per_gas, \
-                l1_block, committed_at, last_status_change_at\
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                l1_block, committed_at, last_status_change_at, last_polled_at\
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 row.kind.as_str(),
                 row.batch_index as i64,
@@ -788,6 +807,7 @@ impl Db {
                 row.l1_block.map(|n| n as i64),
                 row.committed_at as i64,
                 row.last_status_change_at as i64,
+                row.last_polled_at.map(|n| n as i64),
             ],
         )?;
         Ok(())
@@ -831,6 +851,10 @@ impl Db {
             sets.push("l1_block = ?");
             binds.push(Box::new(b.map(|v| v as i64)));
         }
+        if let Some(p) = patch.last_polled_at {
+            sets.push("last_polled_at = ?");
+            binds.push(Box::new(p.map(|v| v as i64)));
+        }
         if sets.is_empty() {
             return Ok(());
         }
@@ -847,24 +871,21 @@ impl Db {
     /// `dispatched`-but-mined window where the active worker has handed
     /// off ownership to the finalization ticker.
     pub(crate) fn find_active_block_challenge(&self) -> Option<ChallengeRow> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
-                        sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
-                        max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
-                        committed_at, last_status_change_at \
-                 FROM challenges \
-                 WHERE kind = 'block' \
-                   AND (status = 'received' \
-                        OR status = 'sp1_proving' \
-                        OR status = 'sp1_proved' \
-                        OR (status = 'dispatched' AND l1_block IS NULL)) \
-                 ORDER BY deadline ASC, committed_at ASC \
-                 LIMIT 1",
-            )
-            .ok()?;
-        stmt.query_row([], row_to_challenge_row).optional().ok().flatten()
+        let now = now_ts() as i64;
+        let poll_floor = now - SP1_STATUS_POLL_INTERVAL_SECS as i64;
+        let sql = format!(
+            "SELECT {CHALLENGE_COLS} FROM challenges \
+             WHERE kind = 'block' \
+               AND (status = 'received' \
+                    OR (status = 'sp1_proving' \
+                        AND (last_polled_at IS NULL OR last_polled_at <= ?1)) \
+                    OR status = 'sp1_proved' \
+                    OR (status = 'dispatched' AND l1_block IS NULL)) \
+             ORDER BY deadline ASC, committed_at ASC \
+             LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql).ok()?;
+        stmt.query_row(params![poll_floor], row_to_challenge_row).optional().ok().flatten()
     }
 
     /// BatchRoot-worker gate: oldest non-terminal `kind=batch_root` row,
@@ -872,35 +893,21 @@ impl Db {
     /// statuses (no SP1 round-trip), so the predicate is narrower than
     /// the block worker's.
     pub(crate) fn find_active_batch_root_challenge(&self) -> Option<ChallengeRow> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
-                        sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
-                        max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
-                        committed_at, last_status_change_at \
-                 FROM challenges \
-                 WHERE kind = 'batch_root' \
-                   AND (status = 'received' \
-                        OR (status = 'dispatched' AND l1_block IS NULL)) \
-                 ORDER BY deadline ASC, committed_at ASC \
-                 LIMIT 1",
-            )
-            .ok()?;
+        let sql = format!(
+            "SELECT {CHALLENGE_COLS} FROM challenges \
+             WHERE kind = 'batch_root' \
+               AND (status = 'received' \
+                    OR (status = 'dispatched' AND l1_block IS NULL)) \
+             ORDER BY deadline ASC, committed_at ASC \
+             LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql).ok()?;
         stmt.query_row([], row_to_challenge_row).optional().ok().flatten()
     }
 
     pub(crate) fn find_challenge_by_id(&self, challenge_id: i64) -> Option<ChallengeRow> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
-                        sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
-                        max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
-                        committed_at, last_status_change_at \
-                 FROM challenges WHERE challenge_id = ?1",
-            )
-            .ok()?;
+        let sql = format!("SELECT {CHALLENGE_COLS} FROM challenges WHERE challenge_id = ?1");
+        let mut stmt = self.conn.prepare(&sql).ok()?;
         stmt.query_row(params![challenge_id], row_to_challenge_row).optional().ok().flatten()
     }
 
@@ -916,34 +923,22 @@ impl Db {
         match kind {
             ChallengeKind::Block => {
                 let c = commitment?;
-                let mut stmt = self
-                    .conn
-                    .prepare(
-                        "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
-                                sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
-                                max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
-                                committed_at, last_status_change_at \
-                         FROM challenges \
-                         WHERE kind = 'block' AND batch_index = ?1 AND commitment = ?2",
-                    )
-                    .ok()?;
+                let sql = format!(
+                    "SELECT {CHALLENGE_COLS} FROM challenges \
+                     WHERE kind = 'block' AND batch_index = ?1 AND commitment = ?2"
+                );
+                let mut stmt = self.conn.prepare(&sql).ok()?;
                 stmt.query_row(params![batch_index as i64, c.0.to_vec()], row_to_challenge_row)
                     .optional()
                     .ok()
                     .flatten()
             }
             ChallengeKind::BatchRoot => {
-                let mut stmt = self
-                    .conn
-                    .prepare(
-                        "SELECT challenge_id, kind, batch_index, commitment, status, deadline, \
-                                sp1_request_id, sp1_proof_bytes, tx_hash, nonce, \
-                                max_fee_per_gas, max_priority_fee_per_gas, l1_block, \
-                                committed_at, last_status_change_at \
-                         FROM challenges \
-                         WHERE kind = 'batch_root' AND batch_index = ?1",
-                    )
-                    .ok()?;
+                let sql = format!(
+                    "SELECT {CHALLENGE_COLS} FROM challenges \
+                     WHERE kind = 'batch_root' AND batch_index = ?1"
+                );
+                let mut stmt = self.conn.prepare(&sql).ok()?;
                 stmt.query_row(params![batch_index as i64], row_to_challenge_row)
                     .optional()
                     .ok()
@@ -1141,6 +1136,7 @@ fn row_to_challenge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChallengeRo
     let l1_block: Option<i64> = row.get(12)?;
     let committed_at: i64 = row.get(13)?;
     let last_status_change_at: i64 = row.get(14)?;
+    let last_polled_at: Option<i64> = row.get(15)?;
     Ok(ChallengeRow {
         challenge_id: row.get::<_, i64>(0)?,
         kind,
@@ -1157,6 +1153,7 @@ fn row_to_challenge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChallengeRo
         l1_block: l1_block.map(|v| v as u64),
         committed_at: committed_at as u64,
         last_status_change_at: last_status_change_at as u64,
+        last_polled_at: last_polled_at.map(|v| v as u64),
     })
 }
 
@@ -1645,6 +1642,7 @@ mod tests {
             l1_block: None,
             committed_at,
             last_status_change_at: committed_at,
+            last_polled_at: None,
         }
     }
 
@@ -1685,6 +1683,44 @@ mod tests {
         assert!(
             result.is_err(),
             "INSERT with status='sp1_proving' AND sp1_request_id=NULL must violate CHECK"
+        );
+    }
+
+    #[test]
+    fn find_active_block_challenge_skips_recently_polled() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        let now = now_ts();
+        let mut row = challenge_row(
+            ChallengeKind::Block,
+            1,
+            Some(B256::from([0xAAu8; 32])),
+            ChallengeStatus::Sp1Proving,
+            1_000_000,
+            Some(B256::from([0xBBu8; 32])),
+            now,
+        );
+        row.last_polled_at = Some(now);
+        db.insert_challenge(&row).unwrap();
+
+        // Within poll interval → returns nothing.
+        assert!(
+            db.find_active_block_challenge().is_none(),
+            "row polled within SP1_STATUS_POLL_INTERVAL_SECS must be excluded"
+        );
+
+        // Pull last_polled_at back beyond the window → row is eligible again.
+        let cid: i64 = db
+            .conn
+            .query_row("SELECT challenge_id FROM challenges LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let patch = ChallengePatch {
+            last_polled_at: Some(Some(now - SP1_STATUS_POLL_INTERVAL_SECS - 1)),
+            ..Default::default()
+        };
+        db.patch_challenge(cid, &patch).unwrap();
+        assert!(
+            db.find_active_block_challenge().is_some(),
+            "row whose last_polled_at is older than the window must be returned"
         );
     }
 

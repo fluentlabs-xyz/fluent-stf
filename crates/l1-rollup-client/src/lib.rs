@@ -184,11 +184,6 @@ sol! {
     /// whose state moved past `Submitted` while the orchestrator was down.
     function getBatch(uint256 batchIndex) external view returns (BatchRecord memory);
 
-    /// View: SP1 program verification key. Used by the orchestrator to
-    /// catch ELF/vk drift between the proxy's local SP1 program and the
-    /// on-chain verifier before broadcasting `resolveBlockChallenge`.
-    function programVKey() external view returns (bytes32);
-
     // ============ Custom errors (for revert-decoding in pre-broadcast simulation) ============
 
     error InvalidBatchRoot(bytes32 expected, bytes32 actual);
@@ -204,6 +199,17 @@ sol! {
     error RollupCorrupted();
     error ChallengeResolutionTooLate(uint256 batchIndex, uint256 deadline, uint256 blockNumber);
     error InvalidBatchIndex(uint256 received, uint256 expected);
+    // OpenZeppelin v5 — surfaced when the L1 signer lacks PROVER_ROLE / similar.
+    error AccessControlUnauthorizedAccount(address account, bytes32 neededRole);
+    // OpenZeppelin v5 Pausable — surfaced when EMERGENCY_ROLE has paused the contract.
+    error EnforcedPause();
+    // Rollup-side challenge-open / lifecycle reverts — useful for operator log decoding even
+    // though the resolver only hits the resolve* paths directly.
+    error BatchAlreadyChallenged(uint256 batchIndex);
+    error BatchRootChallengeOpen(uint256 batchIndex);
+    error IncorrectChallengeDeposit(uint256 expected, uint256 actual);
+    error ChallengeTooLate(uint256 batchIndex);
+    error BatchAlreadyFinalized(uint256 batchIndex);
 
     /// Resolve a single-block dispute with an SP1 Groth16 proof. The
     /// contract re-derives the commitment from `blockHeader`, verifies
@@ -464,24 +470,6 @@ pub async fn get_batch_on_chain(
     })
 }
 
-/// View-call `programVKey()`. Reads the SP1 program verification key the
-/// rollup contract uses for `resolveBlockChallenge` proofs. Cached at
-/// orchestrator startup; checked against the proxy's vk_hash before each
-/// resolveBlockChallenge broadcast.
-pub async fn get_program_vkey(l1_provider: &impl Provider, contract_addr: Address) -> Result<B256> {
-    let call = programVKeyCall {};
-    let input = Bytes::from(call.abi_encode());
-    let req = TransactionRequest {
-        to: Some(contract_addr.into()),
-        input: input.into(),
-        ..Default::default()
-    };
-    let raw = l1_provider.call(req).await.map_err(|e| eyre!("eth_call programVKey failed: {e}"))?;
-    let decoded = programVKeyCall::abi_decode_returns(&raw)
-        .map_err(|e| eyre!("decode programVKey return: {e}"))?;
-    Ok(decoded)
-}
-
 /// Scan L1 for the `BatchPreconfirmed(batchIndex=…)` event in the given
 /// block range. Returns the first matching log's transaction hash and block
 /// number, or `None` if no such event exists in the window.
@@ -595,12 +583,28 @@ pub async fn prepare_preconfirm_tx(
         batchIndex: U256::from(batch_index),
         signature: Bytes::from(signature),
     };
-    build_partial(provider, contract_addr, batch_index, "preconfirm", call.abi_encode(), signer)
-        .await
+    let mut partial = build_partial_calldata(
+        provider,
+        contract_addr,
+        batch_index,
+        "preconfirm",
+        call.abi_encode(),
+    )
+    .await?;
+    finalize_partial(provider, &mut partial, signer).await?;
+    Ok(partial)
 }
 
-/// Build calldata + gas-limit for `resolveBlockChallenge`. Returns a
-/// [`RollupTxPartial`]; caller attaches a nonce just before broadcast.
+/// Build calldata for `resolveBlockChallenge`. Returns a calldata-only
+/// [`RollupTxPartial`] (`gas_limit == 0`); caller MUST run pre-broadcast
+/// simulation and then [`finalize_partial`] before [`RollupTxPartial::with_nonce`].
+///
+/// Splitting calldata-only from `eth_estimateGas` lets the caller's
+/// `eth_call` simulation surface terminal contract reverts (missing
+/// `PROVER_ROLE`, paused contract, corrupted rollup, etc.) BEFORE we
+/// pay for `estimate_gas` — the simulation result is the authoritative
+/// signal, and a permanent revert classifies as terminal `Failed`
+/// instead of looping forever.
 pub async fn prepare_resolve_block_challenge_tx(
     provider: &impl Provider,
     contract_addr: Address,
@@ -608,7 +612,6 @@ pub async fn prepare_resolve_block_challenge_tx(
     block_header: L2BlockHeader,
     block_proof: MerkleProof,
     sp1_proof: Vec<u8>,
-    signer: Address,
 ) -> Result<RollupTxPartial> {
     let call = resolveBlockChallengeCall {
         batchIndex: U256::from(batch_index),
@@ -616,67 +619,83 @@ pub async fn prepare_resolve_block_challenge_tx(
         blockProof: block_proof,
         sp1Proof: Bytes::from(sp1_proof),
     };
-    build_partial(
+    build_partial_calldata(
         provider,
         contract_addr,
         batch_index,
         "resolve_block_challenge",
         call.abi_encode(),
-        signer,
     )
     .await
 }
 
-/// Build calldata + gas-limit for `resolveBatchRootChallenge`. No SP1
-/// proof; the contract re-derives the merkle root from `block_headers`
-/// chained against `previousBatch.toBlockHash` from storage.
-/// Returns a [`RollupTxPartial`]; caller attaches a nonce just before
-/// broadcast.
+/// Build calldata for `resolveBatchRootChallenge`. No SP1 proof; the
+/// contract re-derives the merkle root from `block_headers` chained
+/// against `previousBatch.toBlockHash` from storage.
+///
+/// Returns a calldata-only [`RollupTxPartial`] (`gas_limit == 0`); see
+/// [`prepare_resolve_block_challenge_tx`] for the rationale.
 pub async fn prepare_resolve_batch_root_challenge_tx(
     provider: &impl Provider,
     contract_addr: Address,
     batch_index: u64,
     block_headers: Vec<L2BlockHeaderV1>,
-    signer: Address,
 ) -> Result<RollupTxPartial> {
     let call = resolveBatchRootChallengeCall {
         batchIndex: U256::from(batch_index),
         blockHeaders: block_headers,
     };
-    build_partial(
+    build_partial_calldata(
         provider,
         contract_addr,
         batch_index,
         "resolve_batch_root_challenge",
         call.abi_encode(),
-        signer,
     )
     .await
 }
 
-async fn build_partial(
+/// Calldata + chain_id only — no `eth_estimateGas`. The returned partial
+/// has `gas_limit == 0` until [`finalize_partial`] is called.
+async fn build_partial_calldata(
     provider: &impl Provider,
     contract_addr: Address,
     batch_index: u64,
     tx_kind: &'static str,
     encoded_call: Vec<u8>,
-    signer: Address,
 ) -> Result<RollupTxPartial> {
-    let input = Bytes::from(encoded_call);
-
     let chain_id = provider.get_chain_id().await.map_err(|e| eyre!("get_chain_id failed: {e}"))?;
+    Ok(RollupTxPartial {
+        to: contract_addr,
+        input: Bytes::from(encoded_call),
+        gas_limit: 0,
+        chain_id,
+        batch_index,
+        tx_kind,
+    })
+}
 
+/// Run `eth_estimateGas` against `partial.input` and populate
+/// `partial.gas_limit`. MUST be called after pre-broadcast simulation
+/// succeeds and before [`RollupTxPartial::with_nonce`] for the resolve
+/// path; preconfirm callers run it inline at the end of
+/// [`prepare_preconfirm_tx`] since their pre-flight already verified
+/// contract state.
+pub async fn finalize_partial(
+    provider: &impl Provider,
+    partial: &mut RollupTxPartial,
+    signer: Address,
+) -> Result<()> {
     let est_req = TransactionRequest {
         from: Some(signer),
-        to: Some(contract_addr.into()),
-        input: input.clone().into(),
+        to: Some(partial.to.into()),
+        input: partial.input.clone().into(),
         ..Default::default()
     };
     let estimate =
         provider.estimate_gas(est_req).await.map_err(|e| eyre!("estimate_gas failed: {e}"))?;
-    let gas_limit = apply_gas_buffer(estimate);
-
-    Ok(RollupTxPartial { to: contract_addr, input, gas_limit, chain_id, batch_index, tx_kind })
+    partial.gas_limit = apply_gas_buffer(estimate);
+    Ok(())
 }
 
 /// Returns true when the JSON-RPC error string from `send_raw_transaction`

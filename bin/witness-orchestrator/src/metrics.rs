@@ -54,9 +54,9 @@ pub(crate) const L1_BROADCAST_FAILURES_TOTAL: &str = "orchestrator_l1_broadcast_
 /// in-memory state ahead of DB; recoverable on restart but worth alerting.
 pub(crate) const DB_WRITER_DROPPED_TOTAL: &str = "orchestrator_db_writer_dropped_total";
 
-/// Resolve-tx counters. Labelled by `kind` (`resolve_block_challenge` |
-/// `resolve_batch_root_challenge`). Separate from preconfirm counters
-/// so the two paths can be alerted on independently.
+/// Resolve-tx counters. Labelled by `kind` (`block` | `batch_root`).
+/// Separate from preconfirm counters so the two paths can be alerted on
+/// independently.
 pub(crate) const L1_RESOLVE_DISPATCHED_TOTAL: &str = "orchestrator_l1_resolve_dispatched_total";
 pub(crate) const L1_RESOLVE_SUBMITTED_TOTAL: &str = "orchestrator_l1_resolve_submitted_total";
 pub(crate) const L1_RESOLVE_REJECTED_TOTAL: &str = "orchestrator_l1_resolve_rejected_total";
@@ -179,24 +179,21 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
     );
     metrics::describe_counter!(
         L1_RESOLVE_DISPATCHED_TOTAL,
-        "Resolve-tx broadcasts (first attempt per challenge). Labels: \
-         kind=resolve_block_challenge|resolve_batch_root_challenge"
+        "Resolve-tx broadcasts (first attempt per challenge). Labels: kind=block|batch_root"
     );
     metrics::describe_counter!(
         L1_RESOLVE_SUBMITTED_TOTAL,
-        "Resolve-tx receipts observed with status=1. Labels: \
-         kind=resolve_block_challenge|resolve_batch_root_challenge"
+        "Resolve-tx receipts observed with status=1. Labels: kind=block|batch_root"
     );
     metrics::describe_counter!(
         L1_RESOLVE_REJECTED_TOTAL,
         "Resolve-tx receipts observed with status=0 (on-chain revert). Labels: \
-         kind=resolve_block_challenge|resolve_batch_root_challenge"
+         kind=block|batch_root"
     );
     metrics::describe_counter!(
         L1_RESOLVE_PRE_RECEIPT_FAILURE_TOTAL,
         "Resolve-tx hard-failures before any receipt (initial broadcast error, \
-         stuck-at-cap, nonce advanced). Labels: \
-         kind=resolve_block_challenge|resolve_batch_root_challenge"
+         stuck-at-cap, nonce advanced). Labels: kind=block|batch_root"
     );
 
     metrics::describe_histogram!(

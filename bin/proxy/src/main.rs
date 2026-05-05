@@ -49,7 +49,7 @@ use axum::{
     Router,
 };
 use fluent_stf_primitives::fluent_chainspec;
-use revm_primitives::{hex, FixedBytes, B256};
+use revm_primitives::{hex, B256};
 use url::Url;
 
 use serde::{Deserialize, Serialize};
@@ -487,17 +487,8 @@ async fn challenge_sp1_status(Json(req): Json<Sp1StatusRequest>) -> impl IntoRes
     match row.status.as_str() {
         "completed" => {
             let proof_bytes = row.proof_bytes.unwrap_or_default();
-            let public_values = row.public_values.unwrap_or_default();
-            let vk_hash = row
-                .vk_hash
-                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
-                .map(FixedBytes::from)
-                .unwrap_or_default();
-
             info!(challenge_id = %hex::encode(challenge_id), "Challenge proof ready");
-
-            (StatusCode::OK, Json(Sp1ProofResponse { vk_hash, public_values, proof_bytes }))
-                .into_response()
+            (StatusCode::OK, Json(Sp1ProofResponse { proof_bytes })).into_response()
         }
         "failed" => {
             let error = row.error.unwrap_or_else(|| "Unknown error".into());
@@ -532,13 +523,7 @@ async fn resume_all_pending_challenges(sp1_state: &Sp1State) {
         match row.sp1_request_id {
             Some(sp1_id) => {
                 let client = sp1_state.client.clone();
-                let pk = sp1_state.pk.clone();
-                tokio::spawn(challenge::resume_challenge_proof(
-                    client,
-                    pk,
-                    row.challenge_id,
-                    sp1_id,
-                ));
+                tokio::spawn(challenge::resume_challenge_proof(client, row.challenge_id, sp1_id));
             }
             None => {
                 if let Some(db) = crate::db::db() {

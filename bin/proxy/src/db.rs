@@ -45,7 +45,6 @@ impl Db {
                 status           TEXT NOT NULL DEFAULT 'pending',
                 proof_bytes      BLOB,
                 public_values    BLOB,
-                vk_hash          BLOB,
                 error            TEXT,
                 created_at       INTEGER NOT NULL
             );
@@ -162,17 +161,11 @@ impl Db {
         challenge_id: B256,
         proof_bytes: &[u8],
         public_values: &[u8],
-        vk_hash: &[u8],
     ) {
         if let Err(e) = self.conn.execute(
-            "UPDATE challenges SET status = 'completed', proof_bytes = ?2, public_values = ?3, vk_hash = ?4
+            "UPDATE challenges SET status = 'completed', proof_bytes = ?2, public_values = ?3
              WHERE challenge_id = ?1",
-            params![
-                challenge_id.as_slice(),
-                proof_bytes,
-                public_values,
-                vk_hash,
-            ],
+            params![challenge_id.as_slice(), proof_bytes, public_values,],
         ) {
             error!(err = %e, "Failed to set challenge completed");
         }
@@ -190,7 +183,7 @@ impl Db {
     pub(crate) fn get_challenge(&self, challenge_id: B256) -> Option<ChallengeRow> {
         self.conn
             .query_row(
-                "SELECT status, proof_bytes, public_values, vk_hash, error
+                "SELECT status, proof_bytes, public_values, error
                  FROM challenges WHERE challenge_id = ?1",
                 params![challenge_id.as_slice()],
                 |row| {
@@ -198,8 +191,7 @@ impl Db {
                         status: row.get(0)?,
                         proof_bytes: row.get(1)?,
                         public_values: row.get(2)?,
-                        vk_hash: row.get(3)?,
-                        error: row.get(4)?,
+                        error: row.get(3)?,
                     })
                 },
             )
@@ -254,8 +246,11 @@ pub(crate) struct PendingChallenge {
 pub(crate) struct ChallengeRow {
     pub status: String,
     pub proof_bytes: Option<Vec<u8>>,
+    /// Persisted for operator inspection (`sqlite3 proxy.db`); not
+    /// forwarded over the wire — the Rollup contract reconstructs
+    /// publicValues itself from header + blob hashes.
+    #[allow(dead_code)]
     pub public_values: Option<Vec<u8>>,
-    pub vk_hash: Option<Vec<u8>>,
     pub error: Option<String>,
 }
 
