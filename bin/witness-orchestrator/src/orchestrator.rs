@@ -108,7 +108,6 @@ fn is_log_worthy(attempts: u64) -> bool {
 #[cfg(feature = "zstd-block-payload")]
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
-/// Configuration for the orchestrator.
 #[derive(Clone)]
 pub(crate) struct OrchestratorConfig {
     pub proxy_url: String,
@@ -156,14 +155,11 @@ pub(crate) struct OrchestratorShared {
     pub(crate) shutdown: CancellationToken,
 }
 
-/// Task for the execution worker pool. Produced by the feeder (from the
-/// driver) and by the re-execution path (enclave key rotation recovery).
 struct ExecutionTask {
     block_number: u64,
     payload: Vec<u8>,
 }
 
-/// Response from a `/sign-block-execution` request.
 struct BlockResult {
     block_number: u64,
     response: EthExecutionResponse,
@@ -198,9 +194,6 @@ pub(crate) enum RevertKind {
 }
 
 impl RevertKind {
-    /// Lowercase, snake_case discriminator for structured logs and metrics.
-    /// Returned as a `&'static str` so it can be used as a tracing field
-    /// value without an allocation.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Oog => "oog",
@@ -244,18 +237,14 @@ enum FinalizationDone {
     NoOp,
 }
 
-/// Error from `/sign-batch-root` call.
 enum SignBatchError {
     InvalidSignatures { invalid_blocks: Vec<u64>, enclave_address: Address },
     Other(eyre::Report),
 }
 
-// ============================================================================
-// Persistent execution worker pool
-// ============================================================================
-
-/// Reads tasks from the priority channel pair (high before normal) and sends
-/// `/sign-block-execution` requests with aggressive retry.
+/// Worker pool task: high-before-normal `biased` select, retries
+/// `/sign-block-execution` with exponential backoff. Cancel checked
+/// between tasks only — never mid-HTTP-call.
 #[allow(clippy::too_many_arguments)]
 async fn execution_worker(
     _worker_id: usize,
@@ -364,10 +353,6 @@ async fn execution_worker(
     }
 }
 
-// ============================================================================
-// Feeder
-// ============================================================================
-
 /// Consume ready witnesses from the cold witness store in strict block
 /// order and forward them to the execution worker pool via `normal_tx`.
 ///
@@ -425,10 +410,6 @@ async fn feeder_loop(
     info!("Feeder exited");
     Ok(())
 }
-
-// ============================================================================
-// Orchestrator entry point — main.rs sees only `Orchestrator::{new, run}`
-// ============================================================================
 
 /// Owns every internal piece of state assembled by `new`. `run` consumes the
 /// struct, spawns the worker pool, the feeder, and the per-role workers, then
@@ -755,10 +736,6 @@ impl Orchestrator {
     }
 }
 
-// ============================================================================
-// L1 finality helpers
-// ============================================================================
-
 /// Narrow RPC surface for the finalization check. Blanket-impl'd for any
 /// `alloy` `Provider` so production passes `&l1_provider`; tests stub it.
 #[async_trait::async_trait]
@@ -927,11 +904,6 @@ async fn poll_dispatched_receipts(
     FinalizationDone::Observed { observations }
 }
 
-// ============================================================================
-// Batch signing I/O
-// ============================================================================
-
-/// Sign a batch root via the proxy with retry until definitive result.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(batch_index, from_block, to_block))]
 async fn sign_batch_io(
@@ -1054,7 +1026,6 @@ async fn sign_batch_io(
     }
 }
 
-/// Call the proxy's `/sign-batch-root` endpoint.
 #[allow(clippy::too_many_arguments)]
 async fn call_sign_batch_root(
     http_client: &reqwest::Client,
@@ -1126,11 +1097,6 @@ async fn call_sign_batch_root(
         .map_err(|e| SignBatchError::Other(eyre::eyre!("Failed to parse SubmitBatchResponse: {e}")))
 }
 
-// ============================================================================
-// Block execution request
-// ============================================================================
-
-/// Send a single `/sign-block-execution` request.
 async fn send_block_request(
     http_client: &reqwest::Client,
     proxy_url: &str,
@@ -1160,10 +1126,6 @@ async fn send_block_request(
         .await
         .map_err(|e| eyre::eyre!("Failed to parse response: {e}"))
 }
-
-// ============================================================================
-// Long-lived workers
-// ============================================================================
 
 const WORKER_TICK: Duration = Duration::from_secs(1);
 const FINALIZATION_TICK: Duration = Duration::from_secs(30);
@@ -1367,7 +1329,6 @@ fn pick_next_dispatch_target(db: &Db) -> DispatchTarget {
 async fn dispatcher_worker(shared: Arc<OrchestratorShared>) {
     let mut tick = tokio::time::interval(WORKER_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Consume the immediately-ready first tick so the loop body runs on cycle 0.
     tick.tick().await;
     let mut backoff = DispatchBackoff::default();
 
@@ -1420,7 +1381,6 @@ async fn dispatcher_worker(shared: Arc<OrchestratorShared>) {
 async fn signer_worker(shared: Arc<OrchestratorShared>) {
     let mut tick = tokio::time::interval(WORKER_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Consume the immediately-ready first tick so the loop body runs on cycle 0.
     tick.tick().await;
 
     loop {
@@ -1525,7 +1485,6 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
 async fn finalization_worker(shared: Arc<OrchestratorShared>) {
     let mut tick = tokio::time::interval(FINALIZATION_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Consume the immediately-ready first tick so the loop body runs on cycle 0.
     tick.tick().await;
 
     loop {
@@ -1875,8 +1834,6 @@ async fn handle_block_result(
         return;
     }
 
-    // Drop late results that fall at or below the highest finalized batch's
-    // to_block.
     {
         let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lbe) = g.highest_finalized_to_block() {

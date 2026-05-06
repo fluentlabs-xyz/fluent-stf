@@ -26,10 +26,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-// ---------------------------------------------------------------------------
-// Event types sent to orchestrator
-// ---------------------------------------------------------------------------
-
 /// Events the L1 listener sends to the orchestrator.
 ///
 /// Variant names mirror the v1.0.0 contract event names 1:1.
@@ -63,10 +59,6 @@ pub(crate) enum L1Event {
     Checkpoint(u64),
 }
 
-// ---------------------------------------------------------------------------
-// Listener loop
-// ---------------------------------------------------------------------------
-
 const MAX_POLL_BACKOFF_SECS: u64 = 120;
 
 /// Number of consecutive successful poll cycles between heartbeat INFO
@@ -98,10 +90,6 @@ enum PollOutcome {
     Partial(u64),
 }
 
-/// Run the L1 event listener loop.
-///
-/// Polls L1 logs starting from `from_block` and sends parsed events to `tx`.
-/// This function runs forever.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     l1_provider: RootProvider,
@@ -197,8 +185,7 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// Single poll iteration: fetch logs from `from_block` to latest, paginated.
-/// Returns `Complete` on full success, `Partial` on page failure with progress saved.
+/// Returns `Partial` when a page fails — caller drives backoff and resumes from `last_ok + 1`.
 #[allow(clippy::too_many_arguments)]
 async fn poll_once(
     provider: &RootProvider,
@@ -259,7 +246,6 @@ async fn poll_once(
     Ok(PollOutcome::Complete(latest_block))
 }
 
-/// Process a single page of blocks: fetch and emit all event types in one query.
 async fn process_page(
     provider: &RootProvider,
     l2_provider: &RootProvider,

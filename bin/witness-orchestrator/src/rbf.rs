@@ -677,10 +677,7 @@ async fn bump_loop(
 }
 
 enum BroadcastResult {
-    /// Caller should poll `hash` for a receipt.
     Continue { hash: B256 },
-    /// Function reached a terminal state (cancel, initial-broadcast failure,
-    /// or fast-fail terminal); caller returns.
     Done,
 }
 

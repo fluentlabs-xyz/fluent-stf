@@ -285,7 +285,6 @@ pub(crate) struct DriverConfig {
     pub l2_safe_blocks: u64,
 }
 
-/// A block fetched from RPC together with the time it took to pull.
 struct FetchedBlock {
     block_number: u64,
     alloy_block: alloy_rpc_types::Block,
@@ -419,7 +418,6 @@ impl Driver {
     ) -> eyre::Result<()> {
         let mut state = self.state.lock().await;
 
-        // Nothing to do — already past catch-up.
         if state.next >= self.witness_from_block {
             self.ready.store(true, Ordering::Release);
             return Ok(());
@@ -451,8 +449,6 @@ impl Driver {
                 }
             }
 
-            // Chunk [state.next ..= catchup_upper] into batches of up to
-            // CATCHUP_BATCH_SIZE blocks.
             let start = state.next;
             let mut ranges: Vec<(u64, u64)> = Vec::new();
             {
@@ -560,22 +556,11 @@ impl Driver {
         }
     }
 
-    /// Resolve the witness payload for an already-known block.
-    ///
-    /// Fast path: cold-store hit — returns the cached bincode payload verbatim.
-    ///
-    /// Slow path (cold miss): fetches the block body from the L2 RPC and
-    /// rebuilds the witness against the MDBX state at `block_number - 1`. This
-    /// is the same machinery `try_take_new_block` uses when re-feeding blocks
-    /// evicted from the retention window, lifted into a standalone entry point
-    /// so external consumers (HTTP witness server, post-key-rotation re-exec
-    /// in the orchestrator) can depend on cold storage without treating a miss
-    /// as fatal.
-    ///
-    /// Returns `Ok(None)` when the block cannot be served: either beyond the
-    /// current MDBX tip (not yet committed) or block zero (no parent state).
-    /// Returns `Err(_)` only on a fatal rebuild failure (RPC error, executor
-    /// failure, serialization failure).
+    /// Cold-hit: cached bincode payload verbatim. Cold-miss: fetches the
+    /// block body via RPC and rebuilds against MDBX state at parent.
+    /// Returns `Ok(None)` when `block_number > MDBX tip` (not yet committed)
+    /// or `block_number == 0` (no parent state). `Err(_)` only on a fatal
+    /// rebuild failure (RPC, executor, serialization).
     pub(crate) async fn get_or_build_witness(
         &self,
         block_number: u64,
@@ -781,7 +766,6 @@ impl Driver {
         let mut state = self.state.lock().await;
         let block_number = state.next;
 
-        // ── Re-witness path (block already MDBX-committed) ────────────────
         if block_number <= self.start_tip {
             // Cold-store hit short-circuit: payload already persisted; feeder
             // reads it from the hub. No need to rebuild or re-push.
@@ -825,7 +809,6 @@ impl Driver {
             return Ok(Produced::Pushed);
         }
 
-        // ── Fresh tip-following path (block_number > start_tip) ───────────
         let remote_tip = match self.rpc.get_block_number().await {
             Ok(t) => t,
             Err(e) => {
@@ -878,10 +861,7 @@ impl Driver {
 }
 
 enum Produced {
-    /// Produced a witness and pushed it to the hub; caller should continue.
     Pushed,
-    /// No work this iteration (remote tip caught up, transient RPC error
-    /// absorbed, etc.). Caller should sleep before retrying.
     Idle,
 }
 
@@ -1168,17 +1148,8 @@ async fn witness_phase(
     Ok(payload)
 }
 
-/// Re-witness phase: regenerate the witness for a block already in MDBX.
-///
-/// Fast path: if the cold witness store still has this block, return its
-/// payload verbatim — no RPC parse, no executor run, no trie walk. This
-/// matters after a startup checkpoint rollback, when the driver re-feeds a
-/// range of blocks whose payloads are already persisted. Falls through to
-/// the slow path when the block has been evicted from the retention window.
-///
-/// Slow path: reads parent state root from MDBX, runs `execute_exex_with_block`
-/// against the existing state, and serializes. Does NOT commit — the block is
-/// already present.
+/// Cold-hit: cached payload verbatim. Cold-miss: rebuild against MDBX
+/// parent-state and re-serialize; does NOT commit (block already in MDBX).
 #[tracing::instrument(skip_all, fields(block_number = fetched.block_number))]
 async fn rewitness_phase(
     fetched: FetchedBlock,

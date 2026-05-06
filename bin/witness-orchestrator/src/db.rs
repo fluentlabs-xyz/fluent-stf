@@ -32,10 +32,6 @@ use tracing::{error, info, warn};
 
 use crate::types::{EthExecutionResponse, SubmitBatchResponse};
 
-// ============================================================================
-// RBF resume state — moved from accumulator.rs (part of the SQL surface)
-// ============================================================================
-
 /// State carried over from a prior process lifetime. Used by the dispatcher's
 /// resume path to skip the initial broadcast and enter the bump loop directly.
 #[derive(Debug, Clone, Copy)]
@@ -45,10 +41,6 @@ pub(crate) struct RbfResumeState {
     pub(crate) max_fee_per_gas: u128,
     pub(crate) max_priority_fee_per_gas: u128,
 }
-
-// ============================================================================
-// Status enum
-// ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum BatchStatus {
@@ -82,10 +74,6 @@ impl BatchStatus {
     }
 }
 
-// ============================================================================
-// Batch row + patch
-// ============================================================================
-
 #[derive(Debug, Clone)]
 pub(crate) struct BatchRow {
     pub batch_index: u64,
@@ -114,10 +102,6 @@ pub(crate) struct BatchPatch {
     pub max_priority_fee_per_gas: Option<Option<u128>>,
     pub l1_block: Option<Option<u64>>,
 }
-
-// ============================================================================
-// Challenge enums + row + patch
-// ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ChallengeKind {
@@ -223,10 +207,6 @@ pub(crate) struct ChallengePatch {
 /// `challenge_resolver` as `SP1_STATUS_POLL_INTERVAL`.
 pub(crate) const SP1_STATUS_POLL_INTERVAL_SECS: u64 = 15;
 
-// ============================================================================
-// Db handle
-// ============================================================================
-
 pub(crate) struct Db {
     pub(crate) conn: Connection,
 }
@@ -305,7 +285,6 @@ const CHALLENGE_COLS: &str = "challenge_id, kind, batch_index, commitment, statu
      committed_at, last_status_change_at, last_polled_at";
 
 impl Db {
-    /// Open or create the SQLite database at `path`.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
@@ -321,8 +300,6 @@ impl Db {
         conn.execute_batch(SCHEMA_DDL)?;
         Ok(Self { conn })
     }
-
-    // ── Meta scalars ──────────────────────────────────────────────────────────
 
     pub(crate) fn get_l1_checkpoint(&self) -> Option<u64> {
         self.conn
@@ -369,10 +346,7 @@ impl Db {
         }
     }
 
-    // ── Derived scalars (computed from batches) ───────────────────────────────
-
-    /// `MAX(to_block)` across rows whose status is at least `Dispatched`.
-    /// Drives the L2 driver checkpoint upper bound on startup.
+    /// Driver checkpoint upper bound on startup.
     pub(crate) fn highest_dispatched_to_block(&self) -> Option<u64> {
         self.conn
             .query_row(
@@ -386,7 +360,6 @@ impl Db {
             .map(|v| v as u64)
     }
 
-    /// `MAX(to_block)` across rows with status `finalized`.
     pub(crate) fn highest_finalized_to_block(&self) -> Option<u64> {
         self.conn
             .query_row("SELECT MAX(to_block) FROM batches WHERE status = 'finalized'", [], |row| {
@@ -430,10 +403,8 @@ impl Db {
         counts
     }
 
-    /// Snapshot of active challenge row counts, broken down into rows that
-    /// have not yet reached the terminal `Resolved` status. Returned as a
-    /// single u64 so the heartbeat line stays compact; per-status detail
-    /// lives in Prometheus.
+    /// Non-terminal challenge row count for the heartbeat line; per-status detail lives in
+    /// Prometheus.
     pub(crate) fn active_challenge_count(&self) -> u64 {
         self.conn
             .query_row(
@@ -525,9 +496,6 @@ impl Db {
             .unwrap_or_default()
     }
 
-    // ── Batch read predicates (post-Q0: workers consume these directly) ─────
-
-    /// Look up a single row by `batch_index`.
     pub(crate) fn find_batch(&self, batch_index: u64) -> Option<BatchRow> {
         let mut stmt = self
             .conn
@@ -667,8 +635,7 @@ impl Db {
         .flatten()
     }
 
-    /// Highest-index batch with status >= the given threshold, projected to
-    /// the (batch_index, from_block, to_block) tuple used by metric seeders.
+    /// Used by metric seeders to project (batch_index, from_block, to_block) at startup.
     pub(crate) fn find_highest_with_status_at_or_above(
         &self,
         threshold: BatchStatus,
@@ -746,8 +713,6 @@ impl Db {
         .map(|iter| iter.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
     }
-
-    // ── Batch table ──────────────────────────────────────────────────────────
 
     pub(crate) fn upsert_batch(&self, row: &BatchRow) -> Result<()> {
         let sig_blob = row.signature.as_ref().map(bincode::serialize).transpose().map_err(|e| {
@@ -829,8 +794,6 @@ impl Db {
         Ok(())
     }
 
-    // ── block_responses ──────────────────────────────────────────────────────
-
     pub(crate) fn load_responses(&self) -> Vec<EthExecutionResponse> {
         let mut stmt =
             match self.conn.prepare("SELECT response FROM block_responses ORDER BY block_number") {
@@ -851,8 +814,6 @@ impl Db {
             .unwrap_or_default();
         blobs.into_iter().filter_map(|b| bincode::deserialize(&b).ok()).collect()
     }
-
-    // ── Challenges table ─────────────────────────────────────────────────────
 
     /// `INSERT OR IGNORE` — idempotent on listener replay. Per-kind
     /// uniqueness is enforced by the partial unique indexes.
@@ -1054,8 +1015,6 @@ impl Db {
         .unwrap_or_default()
     }
 
-    // ── BatchReverted recovery ───────────────────────────────────────────────
-
     pub(crate) fn wipe_for_revert(&mut self, start_batch_id: u64, l1_block: u64) {
         let tx = match self.conn.transaction() {
             Ok(tx) => tx,
@@ -1253,9 +1212,6 @@ pub(crate) fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
-// ============================================================================
-// DbCommand actor
-// ============================================================================
 //
 // Async per-row writes coalesce into one transaction per flush (size threshold
 // or 100 ms timer). Sync writes flush the per-row buffer first, run as their
@@ -1552,10 +1508,10 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
             let row = guard.find_batch(batch_index);
             let now = now_ts();
             match row {
-                // (a) idempotent — already past Preconfirmed
                 Some(b) if b.status >= BatchStatus::Preconfirmed => {}
-                // (b) "our batch" — we signed it, regardless of where in the lifecycle the
-                //     listener catches up. Preserve any RBF state we may have written.
+                // "Our batch" — preserve any RBF state we may have written; flip status
+                // to Preconfirmed regardless of where in the lifecycle the listener
+                // catches up.
                 Some(b) if b.signature.is_some() => {
                     let patch = BatchPatch {
                         status: Some(BatchStatus::Preconfirmed),
@@ -1581,8 +1537,8 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
                         "batch preconfirmed via own broadcast"
                     );
                 }
-                // (c) external takeover — never seen in current production but kept for
-                //     edge case (future second validator).
+                // External takeover — never seen in current production; kept for the
+                // future second-validator case.
                 Some(_) => {
                     let patch = BatchPatch {
                         status: Some(BatchStatus::Preconfirmed),
@@ -1611,7 +1567,7 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
                         "batch preconfirmed via external takeover"
                     );
                 }
-                // (d) row absent — insert at Preconfirmed (very early external batch).
+                // Very early external batch — no prior row, insert at Preconfirmed.
                 None => {
                     let row = BatchRow {
                         batch_index,
@@ -1770,12 +1726,8 @@ pub(crate) async fn db_send_sync(
     Ok(())
 }
 
-// ============================================================================
 // Typed write wrappers — non-`db` modules call these instead of constructing
 // `SyncOp` / `*Patch` directly.
-// ============================================================================
-
-// ── Batch ops ───────────────────────────────────────────────────────────────
 
 pub(crate) async fn record_signature(
     db_tx: &mpsc::UnboundedSender<DbCommand>,
@@ -1892,8 +1844,6 @@ pub(crate) async fn wipe_for_revert(
 ) -> eyre::Result<()> {
     db_send_sync(db_tx, SyncOp::WipeForRevert { start_batch_id, l1_block }).await
 }
-
-// ── Challenge ops ───────────────────────────────────────────────────────────
 
 pub(crate) async fn insert_challenge(
     db_tx: &mpsc::UnboundedSender<DbCommand>,
@@ -2198,7 +2148,6 @@ mod tests {
         row.last_polled_at = Some(now);
         db.insert_challenge(&row).unwrap();
 
-        // Within poll interval → returns nothing.
         assert!(
             db.find_active_block_challenge().is_none(),
             "row polled within SP1_STATUS_POLL_INTERVAL_SECS must be excluded"

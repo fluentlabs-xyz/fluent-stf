@@ -1,20 +1,9 @@
-//! L1-event-driven DB writes for the challenge state machine. Called
-//! from `handle_l1_event`; the active worker in `challenge_resolver`
-//! drives rows forward from there.
-//!
-//! Both observers compute the per-row deadline locally from
-//! `getBatch(batchIndex)` (returns `acceptedAtBlock` and the snapshotted
-//! `challengeWindow` taken at commit time). We do not call any
-//! `getChallenge`/`blockChallenges` view — the rollup contract only
-//! exposes the storage variable as `getChallenge(...) returns
-//! (ChallengeRecord memory)` whose layout differs from any flat
-//! tuple, and the deadline is fully derivable from the parent batch
-//! anyway.
-//!
-//! On L1 RPC failure the helpers retry indefinitely with exponential
-//! backoff, exiting only on shutdown. This matches the listener's own
-//! retry posture: a sustained L1 outage stalls event ingestion (the
-//! correct outcome — we must never advance `l1_checkpoint` past an
+//! L1-event-driven writes for the challenge state machine. Computes
+//! per-row deadline locally from `getBatch(batchIndex)` (returns
+//! `acceptedAtBlock` + the snapshotted `challengeWindow`) — the rollup
+//! contract has no flat-tuple `getChallenge` view. Retries L1 RPC
+//! failures indefinitely: a sustained L1 outage stalls listener
+//! ingestion (correct outcome — never advance `l1_checkpoint` past an
 //! event we couldn't persist).
 
 use std::{sync::Arc, time::Duration};

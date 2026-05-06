@@ -1,61 +1,8 @@
-//! Witness orchestrator sidecar binary.
-//!
-//! Runs an embedded forward-sync driver that re-executes Fluent L2 blocks,
-//! produces witnesses in-process, and feeds them into the orchestrator loop
-//! which dispatches to the Nitro proxy over HTTP and orchestrates L1 batch
-//! signing and preconfirmation.
-//!
-//! ## Data flow
-//!
-//! ```text
-//! L2 RPC ──▶ Driver (struct) ◀──pull── feeder ──▶ normal_tx ──▶ workers ──HTTP──▶ proxy
-//!                   │                                                         │
-//!                   └──▶ redb cold witness store             result_rx ◀──────┘
-//! ```
-//!
-//! # Configuration (environment variables)
-//!
-//! | Variable | Default | Description |
-//! |----------|---------|-------------|
-//! | `RPC_URL` | — | L2 RPC URL — drives forward sync and blob construction |
-//! | `DATADIR` | `./forward-driver` | Driver datadir (MDBX + static_files + RocksDB) |
-//! | `WITNESS_COLD_FILE` | `<datadir>/cold.redb` | redb file for cold witness store |
-//! | `WITNESS_RETENTION_BLOCKS` | `172800` | Cold store retention window in L2 blocks — blocks older than `tip - retention` are pruned on push. `0` disables retention (archive mode). |
-//! | `MDBX_MAX_SIZE` | `549755813888` (512 GiB) | MDBX max size |
-//! | `PROXY_URL` | `http://127.0.0.1:8080` | Remote proxy base URL |
-//! | `DB_PATH` | `./witness_orchestrator.db` | SQLite DB for crash recovery |
-//! | `HTTP_TIMEOUT_SECS` | `120` | HTTP POST timeout (seconds) |
-//! | `L1_RPC_URL` | — | L1 Ethereum RPC URL |
-//! | `L1_ROLLUP_ADDR` | — | Rollup contract address on L1 |
-//! | `L1_SUBMITTER_KEY` | — | Private key for signing `preconfirmBatch` txs |
-//! | `L1_START_BATCH_ID` | — | If set (and no checkpoint in DB), scan L1 to derive L2 start checkpoint |
-//! | `L1_ROLLUP_DEPLOY_BLOCK` | `0` | L1 block where Rollup contract was deployed (lower bound for event scans) |
-//! | `API_KEY` | — | API key forwarded to the proxy |
-//! | `FLUENT_METRICS_ADDR` | `0.0.0.0:9090` | HTTP listen address for the Prometheus `/metrics` endpoint. |
-//!
-//! # Metrics
-//!
-//! Mirrors the Go sequencer metric shape (see
-//! `rollup-bridge-services/internal/services/sequencer/metrics.go`).
-//! Scraped from `FLUENT_METRICS_ADDR` on `/metrics`.
-//!
-//! | Metric | Type | Description |
-//! |--------|------|-------------|
-//! | `orchestrator_last_block_witness_built` | **gauge** | Latest L2 block number for which a witness is available (built fresh or reused from cold store). |
-//! | `orchestrator_last_block_executed` | **gauge** | Latest L2 block number executed by the proxy/enclave. |
-//! | `orchestrator_last_block_signed` | **gauge** | Latest L2 block number included in a batch whose `/sign-batch-root` has succeeded (equals `last_batch_signed_to_block`). |
-//! | `orchestrator_last_batch_signed` | **gauge** | Index of the most recently signed L1 batch (`/sign-batch-root`). |
-//! | `orchestrator_last_batch_signed_from_block` | **gauge** | `from_block` of the most recently signed batch. |
-//! | `orchestrator_last_batch_signed_to_block` | **gauge** | `to_block` of the most recently signed batch. |
-//! | `orchestrator_last_batch_preconfirmed` | **gauge** | Index of the most recently L1-included `preconfirmBatch` observed via `BatchPreconfirmed` event. |
-//! | `orchestrator_last_batch_preconfirmed_from_block` | **gauge** | `from_block` of the most recently L1-included batch. |
-//! | `orchestrator_last_batch_preconfirmed_to_block` | **gauge** | `to_block` of the most recently L1-included batch. |
-//! | `orchestrator_sign_block_execution_duration_seconds` | **histogram** | Per-attempt duration of `/sign-block-execution` HTTP call (seconds). |
-//! | `orchestrator_sign_batch_root_duration_seconds` | **histogram** | Per-attempt duration of `/sign-batch-root` HTTP call (seconds). |
-//! | `orchestrator_sign_failures_total` | **counter** | Sign-endpoint failures. Labels: `stage=block|batch`, `kind=enclave_busy|other`. |
-//! | `orchestrator_l1_dispatch_rejected_total` | **counter** | `preconfirmBatch` txs that were mined with status=0 (on-chain revert). |
-//! | `orchestrator_l1_broadcast_failures_total` | **counter** | `preconfirmBatch` broadcast attempts rejected by the L1 RPC before mempool admission. Labels: `kind=nonce_too_low|stuck_at_cap|other`. |
-//! | `orchestrator_l1_dispatch_cost_eth` | **histogram** | Per-tx ETH cost of L1 `preconfirmBatch` (`gas_used` × `effective_gas_price` / 1e18). Cumulative sum available via the Prometheus-emitted `_sum` counterpart. |
+//! `witness-orchestrator` daemon. Drives the embedded forward-sync driver,
+//! dispatches per-block witnesses to the proxy over HTTP, accumulates
+//! batches, and submits `preconfirmBatch` / challenge-resolve txs to L1.
+//! See `README.md` and `.env.example` for env-var configuration and the
+//! `/metrics` surface.
 
 mod blob_builder_mdbx;
 mod block_response_cache;
@@ -229,7 +176,6 @@ async fn main() -> eyre::Result<()> {
     let l2_provider =
         rsp_provider::create_provider(l2_rpc_parsed).expect("failed to build L2 provider");
 
-    // ── Startup: resolve L2 checkpoint from START_BATCH_ID ───────────────────────
     let (listener_from_block, witness_from_block, orchestrator_checkpoint): (u64, u64, u64) = {
         let db_startup = Db::open(&db_path).expect("Failed to open DB for startup");
 
@@ -345,7 +291,6 @@ async fn main() -> eyre::Result<()> {
     let mut tasks: tokio::task::JoinSet<(&'static str, eyre::Result<()>)> =
         tokio::task::JoinSet::new();
 
-    // ── Orchestrator SQLite DB + writer actor ──────────────────────────────────
     //
     // Every mutating SQL operation in the orchestrator routes through `db_tx`
     // into the `run_db_writer` actor. Per-row commands coalesce into one
@@ -450,7 +395,6 @@ async fn main() -> eyre::Result<()> {
     let hub =
         Arc::new(WitnessHub::new(cold_file, witness_retention_blocks, DEFAULT_COLD_BATCH_SIZE)?);
 
-    // ── Embedded forward-sync driver ─────────────────────────────────────────────
     let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
     let driver_rpc: RootProvider<Ethereum> = l2_provider.clone();
     let runtime = Runtime::with_existing_handle(Handle::current())

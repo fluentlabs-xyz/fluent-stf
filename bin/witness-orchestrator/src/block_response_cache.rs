@@ -23,12 +23,9 @@ use crate::{
     types::EthExecutionResponse,
 };
 
-/// Suppression window for the drop-event log. The first drop in any
-/// non-overlapping window is logged with a `dropped_since_last_log` count of
-/// any silently-suppressed drops accumulated during the previous window.
-/// Subsequent drops within the same window increment the suppressed counter
-/// without logging. This bounds log spam while preserving a Graylog
-/// breadcrumb on the first drop after a quiet period.
+/// Drop-event log suppression window: first drop in each window is logged
+/// with `dropped_since_last_log` count of suppressed-since-previous-log
+/// drops; remaining drops in the window are counted but silent.
 const DROP_LOG_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -75,10 +72,8 @@ impl DropThrottle {
 }
 
 impl ResponseCache {
-    /// Initialise with previously persisted responses. Caller reads
-    /// `block_responses` from SQLite once at startup and passes the
-    /// vector. `db_tx` is used for write-through async DB writes from
-    /// `insert` / `purge`.
+    /// Seed from `block_responses` rows persisted in a previous run.
+    /// `db_tx` is used for write-through writes from `insert` / `purge`.
     pub(crate) fn new(
         initial: Vec<EthExecutionResponse>,
         db_tx: mpsc::UnboundedSender<DbCommand>,
@@ -91,14 +86,11 @@ impl ResponseCache {
         self.responses.contains_key(&block)
     }
 
-    /// Number of cached responses currently held in memory. Used at shutdown
-    /// to report how many entries were drained without persistence.
+    /// In-memory entry count; reported at shutdown as the un-persisted-on-drop window.
     pub(crate) fn len(&self) -> usize {
         self.responses.len()
     }
 
-    /// True when every block in `[from, to]` is present in the cache.
-    /// Linear in the range length; fine at typical batch sizes (tens of blocks).
     pub(crate) fn has_range(&self, from: u64, to: u64) -> bool {
         (from..=to).all(|b| self.responses.contains_key(&b))
     }

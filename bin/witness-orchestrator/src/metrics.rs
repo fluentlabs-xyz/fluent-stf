@@ -15,9 +15,6 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-// ─── Metric names (stable string constants — typos would silently noop) ──────
-
-// Progress gauges
 pub(crate) const LAST_BLOCK_WITNESS_BUILT: &str = "orchestrator_last_block_witness_built";
 pub(crate) const LAST_BLOCK_EXECUTED: &str = "orchestrator_last_block_executed";
 pub(crate) const LAST_BLOCK_SIGNED: &str = "orchestrator_last_block_signed";
@@ -30,53 +27,29 @@ pub(crate) const LAST_BATCH_PRECONFIRMED_FROM_BLOCK: &str =
 pub(crate) const LAST_BATCH_PRECONFIRMED_TO_BLOCK: &str =
     "orchestrator_last_batch_preconfirmed_to_block";
 
-// Duration histograms
 pub(crate) const SIGN_BLOCK_EXECUTION_DURATION: &str =
     "orchestrator_sign_block_execution_duration_seconds";
 pub(crate) const SIGN_BATCH_ROOT_DURATION: &str = "orchestrator_sign_batch_root_duration_seconds";
 
-// Errors
 pub(crate) const SIGN_FAILURES_TOTAL: &str = "orchestrator_sign_failures_total";
 pub(crate) const L1_DISPATCH_REJECTED_TOTAL: &str = "orchestrator_l1_dispatch_rejected_total";
-/// Counter for every `preconfirmBatch` broadcast attempt that the L1 RPC
-/// rejected before the tx reached the mempool. Labeled by `kind` (see
-/// [`broadcast_failure_kind`]) so `nonce_too_low` spikes are distinguishable
-/// from transient network failures and from stuck-at-cap giveups.
-///
-/// Alert suggestion:
-/// `rate(orchestrator_l1_broadcast_failures_total[5m]) > 0.05` warns on a
-/// sustained L1 send problem; filtering `kind="nonce_too_low"` catches the
-/// exact race that `NonceAllocator` prevents.
 pub(crate) const L1_BROADCAST_FAILURES_TOTAL: &str = "orchestrator_l1_broadcast_failures_total";
-
-/// Counter for accumulator mutations dropped because the DB writer channel
-/// was closed (e.g. writer actor exited, typically during shutdown). Indicates
-/// in-memory state ahead of DB; recoverable on restart but worth alerting.
 pub(crate) const DB_WRITER_DROPPED_TOTAL: &str = "orchestrator_db_writer_dropped_total";
 
-/// Resolve-tx counters. Labelled by `kind` (`block` | `batch_root`).
-/// Separate from preconfirm counters so the two paths can be alerted on
-/// independently.
 pub(crate) const L1_RESOLVE_DISPATCHED_TOTAL: &str = "orchestrator_l1_resolve_dispatched_total";
 pub(crate) const L1_RESOLVE_SUBMITTED_TOTAL: &str = "orchestrator_l1_resolve_submitted_total";
 pub(crate) const L1_RESOLVE_REJECTED_TOTAL: &str = "orchestrator_l1_resolve_rejected_total";
 pub(crate) const L1_RESOLVE_PRE_RECEIPT_FAILURE_TOTAL: &str =
     "orchestrator_l1_resolve_pre_receipt_failure_total";
 
-// Cost — histogram only. A `u64` counter cannot represent sub-ETH amounts
-// (`0.002 as u64 == 0`); cumulative spend is read from the histogram's `_sum`.
+// Histogram (not counter) so the cumulative spend is readable via `_sum`;
+// a `u64` counter cannot represent sub-ETH amounts (`0.002 as u64 == 0`).
 pub(crate) const L1_DISPATCH_COST_ETH: &str = "orchestrator_l1_dispatch_cost_eth";
 
-// Nonce allocator drift surface. The pair of gauges
-// (NONCE_ALLOCATOR_NEXT, NONCE_PENDING_L1) lets the operator visually
-// detect drift; NONCE_LEAKS_TOTAL is the regression sentinel for the
-// defer-allocate invariant (allocate runs only after RPC-revert-prone
-// preparation succeeds, so release races should never fire).
 pub(crate) const NONCE_ALLOCATOR_NEXT: &str = "orchestrator_nonce_allocator_next";
 pub(crate) const NONCE_PENDING_L1: &str = "orchestrator_nonce_pending_l1";
+// Regression sentinel for the defer-allocate invariant — should remain 0.
 pub(crate) const NONCE_LEAKS_TOTAL: &str = "orchestrator_nonce_leaks_total";
-
-// ─── Bucket configs (exponential, Go-reference parity) ───────────────────────
 
 /// Go reference: `ExponentialBuckets(0.5, 2, 12)` — 0.5s .. ~2048s.
 const SIGN_DURATION_BUCKETS: &[f64] =
@@ -87,8 +60,6 @@ const COST_ETH_BUCKETS: &[f64] = &[
     1e-5, 2e-5, 4e-5, 8e-5, 1.6e-4, 3.2e-4, 6.4e-4, 1.28e-3, 2.56e-3, 5.12e-3, 1.024e-2, 2.048e-2,
     4.096e-2, 8.192e-2, 1.6384e-1, 3.2768e-1, 6.5536e-1,
 ];
-
-// ─── Recorder install ────────────────────────────────────────────────────────
 
 /// Install the Prometheus recorder globally. Must be called before any
 /// `metrics::*!` macro fires for its output to land — un-recorded writes are
@@ -222,9 +193,6 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
     Ok(handle)
 }
 
-// ─── HTTP server ─────────────────────────────────────────────────────────────
-
-/// Run the `/metrics` HTTP server until `shutdown` is cancelled.
 pub(crate) async fn run_server(
     listen_addr: String,
     handle: Arc<PrometheusHandle>,
@@ -247,10 +215,6 @@ pub(crate) async fn run_server(
 async fn render_metrics(State(handle): State<Arc<PrometheusHandle>>) -> impl IntoResponse {
     handle.render()
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-// ─── Resolve-tx counters ─────────────────────────────────────────────────────
 
 pub(crate) fn counter_resolve_dispatched(kind: &'static str) {
     metrics::counter!(L1_RESOLVE_DISPATCHED_TOTAL, "kind" => kind).increment(1);
@@ -332,13 +296,10 @@ pub(crate) fn seed_gauges_on_startup(
     }
 }
 
-/// Update the gauge tracking the allocator's next-to-issue nonce.
 pub(crate) fn set_nonce_allocator_next(value: u64) {
     metrics::gauge!(NONCE_ALLOCATOR_NEXT).set(value as f64);
 }
 
-/// Update the gauge tracking the last observed L1 pending nonce for the
-/// submitter wallet. Set on bootstrap and on every resync.
 pub(crate) fn set_nonce_pending_l1(value: u64) {
     metrics::gauge!(NONCE_PENDING_L1).set(value as f64);
 }
@@ -368,7 +329,6 @@ pub(crate) fn revert_kind_label(kind: crate::orchestrator::RevertKind) -> &'stat
     }
 }
 
-/// Best-effort conversion of a wei U256 to ETH as f64.
 fn wei_to_eth_f64(wei: U256) -> f64 {
     let wei_u128 = u128::try_from(wei).unwrap_or(u128::MAX);
     (wei_u128 as f64) / 1e18

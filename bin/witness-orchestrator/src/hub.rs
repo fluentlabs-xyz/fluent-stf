@@ -46,17 +46,9 @@ impl std::fmt::Debug for WitnessHub {
 }
 
 impl WitnessHub {
-    /// Open or create a cold witness database at `cold_file`.
-    ///
-    /// `retention_blocks` defines the window of retained blocks. On every
-    /// successful commit (single or batched), entries with
-    /// `block_number < highest_committed - retention_blocks` are removed in
-    /// the same write transaction. `retention_blocks == 0` disables retention
-    /// (archive mode).
-    ///
-    /// `batch_size` controls the tip-following buffered write path:
-    /// `push_batched` flushes when the buffer reaches this length. Values `< 1`
-    /// are clamped to `1` (degenerate but safe: every push flushes immediately).
+    /// Retention prunes every commit (`block_number < highest - retention_blocks`);
+    /// `retention_blocks == 0` disables retention (archive mode).
+    /// `batch_size < 1` is clamped to 1.
     pub(crate) fn new(
         cold_file: PathBuf,
         retention_blocks: u64,
@@ -88,9 +80,7 @@ impl WitnessHub {
         })
     }
 
-    /// Persist a single witness payload immediately. Returns after the redb
-    /// commit (fsync). Used by the re-witness path and witness-server cold-miss
-    /// rebuild, where batching would delay durability without benefit.
+    /// Single-block commit; returns after redb fsync.
     pub(crate) async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
         let compressed = compress_payload(payload).await?;
         let entries = vec![(block_number, compressed)];
@@ -503,13 +493,11 @@ mod tests {
         let file = unique_cold_file("batched_flush");
         let hub = WitnessHub::new(file.clone(), 0, 4).unwrap();
 
-        // First 3 buffer only — cold store stays empty on disk.
         for i in 1..=3u64 {
             hub.push_batched(i, &vec![i as u8; 256]).await.unwrap();
         }
         assert_eq!(hub.last_committed_block().unwrap(), None);
 
-        // 4th push hits batch_size → triggers flush.
         hub.push_batched(4, &vec![4u8; 256]).await.unwrap();
         assert_eq!(hub.last_committed_block().unwrap(), Some(4));
 
@@ -529,9 +517,7 @@ mod tests {
         let hub = WitnessHub::new(file.clone(), 0, 128).unwrap();
 
         hub.push_batched(77, &vec![0xAB; 1024]).await.unwrap();
-        // Not yet persisted.
         assert_eq!(hub.last_committed_block().unwrap(), None);
-        // But readable from buffer.
         let got = hub.get_witness(77).await.expect("buffered block readable");
         assert_eq!(got.block_number, 77);
         assert_eq!(got.payload.len(), 1024);
@@ -554,7 +540,6 @@ mod tests {
         hub.flush_pending().await.unwrap();
         assert_eq!(hub.last_committed_block().unwrap(), Some(5));
 
-        // Second flush is a no-op.
         hub.flush_pending().await.unwrap();
 
         drop(hub);
@@ -567,11 +552,9 @@ mod tests {
         // retention = 3, batch = 5 → after flush at highest=10 keep 7..=10.
         let hub = WitnessHub::new(file.clone(), 3, 5).unwrap();
 
-        // Seed with some earlier persisted entries.
         for i in 1..=5u64 {
             hub.push(i, &vec![i as u8; 256]).await.unwrap();
         }
-        // Then buffer 6..=10 via batched API — flush triggers on 10th push.
         for i in 6..=10u64 {
             hub.push_batched(i, &vec![i as u8; 256]).await.unwrap();
         }

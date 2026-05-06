@@ -64,10 +64,6 @@ async fn challenge_close_to_deadline(shared: &OrchestratorShared, row: &Challeng
     row.deadline.saturating_sub(current) <= DEADLINE_WARN_WINDOW_L1_BLOCKS
 }
 
-// ============================================================================
-// Worker entry point — two parallel workers, one per kind
-// ============================================================================
-
 pub(crate) async fn run(shared: Arc<OrchestratorShared>) {
     info!("challenge_resolver started (block + batch_root workers)");
     let block = {
@@ -198,10 +194,6 @@ async fn run_batch_root_worker(shared: Arc<OrchestratorShared>) {
     info!("batch_root_worker exiting");
 }
 
-// ============================================================================
-// Deadline gate
-// ============================================================================
-
 /// Returns `true` if the row was past its resolution deadline and was
 /// transitioned to `Failed`. Operator must call `revertBatches` on L1.
 async fn check_and_fail_if_deadline_expired(
@@ -241,10 +233,6 @@ async fn check_and_fail_if_deadline_expired(
     true
 }
 
-// ============================================================================
-// Resolve error classification
-// ============================================================================
-
 /// Per-step failure classification for the resolve pipeline.
 /// `InvariantViolation` ⇒ operator action required (rollup wedged); the
 /// worker marks the row Failed and stops retrying. `Transient` ⇒ wait +
@@ -283,10 +271,11 @@ async fn mark_invariant_violation(shared: &OrchestratorShared, row: &ChallengeRo
     }
 }
 
-// ============================================================================
-// Block-kind status handlers
-// ============================================================================
-
+/// Lifecycle from `Received`: build the EthClientExecutorInput witness
+/// (cold-store hit verbatim, otherwise MDBX-backed rebuild), assemble
+/// canonical EIP-4844 blobs from MDBX, and POST the SP1 proof request to
+/// the proxy. Transient failures back off and retry; invariant violations
+/// (commitment not in batch range) mark the row Failed.
 #[tracing::instrument(
     skip_all,
     fields(challenge_id = row.challenge_id, batch_index = row.batch_index, kind = row.kind.as_str())
@@ -315,8 +304,6 @@ async fn handle_block_received(
         }
     };
 
-    // 1. Get bincode-serialized EthClientExecutorInput from the driver. Cold-store hit is verbatim;
-    //    cold miss falls through to an MDBX-backed rebuild.
     let witness_bytes = match shared.driver.get_or_build_witness(target_block_number).await {
         Ok(Some(p)) => p,
         Ok(None) => {
@@ -352,7 +339,6 @@ async fn handle_block_received(
         }
     };
 
-    // 2. Build canonical EIP-4844 blobs.
     let blobs = match build_blobs_from_mdbx(&shared.driver, from_block, to_block).await {
         Ok(Some(b)) => b,
         Ok(None) => {
@@ -381,7 +367,6 @@ async fn handle_block_received(
         }
     };
 
-    // 3. Wrap and POST to the proxy.
     let payload = ChallengeSp1Request { client_input: Box::new(client_input), blobs };
     match post_sp1_request(
         &shared.config.http_client,
@@ -640,15 +625,13 @@ async fn handle_dispatched_resume(
     .await;
 }
 
-/// Build the calldata, run pre-broadcast validation, estimate fees, allocate
-/// the nonce only after every RPC-revert-prone step succeeded, then enter
-/// the RBF lifecycle. Used by both kinds for the initial dispatch from
-/// `Received` (BatchRoot) or `Sp1Proved` (Block).
-///
-/// The defer-allocate ordering is the load-bearing invariant: a permission
-/// revert during prepare (e.g. `AccessControlUnauthorizedAccount`) must NOT
-/// burn a nonce, because tail-CAS `release` cannot rewind past concurrent
-/// allocations from other workers.
+/// Defer-allocate ordering: prepare (calldata-only, no `estimate_gas`) →
+/// `eth_call` simulation (catches permanent contract reverts before any
+/// gas burn) → estimate_gas → fees → allocate nonce → RBF. A permission
+/// revert during prepare must NOT burn a nonce because tail-CAS `release`
+/// cannot rewind past concurrent allocations from other workers. Used
+/// for the initial dispatch from `Received` (BatchRoot) or `Sp1Proved`
+/// (Block).
 #[tracing::instrument(
     skip_all,
     fields(challenge_id = row.challenge_id, batch_index = row.batch_index, kind = row.kind.as_str())
@@ -658,9 +641,6 @@ async fn run_resolve_lifecycle(
     row: &ChallengeRow,
     backoff: &mut DispatchBackoff,
 ) {
-    // 1. Calldata-only partial. NO `eth_estimateGas` here — a permanent contract revert (missing
-    //    PROVER_ROLE, paused, corrupted) must surface in step 2 via `eth_call` simulation, not as a
-    //    transient `Err` that loops the worker until deadline.
     let mut partial = match prepare_resolve_partial(shared, row).await {
         Ok(p) => p,
         Err(ResolveError::InvariantViolation(reason)) => {
@@ -678,15 +658,11 @@ async fn run_resolve_lifecycle(
         }
     };
 
-    // 2. Pre-broadcast simulation. Catches any contract revert (AccessControl, RollupCorrupted,
-    //    EnforcedPause, BlockNotChallenged, ChallengeResolutionTooLate, etc.) deterministically
-    //    before we pay for `estimate_gas`.
     if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &partial).await {
         fail_with_reason(shared, row, reason).await;
         return;
     }
 
-    // 3. Now safe to estimate gas — contract accepts the call.
     if let Err(e) = l1_rollup_client::finalize_partial(
         &shared.config.l1_provider,
         &mut partial,
@@ -703,7 +679,6 @@ async fn run_resolve_lifecycle(
         return;
     }
 
-    // 4. Fees + nonce + RBF lifecycle.
     let (fee, tip) = match rbf::estimate_initial_fees(
         shared,
         rbf::FeeEstimateLog {
@@ -784,10 +759,6 @@ async fn fail_with_reason(shared: &OrchestratorShared, row: &ChallengeRow, reaso
     }
 }
 
-// ============================================================================
-// Pre-broadcast validation: local cheap checks + eth_call simulation
-// ============================================================================
-
 /// Catch-all defense before broadcasting a resolve tx: simulate the
 /// signed calldata via `eth_call`. If the contract would revert, we
 /// surface the revert reason and abort — there is no recovery from the
@@ -830,10 +801,6 @@ async fn validate_resolve_pre_broadcast(
         )),
     }
 }
-
-// ============================================================================
-// Resolve template construction
-// ============================================================================
 
 /// Per-kind dispatcher: builds either a `resolveBlockChallenge` or a
 /// `resolveBatchRootChallenge` calldata-only partial. Caller runs
@@ -1022,10 +989,6 @@ fn rollback_status_for(kind: ChallengeKind) -> ChallengeStatus {
     }
 }
 
-// ============================================================================
-// Proxy SP1 round-trip
-// ============================================================================
-
 /// zstd level used to compress the bincode-serialized
 /// [`ChallengeSp1Request`] body. Same level as
 /// `/sign-block-execution` (the only other heavy POST path).
@@ -1141,10 +1104,6 @@ async fn poll_sp1_status(
         }
     }
 }
-
-// ============================================================================
-// Stateful RbfObserver — mirrors PreconfirmObserver
-// ============================================================================
 
 pub(crate) struct ResolveObserver<'a> {
     shared: &'a OrchestratorShared,

@@ -1,8 +1,3 @@
-//! Bridge-event hashing over MDBX-shaped receipts. Forwards into the
-//! pure-inner functions in `rsp_host_executor::events_hash` so this
-//! shell only deals with the per-receipt status check + log-extraction
-//! shape.
-
 use alloy_primitives::{Address, B256};
 use rsp_host_executor::events_hash::{
     calculate_deposit_hash_inner, calculate_withdrawal_root_inner, count_deposits_inner,
@@ -44,8 +39,6 @@ pub(crate) fn count_deposits_from_reth_receipts(
     count_deposits_inner(successful_reth_receipt_logs(receipts), bridge_address, receive_topic)
 }
 
-/// Stream of bare logs from successful reth receipts — the shape every
-/// `*_inner` helper in `rsp_host_executor::events_hash` takes.
 fn successful_reth_receipt_logs(
     receipts: &[reth_ethereum_primitives::Receipt],
 ) -> impl Iterator<Item = &alloy_primitives::Log> {

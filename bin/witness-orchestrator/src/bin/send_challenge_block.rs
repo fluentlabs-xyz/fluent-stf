@@ -1,18 +1,8 @@
-//! Standalone CLI that sends a single `Rollup.challengeBlock(...)` tx
-//! against the configured L1 so a running `witness-orchestrator`
-//! picks up the resulting `BlockChallenged` event and resolves it.
-//! Fire-and-forget — operator inspects both txs on etherscan.
-//!
-//! # Configuration (environment variables)
-//!
-//! | Variable | Description |
-//! |----------|-------------|
-//! | `RPC_URL` | L2 RPC URL (used to build `L2BlockHeader` for every block in the batch) |
-//! | `L1_RPC_URL` | L1 Ethereum RPC URL |
-//! | `L1_ROLLUP_ADDR` | Rollup contract address |
-//! | `L1_CHALLENGER_KEY` | Challenger private key — MUST hold `CHALLENGER_ROLE` and MUST NOT be the orchestrator's `L1_SUBMITTER_KEY` |
-//! | `CHALLENGE_BATCH_INDEX` | Index of the batch containing the disputed block |
-//! | `CHALLENGE_BLOCK_NUMBER` | L2 block number to dispute (must lie inside `CHALLENGE_BATCH_INDEX`) |
+//! Operator-only one-shot CLI. Submits a `Rollup.challengeBlock(...)`
+//! tx with the contract's challenge bond so a running
+//! `witness-orchestrator` picks up the resulting `BlockChallenged` event
+//! and resolves it. See `README.md` and `.env.example` for env-var
+//! configuration.
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;

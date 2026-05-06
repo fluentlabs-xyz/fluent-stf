@@ -1,18 +1,12 @@
-//! MDBX-backed wrapper around `rsp_blob_builder`'s encoder. Reads
-//! header + body from the orchestrator's driver factory, never hits
-//! L2 RPC. Used by `sign_batch_io` and `handle_block_received`.
-
 use std::sync::Arc;
 
 use tracing::info;
 
 use crate::driver::Driver;
 
-/// Build canonical EIP-4844 blobs from MDBX-committed blocks. Returns
-/// `Ok(None)` when `to_block` is above the driver's MDBX tip — the
-/// caller's worker tick should retry. Otherwise byte-identical to
-/// `rsp_blob_builder::build_blobs_from_l2(rpc, from, to)` for the same
-/// (already-MDBX-committed) range.
+/// `Ok(None)` when `to_block` exceeds the driver's MDBX tip — caller's
+/// next worker tick should retry. Output is byte-identical to
+/// `rsp_blob_builder::build_blobs_from_l2(rpc, from, to)` for the same range.
 pub(crate) async fn build_blobs_from_mdbx(
     driver: &Arc<Driver>,
     from_block: u64,
