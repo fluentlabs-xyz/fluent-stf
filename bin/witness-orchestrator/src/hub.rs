@@ -18,7 +18,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use redb::{Database, ReadableTable, TableDefinition};
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{error, info};
+use tracing::{info, warn};
 
 use crate::types::ProveRequest;
 const COLD_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("cold_witnesses");
@@ -228,20 +228,33 @@ impl WitnessHub {
         let db = Arc::clone(&self.db);
         let retention_blocks = self.retention_blocks;
 
+        let t = std::time::Instant::now();
         let join = tokio::task::spawn_blocking(move || -> eyre::Result<()> {
             commit_batch_blocking(&db, entries, retention_blocks)
                 .map_err(|e| eyre::eyre!("commit_batch: {e}"))
         })
         .await;
+        let fsync_ms = t.elapsed().as_millis() as u64;
 
         match join {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                info!(event = "cold_commit_done", fsync_ms, "cold commit done");
+                Ok(())
+            }
             Ok(Err(e)) => {
-                error!(err = %e, "Cold: witness commit failed");
+                warn!(
+                    err = %e,
+                    event = "cold_commit_failed",
+                    "cold witness commit failed"
+                );
                 Err(e)
             }
             Err(e) => {
-                error!(err = %e, "Cold: spawn_blocking join failed");
+                warn!(
+                    err = %e,
+                    event = "cold_commit_join_failed",
+                    "cold spawn_blocking join failed"
+                );
                 Err(eyre::eyre!("spawn_blocking join: {e}"))
             }
         }
@@ -303,7 +316,14 @@ fn commit_batch_blocking(
                     total_bytes = total_bytes.saturating_sub(*size);
                 }
                 if !stale.is_empty() {
-                    info!(highest, cutoff, pruned = stale.len(), batched, "Cold: retention prune");
+                    info!(
+                        event = "cold_retention_pruned",
+                        highest_block = highest,
+                        cutoff,
+                        pruned = stale.len(),
+                        batched,
+                        "cold retention prune"
+                    );
                 }
             }
         }
@@ -313,7 +333,7 @@ fn commit_batch_blocking(
         highest_block = highest;
     }
     write_txn.commit()?;
-    info!(highest_block, batched, "Cold: committed");
+    info!(event = "cold_committed", highest_block, batched, "cold committed");
     Ok(())
 }
 

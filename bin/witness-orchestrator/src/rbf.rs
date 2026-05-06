@@ -18,7 +18,7 @@ use l1_rollup_client::{
     batch_status, broadcast_rollup_tx, find_batch_preconfirm_event, get_batch_on_chain,
     is_nonce_too_low_error, prepare_preconfirm_tx, RollupTxPartial, RollupTxTemplate,
 };
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use async_trait::async_trait;
 
@@ -81,16 +81,22 @@ impl RbfObserver for PreconfirmObserver<'_> {
         )
         .await
         {
-            error!(batch_index = self.batch_index, err = %e, "record_broadcast failed");
+            warn!(
+                batch_index = self.batch_index,
+                err = %e,
+                event = "record_broadcast_failed",
+                "record_broadcast failed"
+            );
             return;
         }
         info!(
             batch_index = self.batch_index,
+            event = "preconfirm_batch_dispatched",
             nonce = self.nonce,
-            %hash,
+            tx_hash = %hash,
             max_fee_per_gas = fee,
             max_priority_fee_per_gas = tip,
-            "preconfirmBatch DISPATCHED"
+            "preconfirm batch dispatched"
         );
     }
 
@@ -98,48 +104,71 @@ impl RbfObserver for PreconfirmObserver<'_> {
         if let Err(e) =
             db::record_rebroadcast(&self.shared.db_tx, self.batch_index, hash, fee, tip).await
         {
-            error!(batch_index = self.batch_index, err = %e, "record_rbf_bump failed");
+            warn!(
+                batch_index = self.batch_index,
+                err = %e,
+                event = "record_rebroadcast_failed",
+                "record_rebroadcast failed"
+            );
         }
         info!(
             batch_index = self.batch_index,
-            %hash,
+            event = "preconfirm_batch_rebroadcast",
+            tx_hash = %hash,
             max_fee_per_gas = fee,
             max_priority_fee_per_gas = tip,
-            "RBF bump rebroadcast"
+            "preconfirm batch rebroadcast"
         );
     }
 
     async fn on_submitted(&self, hash: B256, l1_block: u64) {
         // Record the L1 block of the receipt; status stays `Dispatched`. The L1
-        // listener owns the `Dispatched → Preconfirmed` transition (Q3/Q4).
+        // listener owns the `Dispatched → Preconfirmed` transition.
         if let Err(e) =
             db::record_receipt_observed(&self.shared.db_tx, self.batch_index, l1_block).await
         {
-            error!(batch_index = self.batch_index, err = %e, "record_receipt_observed failed");
+            warn!(
+                batch_index = self.batch_index,
+                err = %e,
+                event = "record_receipt_observed_failed",
+                "record_receipt_observed failed"
+            );
         }
         info!(
             batch_index = self.batch_index,
-            %hash,
+            event = "preconfirm_batch_submitted_l1",
+            tx_hash = %hash,
             l1_block,
-            "Batch submitted to L1 — awaiting BatchPreconfirmed event"
+            "preconfirm batch submitted"
         );
     }
 
     async fn on_reverted(&self, hash: B256, kind: RevertKind) {
-        error!(
+        warn!(
             batch_index = self.batch_index,
-            %hash,
-            ?kind,
-            "preconfirmBatch REVERTED on L1 — rolling back to Accepted"
+            event = "preconfirm_batch_reverted",
+            tx_hash = %hash,
+            kind = kind.as_str(),
+            "preconfirm batch reverted"
         );
         if let Err(e) = db::rollback_to_accepted(&self.shared.db_tx, self.batch_index).await {
-            error!(batch_index = self.batch_index, err = %e, "rollback_to_accepted failed");
+            warn!(
+                batch_index = self.batch_index,
+                err = %e,
+                event = "rollback_to_accepted_failed",
+                "rollback_to_accepted failed"
+            );
         }
     }
 
     async fn on_pre_receipt_failure(&self, _reason: &'static str) {
         if let Err(e) = db::rollback_to_accepted(&self.shared.db_tx, self.batch_index).await {
-            error!(batch_index = self.batch_index, err = %e, "rollback_to_accepted failed");
+            warn!(
+                batch_index = self.batch_index,
+                err = %e,
+                event = "rollback_to_accepted_failed",
+                "rollback_to_accepted failed"
+            );
         }
     }
 
@@ -171,6 +200,7 @@ impl RbfObserver for PreconfirmObserver<'_> {
     }
 }
 
+#[tracing::instrument(skip_all, fields(batch_index))]
 pub(crate) async fn run(
     shared: &OrchestratorShared,
     batch_index: u64,
@@ -254,6 +284,7 @@ pub(crate) async fn run(
 /// so a late-arriving dispute does not blow its window inside an at-cap
 /// retry storm.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(batch_index, nonce))]
 pub(crate) async fn run_generic(
     shared: &OrchestratorShared,
     batch_index: u64,
@@ -453,14 +484,29 @@ async fn prepare_partial(
     let signer_addr = shared.config.l1_signer_address;
     let cancel = &shared.shutdown;
 
+    let t = std::time::Instant::now();
     tokio::select! {
         _ = cancel.cancelled() => None,
         res = prepare_preconfirm_tx(
             provider, contract, verifier, batch_index, signature, signer_addr,
         ) => match res {
-            Ok(p) => Some(p),
+            Ok(p) => {
+                info!(
+                    batch_index,
+                    event = "prepare_preconfirm_done",
+                    duration_ms = t.elapsed().as_millis() as u64,
+                    "prepare_preconfirm_tx done"
+                );
+                Some(p)
+            }
             Err(e) => {
-                warn!(batch_index, err = %e, "prepare_preconfirm_tx failed");
+                warn!(
+                    batch_index,
+                    err = %e,
+                    event = "prepare_preconfirm_failed",
+                    duration_ms = t.elapsed().as_millis() as u64,
+                    "prepare_preconfirm_tx failed"
+                );
                 backoff.apply("prepare_preconfirm_tx failed");
                 None
             }
@@ -617,10 +663,11 @@ async fn bump_loop(
                 stuck_at_cap_first_block = current_l1_block(shared).await;
             }
             if !at_cap_logged {
-                error!(
+                warn!(
                     batch_index,
+                    event = "rbf_fee_cap_reached",
                     max_fee_cap,
-                    "RBF fee cap reached — operator attention required; dispatcher continues \
+                    "rbf fee cap reached — operator attention required; dispatcher continues \
                      rebroadcasting at cap"
                 );
                 at_cap_logged = true;
@@ -654,6 +701,7 @@ async fn try_broadcast(
     let cancel = &shared.shutdown;
     let was_first = current_hash.is_none();
 
+    let t = std::time::Instant::now();
     let res = tokio::select! {
         _ = cancel.cancelled() => {
             if was_first && !shared.nonce_allocator.release_with_outcome(nonce) {
@@ -672,9 +720,18 @@ async fn try_broadcast(
             max_priority_fee_per_gas,
         ) => res,
     };
+    let duration_ms = t.elapsed().as_millis() as u64;
 
     match res {
         Ok(new_hash) => {
+            info!(
+                batch_index,
+                event = "rbf_broadcast_done",
+                duration_ms,
+                tx_hash = %new_hash,
+                was_first,
+                "rbf broadcast done"
+            );
             if was_first {
                 backoff.reset();
                 observer
@@ -779,7 +836,7 @@ async fn bump_nonce_too_low_fastfail(
             let Some(l1_block) = receipt.block_number else {
                 warn!(
                     batch_index,
-                    prior_hash = %prior,
+                    prev_tx_hash = %prior,
                     "RBF: nonce-too-low + receipt without block_number — retry"
                 );
                 return BroadcastResult::Continue { hash: prior };
@@ -791,9 +848,9 @@ async fn bump_nonce_too_low_fastfail(
             let kind = classify_revert(receipt.gas_used, template.gas_limit);
             warn!(
                 batch_index,
-                prior_hash = %prior,
+                prev_tx_hash = %prior,
                 l1_block,
-                ?kind,
+                kind = kind.as_str(),
                 gas_used = receipt.gas_used,
                 gas_limit = template.gas_limit,
                 "RBF: nonce-too-low fallback found REVERTED receipt"
@@ -815,7 +872,7 @@ async fn bump_nonce_too_low_fastfail(
             // mining, `STUCK_AT_CAP_BLOCKS` in `bump_loop` is the backstop.
             info!(
                 batch_index,
-                prior_hash = %prior,
+                prev_tx_hash = %prior,
                 "RBF: bump nonce-too-low — earlier bump won the slot; awaiting BatchPreconfirmed"
             );
             BroadcastResult::Continue { hash: prior }
@@ -863,7 +920,7 @@ async fn poll_for_terminal(
                 let Some(l1_block) = receipt.block_number else {
                     warn!(
                         batch_index,
-                        current_hash = %observed_hash,
+                        tx_hash = %observed_hash,
                         "Receipt present but block_number is None — retrying next interval"
                     );
                     continue;
@@ -872,21 +929,23 @@ async fn poll_for_terminal(
                     let kind = classify_revert(receipt.gas_used, template.gas_limit);
                     warn!(
                         batch_index,
-                        current_hash = %observed_hash,
+                        tx_hash = %observed_hash,
                         l1_block,
-                        ?kind,
+                        kind = kind.as_str(),
                         gas_used = receipt.gas_used,
                         gas_limit = template.gas_limit,
-                        "preconfirmBatch REVERTED on L1"
+                        event = "preconfirm_batch_reverted",
+                        "preconfirm batch reverted"
                     );
                     handle_reverted(observer, observed_hash, kind, backoff).await;
                     return PollResult::Done;
                 }
                 info!(
                     batch_index,
-                    current_hash = %observed_hash,
+                    event = "preconfirm_batch_confirmed",
+                    tx_hash = %observed_hash,
                     l1_block,
-                    "preconfirmBatch confirmed on L1"
+                    "preconfirm batch confirmed"
                 );
                 handle_submitted(observer, observed_hash, l1_block, backoff).await;
                 return PollResult::Done;
@@ -895,7 +954,7 @@ async fn poll_for_terminal(
             Err(e) => {
                 warn!(
                     batch_index,
-                    current_hash = %observed_hash,
+                    tx_hash = %observed_hash,
                     err = %e,
                     "get_transaction_receipt failed — retrying next interval"
                 );

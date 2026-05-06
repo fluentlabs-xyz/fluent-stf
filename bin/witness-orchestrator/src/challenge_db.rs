@@ -143,7 +143,7 @@ async fn get_batch_with_retry(
                 warn!(
                     batch_index,
                     err = %e,
-                    ?backoff,
+                    backoff_secs = backoff.as_secs(),
                     "getBatch failed during challenge persist — retrying"
                 );
                 tokio::select! {

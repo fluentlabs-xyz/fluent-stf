@@ -302,6 +302,8 @@ struct WitnessJob {
     execute_ms: u64,
     trie_ms: u64,
     save_ms: u64,
+    save_blocks_ms: u64,
+    mdbx_commit_ms: u64,
     t_total_start: Instant,
 }
 
@@ -333,6 +335,14 @@ struct DriverState {
 }
 
 impl Driver {
+    /// Current MDBX tip block number, read directly from the provider factory.
+    /// Used by the heartbeat worker for an at-a-glance snapshot of how far
+    /// MDBX has been wound. Returns `None` if the underlying call fails — the
+    /// heartbeat falls back to reporting zero rather than blocking.
+    pub(crate) fn mdbx_tip(&self) -> Option<u64> {
+        self.factory.best_block_number().ok()
+    }
+
     /// Construct the driver. Runs genesis init, static-file heal, and the
     /// cold_last vs mdbx_tip invariant check. Fails loudly on any
     /// invariant violation.
@@ -515,17 +525,19 @@ impl Driver {
                 .map_err(|e| eyre!("commit_batch join: {e}"))??;
 
                 info!(
-                    range_start = s,
-                    range_end = e,
+                    event = "catchup_commit_batch",
+                    from_block = s,
+                    to_block = e,
                     witness_from_block = self.witness_from_block,
                     commit_ms = t_commit.elapsed().as_millis() as u64,
-                    "Catch-up: committed batch (no witness)"
+                    "catchup committed batch (no witness)"
                 );
                 if e + 1 == self.witness_from_block {
                     info!(
+                        event = "catchup_complete",
                         block_number = e,
                         witness_from_block = self.witness_from_block,
-                        "Catch-up complete — switching to full witness mode"
+                        "catchup complete — switching to full witness mode"
                     );
                 }
 
@@ -932,6 +944,7 @@ async fn fetch_batch(
 }
 
 /// Commit phase: alloy → primitive → execute → trie → save_blocks(Full) → commit.
+#[tracing::instrument(skip_all, fields(block_number = fetched.block_number))]
 fn commit_phase(
     factory: &ProviderFactory<DriverNode>,
     chain_spec: &Arc<ChainSpec>,
@@ -988,8 +1001,11 @@ fn commit_phase(
     provider_rw
         .save_blocks(vec![executed], SaveBlocksMode::Full)
         .map_err(|e| eyre!("save_blocks: {e}"))?;
+    let save_blocks_ms = t_save.elapsed().as_millis() as u64;
+    let t_commit = Instant::now();
     provider_rw.commit().map_err(|e| eyre!("commit: {e}"))?;
-    let save_ms = t_save.elapsed().as_millis() as u64;
+    let mdbx_commit_ms = t_commit.elapsed().as_millis() as u64;
+    let save_ms = save_blocks_ms + mdbx_commit_ms;
 
     let parent_state_root = factory
         .header_by_number(block_number - 1)?
@@ -1004,6 +1020,8 @@ fn commit_phase(
         execute_ms,
         trie_ms,
         save_ms,
+        save_blocks_ms,
+        mdbx_commit_ms,
         t_total_start,
     })
 }
@@ -1081,6 +1099,7 @@ fn commit_batch(
 /// Witness phase: execute_exex_with_block + bincode (on blocking pool).
 /// Returns the serialized payload, leaving storage/channel side-effects to
 /// the caller.
+#[tracing::instrument(skip_all, fields(block_number = job.block_number))]
 async fn witness_phase(
     job: WitnessJob,
     factory: ProviderFactory<DriverNode>,
@@ -1094,6 +1113,8 @@ async fn witness_phase(
         execute_ms,
         trie_ms,
         save_ms,
+        save_blocks_ms,
+        mdbx_commit_ms,
         t_total_start,
     } = job;
 
@@ -1129,15 +1150,18 @@ async fn witness_phase(
     let total_ms = t_total_start.elapsed().as_millis() as u64;
     info!(
         block_number,
+        event = "block_witness_built",
         total_ms,
         fetch_ms,
         execute_ms,
         trie_ms,
         save_ms,
+        save_blocks_ms,
+        mdbx_commit_ms,
         witness_ms,
         serialize_ms,
         payload_bytes,
-        "Block witness built"
+        "block witness built"
     );
     metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
 
@@ -1155,6 +1179,7 @@ async fn witness_phase(
 /// Slow path: reads parent state root from MDBX, runs `execute_exex_with_block`
 /// against the existing state, and serializes. Does NOT commit — the block is
 /// already present.
+#[tracing::instrument(skip_all, fields(block_number = fetched.block_number))]
 async fn rewitness_phase(
     fetched: FetchedBlock,
     factory: ProviderFactory<DriverNode>,
@@ -1167,9 +1192,10 @@ async fn rewitness_phase(
     if let Some(cached) = hub.get_witness(block_number).await {
         info!(
             block_number,
+            event = "block_re_witness_cold_hit",
             payload_bytes = cached.payload.len() as u64,
             fetch_ms,
-            "Block re-witness served from cold store"
+            "block re-witness served from cold store"
         );
         return Ok(cached.payload);
     }
@@ -1216,12 +1242,13 @@ async fn rewitness_phase(
 
     info!(
         block_number,
+        event = "block_re_witness_built",
         total_ms = t_total_start.elapsed().as_millis() as u64,
         fetch_ms,
         witness_ms,
         serialize_ms,
         payload_bytes = payload.len() as u64,
-        "Block re-witness built"
+        "block re-witness built"
     );
 
     Ok(payload)

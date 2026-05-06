@@ -6,19 +6,72 @@
 //! All other batch state (the `batches` table) lives only in SQLite.
 //! Workers query it directly each tick — see the predicate methods on `Db`.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
+};
 
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::{
     db::{AsyncOp, DbCommand},
     types::EthExecutionResponse,
 };
 
+/// Suppression window for the drop-event log. The first drop in any
+/// non-overlapping window is logged with a `dropped_since_last_log` count of
+/// any silently-suppressed drops accumulated during the previous window.
+/// Subsequent drops within the same window increment the suppressed counter
+/// without logging. This bounds log spam while preserving a Graylog
+/// breadcrumb on the first drop after a quiet period.
+const DROP_LOG_WINDOW: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub(crate) struct ResponseCache {
     responses: HashMap<u64, EthExecutionResponse>,
     db_tx: Option<mpsc::UnboundedSender<DbCommand>>,
+    drop_throttle: DropThrottle,
+}
+
+#[derive(Debug)]
+struct DropThrottle {
+    last_log: Mutex<Option<Instant>>,
+    suppressed: AtomicU64,
+}
+
+impl DropThrottle {
+    fn new() -> Self {
+        Self { last_log: Mutex::new(None), suppressed: AtomicU64::new(0) }
+    }
+
+    /// Records a drop. Returns `Some(suppressed_since_last_log)` when this
+    /// drop should produce a log line; returns `None` when the drop is
+    /// suppressed within the active window. The returned count is reset to
+    /// zero on every emitted log so the next window starts fresh.
+    fn observe(&self) -> Option<u64> {
+        let mut last = self.last_log.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match *last {
+            None => {
+                *last = Some(now);
+                Some(0)
+            }
+            Some(prev) if now.duration_since(prev) >= DROP_LOG_WINDOW => {
+                let n = self.suppressed.swap(0, Ordering::Relaxed);
+                *last = Some(now);
+                Some(n)
+            }
+            Some(_) => {
+                self.suppressed.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
 }
 
 impl ResponseCache {
@@ -31,11 +84,17 @@ impl ResponseCache {
         db_tx: mpsc::UnboundedSender<DbCommand>,
     ) -> Self {
         let responses = initial.into_iter().map(|r| (r.block_number, r)).collect();
-        Self { responses, db_tx: Some(db_tx) }
+        Self { responses, db_tx: Some(db_tx), drop_throttle: DropThrottle::new() }
     }
 
     pub(crate) fn contains(&self, block: u64) -> bool {
         self.responses.contains_key(&block)
+    }
+
+    /// Number of cached responses currently held in memory. Used at shutdown
+    /// to report how many entries were drained without persistence.
+    pub(crate) fn len(&self) -> usize {
+        self.responses.len()
     }
 
     /// True when every block in `[from, to]` is present in the cache.
@@ -54,6 +113,16 @@ impl ResponseCache {
         if let Some(tx) = &self.db_tx {
             if tx.send(DbCommand::Async(AsyncOp::SaveResponse(resp))).is_err() {
                 metrics::counter!(crate::metrics::DB_WRITER_DROPPED_TOTAL).increment(1);
+                if let Some(suppressed) = self.drop_throttle.observe() {
+                    warn!(
+                        block_number = block,
+                        event = "block_response_cache_drop",
+                        reason = "db_writer_closed",
+                        op = "insert",
+                        dropped_since_last_log = suppressed,
+                        "block_response_cache drop"
+                    );
+                }
             }
         }
     }
@@ -65,6 +134,16 @@ impl ResponseCache {
         if let Some(tx) = &self.db_tx {
             if tx.send(DbCommand::Async(AsyncOp::DeleteResponsesBatch(blocks.to_vec()))).is_err() {
                 metrics::counter!(crate::metrics::DB_WRITER_DROPPED_TOTAL).increment(1);
+                if let Some(suppressed) = self.drop_throttle.observe() {
+                    warn!(
+                        purged = blocks.len(),
+                        event = "block_response_cache_drop",
+                        reason = "db_writer_closed",
+                        op = "purge",
+                        dropped_since_last_log = suppressed,
+                        "block_response_cache drop"
+                    );
+                }
             }
         }
     }

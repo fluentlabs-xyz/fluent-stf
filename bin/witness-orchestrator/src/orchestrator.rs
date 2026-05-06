@@ -32,7 +32,7 @@ use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use bytes::Bytes;
 use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::{
     blob_builder_mdbx::build_blobs_from_mdbx,
@@ -146,6 +146,11 @@ pub(crate) struct OrchestratorShared {
     /// cleared by the spawned key-check task once the new key is on L1.
     /// The dispatcher skips broadcasting while this is `Some(_)`.
     pub(crate) pending_key_check: Arc<std::sync::Mutex<Option<Address>>>,
+    /// Latest L1 block number observed by the L1 listener. Updated on every
+    /// `Checkpoint` event the router processes. Read by the heartbeat worker
+    /// to surface a whole-system snapshot in one log line; lock-free so
+    /// heartbeat never depends on RPC liveness.
+    pub(crate) last_seen_l1_block: Arc<AtomicU64>,
     high_tx: AsyncSender<ExecutionTask>,
     pub(crate) driver: Arc<Driver>,
     pub(crate) shutdown: CancellationToken,
@@ -190,6 +195,18 @@ enum SignOutcome {
 pub(crate) enum RevertKind {
     Oog,
     Logic,
+}
+
+impl RevertKind {
+    /// Lowercase, snake_case discriminator for structured logs and metrics.
+    /// Returned as a `&'static str` so it can be used as a tracing field
+    /// value without an allocation.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Oog => "oog",
+            Self::Logic => "logic",
+        }
+    }
 }
 
 /// `gas_used / gas_limit >= 0.95` → Oog. Pulled out for unit testing.
@@ -241,7 +258,7 @@ enum SignBatchError {
 /// `/sign-block-execution` requests with aggressive retry.
 #[allow(clippy::too_many_arguments)]
 async fn execution_worker(
-    worker_id: usize,
+    _worker_id: usize,
     high_rx: AsyncReceiver<ExecutionTask>,
     normal_rx: AsyncReceiver<ExecutionTask>,
     result_tx: mpsc::Sender<BlockResult>,
@@ -250,7 +267,6 @@ async fn execution_worker(
     api_key: String,
     shutdown: CancellationToken,
 ) {
-    info!(worker_id, "Execution worker started");
     loop {
         // biased: always drain high-priority (re-execution) before normal.
         // Cancel is checked ONLY between tasks — never mid-HTTP-call —
@@ -264,92 +280,88 @@ async fn execution_worker(
             else => break,
         };
 
-        #[cfg(feature = "zstd-block-payload")]
-        let payload = {
-            let uncompressed_len = task.payload.len();
-            match zstd::encode_all(task.payload.as_slice(), ZSTD_COMPRESSION_LEVEL) {
-                Ok(compressed) => {
-                    tracing::debug!(
-                        block = task.block_number,
-                        uncompressed_len,
-                        compressed_len = compressed.len(),
-                        "Compressed block payload for /sign-block-execution"
-                    );
-                    Bytes::from(compressed)
+        let block_number = task.block_number;
+        let process = async {
+            #[cfg(feature = "zstd-block-payload")]
+            let payload = {
+                let uncompressed_len = task.payload.len();
+                match zstd::encode_all(task.payload.as_slice(), ZSTD_COMPRESSION_LEVEL) {
+                    Ok(compressed) => {
+                        debug!(
+                            uncompressed_len,
+                            compressed_len = compressed.len(),
+                            "Compressed block payload for /sign-block-execution"
+                        );
+                        Bytes::from(compressed)
+                    }
+                    Err(e) => {
+                        error!(
+                            err = %e,
+                            "zstd compression failed — dropping task"
+                        );
+                        return false;
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        worker_id,
-                        block = task.block_number,
-                        err = %e,
-                        "zstd compression failed — dropping task"
-                    );
-                    continue;
+            };
+            #[cfg(not(feature = "zstd-block-payload"))]
+            let payload = Bytes::from(task.payload);
+            let mut backoff = Duration::from_millis(50);
+            let mut attempts: u32 = 0;
+            loop {
+                attempts += 1;
+                let t_start = std::time::Instant::now();
+                match send_block_request(
+                    &http_client,
+                    &proxy_url,
+                    &api_key,
+                    block_number,
+                    payload.clone(),
+                )
+                .await
+                {
+                    Ok(response) => {
+                        let elapsed = t_start.elapsed();
+                        metrics::histogram!(crate::metrics::SIGN_BLOCK_EXECUTION_DURATION)
+                            .record(elapsed.as_secs_f64());
+                        info!(
+                            event = "sign_block_execution_done",
+                            attempts,
+                            duration_ms = elapsed.as_millis() as u64,
+                            "sign-block-execution done"
+                        );
+                        if result_tx.send(BlockResult { block_number, response }).await.is_err() {
+                            warn!(event = "result_channel_closed", "result channel closed");
+                        }
+                        return true;
+                    }
+                    Err(e) => {
+                        metrics::histogram!(crate::metrics::SIGN_BLOCK_EXECUTION_DURATION)
+                            .record(t_start.elapsed().as_secs_f64());
+                        metrics::counter!(
+                            crate::metrics::SIGN_FAILURES_TOTAL,
+                            "stage" => "block",
+                            "kind" => crate::metrics::sign_failure_kind(&e),
+                        )
+                        .increment(1);
+                        warn!(
+                            attempt = attempts,
+                            err = %e,
+                            "Execution failed, retrying"
+                        );
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return false,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(Duration::from_secs(2));
+                    }
                 }
             }
         };
-        #[cfg(not(feature = "zstd-block-payload"))]
-        let payload = Bytes::from(task.payload);
-        let mut backoff = Duration::from_millis(50);
-        let mut attempts: u32 = 0;
-        loop {
-            attempts += 1;
-            let t_start = std::time::Instant::now();
-            match send_block_request(
-                &http_client,
-                &proxy_url,
-                &api_key,
-                task.block_number,
-                payload.clone(),
-            )
-            .await
-            {
-                Ok(response) => {
-                    metrics::histogram!(crate::metrics::SIGN_BLOCK_EXECUTION_DURATION)
-                        .record(t_start.elapsed().as_secs_f64());
-                    if attempts > 1 {
-                        info!(
-                            worker_id,
-                            block = task.block_number,
-                            attempts,
-                            "Block succeeded after retries"
-                        );
-                    }
-                    if result_tx
-                        .send(BlockResult { block_number: task.block_number, response })
-                        .await
-                        .is_err()
-                    {
-                        warn!(worker_id, block = task.block_number, "Result channel closed");
-                    }
-                    break;
-                }
-                Err(e) => {
-                    metrics::histogram!(crate::metrics::SIGN_BLOCK_EXECUTION_DURATION)
-                        .record(t_start.elapsed().as_secs_f64());
-                    metrics::counter!(
-                        crate::metrics::SIGN_FAILURES_TOTAL,
-                        "stage" => "block",
-                        "kind" => crate::metrics::sign_failure_kind(&e),
-                    )
-                    .increment(1);
-                    warn!(
-                        worker_id,
-                        block = task.block_number,
-                        attempt = attempts,
-                        err = %e,
-                        "Execution failed, retrying"
-                    );
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        _ = tokio::time::sleep(backoff) => {}
-                    }
-                    backoff = (backoff * 2).min(Duration::from_secs(2));
-                }
-            }
+        let span = tracing::info_span!("execute_block", block_number);
+        if !process.instrument(span).await && shutdown.is_cancelled() {
+            return;
         }
     }
-    info!(worker_id, "Execution worker exiting");
 }
 
 // ============================================================================
@@ -520,6 +532,7 @@ impl Orchestrator {
             nonce_allocator,
             orchestrator_tip,
             pending_key_check: Arc::new(std::sync::Mutex::new(None)),
+            last_seen_l1_block: Arc::new(AtomicU64::new(0)),
             high_tx,
             driver,
             shutdown,
@@ -561,17 +574,29 @@ impl Orchestrator {
 
         let mut workers: JoinSet<()> = JoinSet::new();
         for i in 0..EXECUTION_WORKERS {
-            workers.spawn(execution_worker(
-                i,
-                high_rx.clone(),
-                normal_rx.clone(),
-                result_tx.clone(),
-                shared.config.http_client.clone(),
-                shared.config.proxy_url.clone(),
-                shared.config.api_key.clone(),
-                shared.shutdown.clone(),
-            ));
+            workers.spawn(
+                execution_worker(
+                    i,
+                    high_rx.clone(),
+                    normal_rx.clone(),
+                    result_tx.clone(),
+                    shared.config.http_client.clone(),
+                    shared.config.proxy_url.clone(),
+                    shared.config.api_key.clone(),
+                    shared.shutdown.clone(),
+                )
+                .instrument(tracing::info_span!(
+                    "execution_worker",
+                    worker = "execution",
+                    worker_id = i,
+                )),
+            );
         }
+        info!(
+            event = "execution_pool_started",
+            workers = EXECUTION_WORKERS,
+            "execution pool started"
+        );
 
         // One-shot startup recovery: priority-replay blocks missing from
         // `block_responses` for any unsent batch. Run synchronously before
@@ -594,49 +619,80 @@ impl Orchestrator {
             let cache = Arc::clone(&shared.cache);
             let normal_tx = normal_tx.clone();
             let shutdown = shared.shutdown.clone();
-            tasks.spawn(async move {
-                if let Err(e) =
-                    feeder_loop(hub, normal_tx, cache, feeder_starting_block, shutdown).await
-                {
-                    warn!(err = %e, "feeder exited with error");
+            tasks.spawn(
+                async move {
+                    if let Err(e) =
+                        feeder_loop(hub, normal_tx, cache, feeder_starting_block, shutdown).await
+                    {
+                        warn!(err = %e, "feeder exited with error");
+                    }
+                    "feeder"
                 }
-                "feeder"
-            });
+                .instrument(tracing::info_span!("feeder", worker = "feeder")),
+            );
         }
         {
             let shared = Arc::clone(&shared);
-            tasks.spawn(async move {
-                signer_worker(shared).await;
-                "signer_worker"
-            });
+            tasks.spawn(
+                async move {
+                    signer_worker(shared).await;
+                    "signer_worker"
+                }
+                .instrument(tracing::info_span!("signer_worker", worker = "signer")),
+            );
         }
         {
             let shared = Arc::clone(&shared);
-            tasks.spawn(async move {
-                dispatcher_worker(shared).await;
-                "dispatcher_worker"
-            });
+            tasks.spawn(
+                async move {
+                    dispatcher_worker(shared).await;
+                    "dispatcher_worker"
+                }
+                .instrument(tracing::info_span!("dispatcher_worker", worker = "dispatcher")),
+            );
         }
         {
             let shared = Arc::clone(&shared);
-            tasks.spawn(async move {
-                finalization_worker(shared).await;
-                "finalization_worker"
-            });
+            tasks.spawn(
+                async move {
+                    finalization_worker(shared).await;
+                    "finalization_worker"
+                }
+                .instrument(tracing::info_span!("finalization_worker", worker = "finalization")),
+            );
         }
         {
             let shared = Arc::clone(&shared);
-            tasks.spawn(async move {
-                router(shared, l1_events, result_rx, initial_checkpoint).await;
-                "router"
-            });
+            tasks.spawn(
+                async move {
+                    router(shared, l1_events, result_rx, initial_checkpoint).await;
+                    "router"
+                }
+                .instrument(tracing::info_span!("router", worker = "router")),
+            );
         }
         {
             let shared = Arc::clone(&shared);
-            tasks.spawn(async move {
-                challenge_resolver::run(shared).await;
-                "challenge_resolver"
-            });
+            tasks.spawn(
+                async move {
+                    challenge_resolver::run(shared).await;
+                    "challenge_resolver"
+                }
+                .instrument(tracing::info_span!(
+                    "challenge_resolver",
+                    worker = "challenge_resolver"
+                )),
+            );
+        }
+        {
+            let shared = Arc::clone(&shared);
+            tasks.spawn(
+                async move {
+                    heartbeat_loop(shared).await;
+                    "heartbeat"
+                }
+                .instrument(tracing::info_span!("heartbeat", worker = "heartbeat")),
+            );
         }
 
         // Any worker exit — clean or fatal — cancels the root token so the
@@ -647,7 +703,7 @@ impl Orchestrator {
             }
             Some(join) = tasks.join_next() => {
                 match join {
-                    Ok(name) => info!(task = name, "orchestrator worker exited"),
+                    Ok(name) => info!(worker = name, "orchestrator worker exited"),
                     Err(e) => warn!(err = %e, "orchestrator worker join failed"),
                 }
                 shared.shutdown.cancel();
@@ -656,14 +712,17 @@ impl Orchestrator {
 
         while let Some(join) = tasks.join_next().await {
             match join {
-                Ok(name) => info!(task = name, "orchestrator worker drained"),
+                Ok(name) => info!(worker = name, "orchestrator worker drained"),
                 Err(e) => warn!(err = %e, "orchestrator worker join failed during drain"),
             }
         }
 
         // Drop everything we still hold so the worker pool sees the channels
-        // close and drains cleanly.
+        // close and drains cleanly. Keep a handle to the response cache so
+        // the post-drain shutdown log can report how many in-memory entries
+        // are about to be dropped without persistence.
         info!("Closing worker task channels — draining execution workers");
+        let cache_for_shutdown = Arc::clone(&shared.cache);
         drop(normal_tx);
         drop(result_tx);
         // `shared.high_tx` is the last live producer for `high_rx`; dropping
@@ -687,6 +746,11 @@ impl Orchestrator {
                 workers.shutdown().await;
             }
         }
+        let drained = cache_for_shutdown.lock().unwrap_or_else(|e| e.into_inner()).len();
+        info!(
+            event = "block_response_cache_shutdown_drained",
+            drained, "block_response_cache drained on shutdown"
+        );
         info!("Orchestrator::run exited");
     }
 }
@@ -775,6 +839,64 @@ async fn poll_receipts<Id: Copy + std::fmt::Debug>(
     out
 }
 
+/// Default heartbeat cadence. Operator override via `HEARTBEAT_INTERVAL_SECS`
+/// env var. Long enough to avoid log spam in idle steady state, short enough
+/// that a stuck pipeline produces a missing-heartbeat alert within a paging
+/// SLO.
+const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 300;
+
+/// Periodic worker that emits one consolidated `info!(event = "heartbeat", ...)`
+/// line every `HEARTBEAT_INTERVAL_SECS`. The line carries a snapshot of pipeline
+/// state — batch counts grouped by status, active challenge count, MDBX tip,
+/// and last L1 block observed by the listener — so an operator browsing
+/// Graylog can confirm liveness and read the current pipeline shape from a
+/// single log entry.
+///
+/// All inputs are in-process (SQLite under the existing DB Mutex, atomics on
+/// `OrchestratorShared`); the worker never makes RPC calls. This keeps the
+/// liveness signal independent of remote-system health, which is the property
+/// operators rely on when external dependencies degrade.
+async fn heartbeat_loop(shared: Arc<OrchestratorShared>) {
+    let interval = std::env::var("HEARTBEAT_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS));
+
+    loop {
+        let (batch_counts, active_challenges) = {
+            let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+            (g.batch_status_counts(), g.active_challenge_count())
+        };
+        let mdbx_tip = shared.driver.mdbx_tip().unwrap_or(0);
+        let l1_tip = shared.last_seen_l1_block.load(Ordering::Relaxed);
+        let orchestrator_tip = shared.orchestrator_tip.load(Ordering::Relaxed);
+
+        let count_for = |s: BatchStatus| -> u64 {
+            batch_counts.iter().find(|(t, _)| *t == s).map(|(_, c)| *c).unwrap_or(0)
+        };
+
+        info!(
+            event = "heartbeat",
+            committed = count_for(BatchStatus::Committed),
+            accepted = count_for(BatchStatus::Accepted),
+            dispatched = count_for(BatchStatus::Dispatched),
+            preconfirmed = count_for(BatchStatus::Preconfirmed),
+            finalized = count_for(BatchStatus::Finalized),
+            active_challenges,
+            mdbx_tip,
+            l1_tip,
+            orchestrator_tip,
+            "heartbeat"
+        );
+
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shared.shutdown.cancelled() => break,
+        }
+    }
+}
+
 /// Pure-RPC half of the finalization + reorg check: takes a `dispatched`
 /// snapshot and returns receipt observations without touching the DB.
 /// Skips rows whose `l1_block IS NULL` (in-flight initial broadcast — the
@@ -797,7 +919,7 @@ async fn poll_dispatched_receipts(
             warn!(
                 batch_index,
                 %tx_hash,
-                ?kind,
+                kind = kind.as_str(),
                 "Finalization-ticker observed REVERTED preconfirmBatch"
             );
         }
@@ -811,6 +933,7 @@ async fn poll_dispatched_receipts(
 
 /// Sign a batch root via the proxy with retry until definitive result.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(batch_index, from_block, to_block))]
 async fn sign_batch_io(
     http_client: &reqwest::Client,
     proxy_url: &str,
@@ -822,7 +945,7 @@ async fn sign_batch_io(
     driver: &Arc<Driver>,
     shutdown: &CancellationToken,
 ) -> SignOutcome {
-    info!(batch_index, from_block, to_block, "Signing batch root");
+    info!(batch_index, from_block, to_block, event = "batch_root_signing", "batch root signing");
 
     let blobs = {
         let mut backoff = Duration::from_secs(1);
@@ -838,13 +961,13 @@ async fn sign_batch_io(
                     batch_index,
                     from_block,
                     to_block,
-                    ?backoff,
+                    backoff_secs = backoff.as_secs(),
                     "MDBX tip behind Accepted batch range — invariant violation; sign_batch_io waiting"
                 ),
                 Err(e) => warn!(
                     batch_index,
                     err = %e,
-                    ?backoff,
+                    backoff_secs = backoff.as_secs(),
                     "MDBX blob construction failed — retrying"
                 ),
             }
@@ -856,7 +979,12 @@ async fn sign_batch_io(
         }
     };
 
-    info!(batch_index, num_blobs = blobs.len(), "Blobs built from L2 tx data");
+    info!(
+        batch_index,
+        event = "blobs_built",
+        num_blobs = blobs.len(),
+        "blobs built from l2 tx data"
+    );
 
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -874,9 +1002,15 @@ async fn sign_batch_io(
         .await
         {
             Ok(resp) => {
+                let elapsed = t_start.elapsed();
                 metrics::histogram!(crate::metrics::SIGN_BATCH_ROOT_DURATION)
-                    .record(t_start.elapsed().as_secs_f64());
-                info!(batch_index, "Batch root signed");
+                    .record(elapsed.as_secs_f64());
+                info!(
+                    batch_index,
+                    event = "sign_batch_root_done",
+                    duration_ms = elapsed.as_millis() as u64,
+                    "batch root signed"
+                );
                 return SignOutcome::Signed { response: resp };
             }
             Err(SignBatchError::InvalidSignatures { invalid_blocks, enclave_address }) => {
@@ -884,7 +1018,12 @@ async fn sign_batch_io(
                     .record(t_start.elapsed().as_secs_f64());
                 warn!(
                     batch_index,
-                    ?invalid_blocks,
+                    invalid_count = invalid_blocks.len(),
+                    invalid_blocks_csv = %invalid_blocks
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
                     %enclave_address,
                     "Batch has stale signatures — key rotation detected"
                 );
@@ -899,7 +1038,12 @@ async fn sign_batch_io(
                     "kind" => crate::metrics::sign_failure_kind(&e),
                 )
                 .increment(1);
-                warn!(batch_index, err = %e, ?backoff, "sign-batch-root failed — retrying");
+                warn!(
+                    batch_index,
+                    err = %e,
+                    backoff_secs = backoff.as_secs(),
+                    "sign-batch-root failed — retrying"
+                );
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = shutdown.cancelled() => return SignOutcome::TaskFailed,
@@ -1250,9 +1394,9 @@ async fn dispatcher_worker(shared: Arc<OrchestratorShared>) {
                     info!(
                         batch_index,
                         nonce = resume.nonce,
-                        stored_tx_hash = %resume.tx_hash,
-                        stored_max_fee_per_gas = resume.max_fee_per_gas,
-                        stored_max_priority_fee_per_gas = resume.max_priority_fee_per_gas,
+                        tx_hash = %resume.tx_hash,
+                        max_fee_per_gas = resume.max_fee_per_gas,
+                        max_priority_fee_per_gas = resume.max_priority_fee_per_gas,
                         "RBF: resuming dispatched batch from persisted state"
                     );
                     rbf::run(&shared, batch_index, signature, Some(resume), &mut backoff).await;
@@ -1318,7 +1462,11 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
 
             match outcome {
                 SignOutcome::Signed { response } => {
-                    info!(batch_index, "Batch signed — available for dispatch");
+                    info!(
+                        batch_index,
+                        event = "batch_accepted_for_dispatch",
+                        "batch accepted for dispatch"
+                    );
                     if let Err(e) = db::record_signature(&shared.db_tx, batch_index, response).await
                     {
                         error!(batch_index, err = %e, "record_signature failed");
@@ -1501,7 +1649,13 @@ async fn apply_finalization_changes(
                 if to_block > current {
                     orchestrator_tip.store(to_block, Ordering::Relaxed);
                 }
-                info!(batch_index, %tx_hash, to_block, "Batch finalized on L1");
+                info!(
+                    batch_index,
+                    event = "batch_finalized",
+                    %tx_hash,
+                    to_block,
+                    "batch finalized"
+                );
             }
             ReceiptCheck::Found { finalized: false } => {
                 // Receipt is observable but the L1 block is still in the
@@ -1516,7 +1670,7 @@ async fn apply_finalization_changes(
                 if !still_ours {
                     info!(
                         batch_index,
-                        observed = %tx_hash,
+                        %tx_hash,
                         "Stale ticker observation: dispatched tx_hash changed — skip"
                     );
                 } else {
@@ -1528,7 +1682,7 @@ async fn apply_finalization_changes(
                     error!(
                         batch_index,
                         %tx_hash,
-                        ?kind,
+                        kind = kind.as_str(),
                         "Finalization-ticker rolling back reverted batch"
                     );
                     if let Err(e) = db::rollback_to_accepted(db_tx, batch_index).await {
@@ -1549,7 +1703,7 @@ async fn apply_finalization_changes(
                 if !still_ours {
                     info!(
                         batch_index,
-                        observed = %tx_hash,
+                        %tx_hash,
                         "Stale Missing observation: dispatched tx_hash changed — skip"
                     );
                     continue;
@@ -1631,6 +1785,7 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
             }
         }
         L1Event::Checkpoint(l1_block) => {
+            shared.last_seen_l1_block.store(l1_block, Ordering::Relaxed);
             if shared.db_tx.send(DbCommand::Async(AsyncOp::SaveL1Checkpoint(l1_block))).is_err() {
                 warn!(l1_block, "save_l1_checkpoint: db writer channel closed");
             }
@@ -1639,7 +1794,12 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
             // Wipe persists the recovery anchors before shutdown so the
             // supervisor's restart can re-resolve the L2 checkpoint from
             // the reverted batch via `resolve_l2_start_checkpoint`.
-            info!(from_batch_index, l1_block, "BatchReverted — wiping DB and scheduling restart");
+            warn!(
+                from_batch_index,
+                l1_block,
+                event = "batch_reverted",
+                "batch reverted — wiping db and scheduling restart"
+            );
             if let Err(e) = db::wipe_for_revert(&shared.db_tx, from_batch_index, l1_block).await {
                 error!(from_batch_index, l1_block, err = %e, "wipe_for_revert failed");
             }
@@ -1723,15 +1883,15 @@ async fn handle_block_result(
             if block_number <= lbe {
                 warn!(
                     block_number,
-                    last_batch_end = lbe,
-                    "Ignoring block result: already finalized"
+                    event = "block_result_dropped_finalized",
+                    last_batch_to_block = lbe,
+                    "ignoring block result: already finalized"
                 );
                 return;
             }
         }
     }
 
-    info!(block_number, "Block execution response received");
     {
         let mut c = shared.cache.lock().unwrap_or_else(|e| e.into_inner());
         c.insert(result.response);

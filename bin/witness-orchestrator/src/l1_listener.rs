@@ -114,11 +114,12 @@ pub(crate) async fn run(
     shutdown: CancellationToken,
 ) -> eyre::Result<()> {
     info!(
+        event = "l1_listener_started",
         %contract_addr,
         from_block,
         poll_interval_secs,
         safe_blocks,
-        "L1 listener started"
+        "l1 listener started"
     );
 
     let mut backoff_secs = poll_interval_secs;
@@ -159,7 +160,11 @@ pub(crate) async fn run(
                 backoff_secs = poll_interval_secs; // reset on full success
                 polls_since_log += 1;
                 if polls_since_log >= CHECKPOINT_LOG_EVERY {
-                    info!(latest_l1_block = latest, "L1 listener checkpoint heartbeat");
+                    info!(
+                        event = "l1_listener_heartbeat",
+                        latest_l1_block = latest,
+                        "l1 listener heartbeat"
+                    );
                     polls_since_log = 0;
                 }
             }
@@ -278,10 +283,19 @@ async fn process_page(
         .from_block(from)
         .to_block(to);
 
+    let t = std::time::Instant::now();
     let logs = provider
         .get_logs(&filter)
         .await
         .map_err(|e| eyre!("Log query failed [{from}..{to}]: {e}"))?;
+    info!(
+        event = "l1_get_logs_done",
+        from_block = from,
+        to_block = to,
+        events_count = logs.len(),
+        duration_ms = t.elapsed().as_millis() as u64,
+        "l1 get_logs completed"
+    );
 
     for log in &logs {
         let topic0 = log.topic0().copied().unwrap_or_default();
@@ -314,7 +328,13 @@ async fn process_page(
 
             let to_block_number = to_block.header.number;
 
-            info!(batch_index, from_block_number, to_block_number, "BatchCommitted event");
+            info!(
+                batch_index,
+                event = "batch_committed_event",
+                from_block_number,
+                to_block_number,
+                "batch committed event"
+            );
 
             if tx
                 .send(L1Event::BatchCommitted {
@@ -335,7 +355,7 @@ async fn process_page(
                 .batchIndex
                 .try_into()
                 .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-            info!(batch_index, "BatchSubmitted event");
+            info!(batch_index, event = "batch_submitted_event", "batch submitted event");
             if tx.send(L1Event::BatchSubmitted { batch_index }).await.is_err() {
                 return Err(eyre!("L1 event channel closed"));
             }
@@ -353,7 +373,13 @@ async fn process_page(
             let l1_block = log
                 .block_number
                 .ok_or_else(|| eyre!("BatchPreconfirmed log missing block_number"))?;
-            info!(batch_index, %tx_hash, l1_block, "BatchPreconfirmed event");
+            info!(
+                batch_index,
+                event = "batch_preconfirmed_event",
+                %tx_hash,
+                l1_block,
+                "batch preconfirmed event"
+            );
             if tx.send(L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block }).await.is_err()
             {
                 return Err(eyre!("L1 event channel closed"));
@@ -368,7 +394,12 @@ async fn process_page(
                 .map_err(|_| eyre!("fromBatchIndex overflow: {}", event.fromBatchIndex))?;
             let l1_block =
                 log.block_number.ok_or_else(|| eyre!("BatchReverted log missing block_number"))?;
-            info!(from_batch_index, l1_block, "BatchReverted event");
+            info!(
+                from_batch_index,
+                event = "batch_reverted_event",
+                l1_block,
+                "batch reverted event"
+            );
             if tx.send(L1Event::BatchReverted { from_batch_index, l1_block }).await.is_err() {
                 return Err(eyre!("L1 event channel closed"));
             }
@@ -411,7 +442,12 @@ async fn process_page(
                 .try_into()
                 .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
             let commitment = event.commitment;
-            info!(batch_index, %commitment, "ChallengeResolved event");
+            info!(
+                batch_index,
+                event = "challenge_resolved_event",
+                %commitment,
+                "block challenge resolved event"
+            );
             if tx.send(L1Event::ChallengeResolved { batch_index, commitment }).await.is_err() {
                 return Err(eyre!("L1 event channel closed"));
             }
@@ -427,7 +463,11 @@ async fn process_page(
                 .batchIndex
                 .try_into()
                 .map_err(|_| eyre!("batchIndex overflow: {}", event.batchIndex))?;
-            info!(batch_index, "BatchRootChallengeResolved event");
+            info!(
+                batch_index,
+                event = "batch_root_challenge_resolved_event",
+                "batch root challenge resolved event"
+            );
             if tx.send(L1Event::BatchRootChallengeResolved { batch_index }).await.is_err() {
                 return Err(eyre!("L1 event channel closed"));
             }

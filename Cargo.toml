@@ -28,7 +28,7 @@ exclude = ["**/target"]
 [workspace.dependencies]
 # --- std utils ---
 tracing = { version = "0.1.40", default-features = false }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 cfg-if = "1.0.0"
 spin = { version = "0.9.8", features = ["mutex"] }
 async-trait = "0.1.80"

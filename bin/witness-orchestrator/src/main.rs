@@ -69,6 +69,7 @@ mod l1_listener;
 mod metrics;
 mod orchestrator;
 mod rbf;
+mod tracing_format;
 mod types;
 
 use std::{
@@ -92,7 +93,7 @@ use reth_tasks::Runtime;
 use rsp_host_executor::EthHostExecutor;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info, Instrument};
 
 use driver::{Driver, DriverConfig};
 use orchestrator::OrchestratorConfig;
@@ -108,14 +109,48 @@ const DEFAULT_WITNESS_RETENTION_BLOCKS: u64 = 172_800;
 /// Default listen address for the Prometheus `/metrics` HTTP server.
 const DEFAULT_METRICS_LISTEN_ADDR: &str = "0.0.0.0:9090";
 
+/// Default `EnvFilter` directives. Trims noisy external crates to `warn` so
+/// production logs are not drowned by RPC retry / connection-pool / MDBX
+/// maintenance chatter. `RUST_LOG`, when set, replaces this list verbatim;
+/// last directive wins, so operators can locally re-enable any crate
+/// (e.g. `RUST_LOG=info,alloy=debug`).
+const DEFAULT_TRACING_DIRECTIVES: &str = "info,\
+    alloy=warn,\
+    reth=warn,\
+    hyper=warn,\
+    hyper_util=warn,\
+    reqwest=warn,\
+    tower=warn,\
+    h2=warn";
+
+fn init_tracing() {
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_DIRECTIVES));
+
+    let format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "pretty".into());
+    let deploy_env = std::env::var("DEPLOY_ENV").unwrap_or_else(|_| "unknown".into());
+
+    match format.as_str() {
+        "json" => {
+            let layer =
+                fmt::layer().with_ansi(false).event_format(tracing_format::ServiceJson::new(
+                    "witness-orchestrator",
+                    env!("CARGO_PKG_VERSION"),
+                    deploy_env,
+                ));
+            tracing_subscriber::registry().with(env_filter).with(layer).init();
+        }
+        _ => {
+            tracing_subscriber::registry().with(env_filter).with(fmt::layer()).init();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing();
 
     // Install Prometheus recorder before any spawn so early metric writes are
     // not lost to the noop recorder.
@@ -323,10 +358,13 @@ async fn main() -> eyre::Result<()> {
     let (db_tx, db_rx) = tokio::sync::mpsc::unbounded_channel::<DbCommand>();
     {
         let db = Arc::clone(&db);
-        tasks.spawn(async move {
-            db::run_db_writer(db_rx, db).await;
-            ("db_writer", Ok::<(), eyre::Report>(()))
-        });
+        tasks.spawn(
+            async move {
+                db::run_db_writer(db_rx, db).await;
+                ("db_writer", Ok::<(), eyre::Report>(()))
+            }
+            .instrument(tracing::info_span!("db_writer", worker = "db_writer")),
+        );
     }
 
     // Shared watermark consumed by the driver's lookahead gate. Seeded from
@@ -339,29 +377,32 @@ async fn main() -> eyre::Result<()> {
     // blocking the final JoinSet drain forever.
     {
         let shutdown = shutdown.clone();
-        tasks.spawn(async move {
-            let r = async {
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .map_err(|e| eyre::eyre!("install SIGTERM: {e}"))?;
-                tokio::select! {
-                    _ = sigterm.recv() => {
-                        info!("SIGTERM received — graceful shutdown");
-                        shutdown.cancel();
+        tasks.spawn(
+            async move {
+                let r = async {
+                    let mut sigterm =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .map_err(|e| eyre::eyre!("install SIGTERM: {e}"))?;
+                    tokio::select! {
+                        _ = sigterm.recv() => {
+                            info!("SIGTERM received — graceful shutdown");
+                            shutdown.cancel();
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("SIGINT received — graceful shutdown");
+                            shutdown.cancel();
+                        }
+                        _ = shutdown.cancelled() => {
+                            info!("Internal shutdown observed — exiting signal handler");
+                        }
                     }
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("SIGINT received — graceful shutdown");
-                        shutdown.cancel();
-                    }
-                    _ = shutdown.cancelled() => {
-                        info!("Internal shutdown observed — exiting signal handler");
-                    }
+                    Ok::<(), eyre::Report>(())
                 }
-                Ok::<(), eyre::Report>(())
+                .await;
+                ("signal", r)
             }
-            .await;
-            ("signal", r)
-        });
+            .instrument(tracing::info_span!("signal_handler", worker = "signal_handler")),
+        );
     }
 
     // Metrics HTTP server — exposes `/metrics` on `FLUENT_METRICS_ADDR`.
@@ -369,10 +410,13 @@ async fn main() -> eyre::Result<()> {
         let shutdown = shutdown.clone();
         let addr = metrics_listen_addr.clone();
         let handle = Arc::clone(&metrics_handle);
-        tasks.spawn(async move {
-            let r = metrics::run_server(addr, handle, shutdown).await;
-            ("metrics_server", r)
-        });
+        tasks.spawn(
+            async move {
+                let r = metrics::run_server(addr, handle, shutdown).await;
+                ("metrics_server", r)
+            }
+            .instrument(tracing::info_span!("metrics_server", worker = "metrics_server")),
+        );
     }
 
     let l1_listened_l2_provider = l2_provider.clone();
@@ -381,20 +425,23 @@ async fn main() -> eyre::Result<()> {
     let (l1_tx, l1_rx) = tokio::sync::mpsc::channel(64);
     {
         let shutdown = shutdown.clone();
-        tasks.spawn(async move {
-            let r = l1_listener::run(
-                l1_read_provider,
-                l1_listened_l2_provider,
-                l1_rollup_addr,
-                listener_from_block,
-                l1_poll_interval_secs,
-                l1_safe_blocks,
-                l1_tx,
-                shutdown,
-            )
-            .await;
-            ("l1_listener", r)
-        });
+        tasks.spawn(
+            async move {
+                let r = l1_listener::run(
+                    l1_read_provider,
+                    l1_listened_l2_provider,
+                    l1_rollup_addr,
+                    listener_from_block,
+                    l1_poll_interval_secs,
+                    l1_safe_blocks,
+                    l1_tx,
+                    shutdown,
+                )
+                .await;
+                ("l1_listener", r)
+            }
+            .instrument(tracing::info_span!("l1_listener", worker = "l1_listener")),
+        );
     }
 
     // Cold witness store. Owned by `Driver`; external consumers reach it
@@ -482,15 +529,18 @@ async fn main() -> eyre::Result<()> {
     let catchup_handle = {
         let driver = Arc::clone(&driver);
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            match driver.advance_to_witness_from_block(&shutdown).await {
-                Ok(()) => info!("driver_catchup: completed"),
-                Err(e) => {
-                    tracing::error!(err = %e, "driver_catchup: fatal — cancelling shutdown");
-                    shutdown.cancel();
+        tokio::spawn(
+            async move {
+                match driver.advance_to_witness_from_block(&shutdown).await {
+                    Ok(()) => info!("driver_catchup: completed"),
+                    Err(e) => {
+                        error!(err = %e, "driver_catchup: fatal — cancelling shutdown");
+                        shutdown.cancel();
+                    }
                 }
             }
-        })
+            .instrument(tracing::info_span!("driver_catchup", worker = "driver_catchup")),
+        )
     };
 
     let config = OrchestratorConfig {
@@ -512,10 +562,13 @@ async fn main() -> eyre::Result<()> {
     {
         let driver = Arc::clone(&driver);
         let shutdown = shutdown.clone();
-        tasks.spawn(async move {
-            let r = driver.run_background_loop(shutdown).await;
-            ("driver_loop", r)
-        });
+        tasks.spawn(
+            async move {
+                let r = driver.run_background_loop(shutdown).await;
+                ("driver_loop", r)
+            }
+            .instrument(tracing::info_span!("driver_loop", worker = "driver_loop")),
+        );
     }
 
     // Build and run the orchestrator. `new` performs every internal setup
@@ -556,13 +609,13 @@ async fn main() -> eyre::Result<()> {
         }
         Some(join) = tasks.join_next() => {
             match join {
-                Ok((name, Ok(()))) => info!(task = name, "background task exited cleanly"),
+                Ok((name, Ok(()))) => info!(worker = name, "background task exited cleanly"),
                 Ok((name, Err(e))) => {
-                    tracing::error!(task = name, err = %e, "background task exited with error");
+                    error!(worker = name, err = %e, "background task exited with error");
                     exit_code = 1;
                 }
                 Err(e) => {
-                    tracing::error!(err = %e, "background task join failed");
+                    error!(err = %e, "background task join failed");
                     exit_code = 1;
                 }
             }
@@ -578,13 +631,13 @@ async fn main() -> eyre::Result<()> {
     let drain_fut = async {
         while let Some(join) = tasks.join_next().await {
             match join {
-                Ok((name, Ok(()))) => info!(task = name, "background task exited cleanly"),
+                Ok((name, Ok(()))) => info!(worker = name, "background task exited cleanly"),
                 Ok((name, Err(e))) => {
-                    tracing::error!(task = name, err = %e, "background task exited with error");
+                    error!(worker = name, err = %e, "background task exited with error");
                     exit_code = 1;
                 }
                 Err(e) => {
-                    tracing::error!(err = %e, "background task join failed");
+                    error!(err = %e, "background task join failed");
                     exit_code = 1;
                 }
             }
@@ -595,7 +648,7 @@ async fn main() -> eyre::Result<()> {
         .await
         .is_err()
     {
-        tracing::error!(
+        error!(
             timeout_secs = SHUTDOWN_DRAIN_TIMEOUT_SECS,
             "Background tasks drain timed out — forcing shutdown"
         );
@@ -606,7 +659,7 @@ async fn main() -> eyre::Result<()> {
     // running — on normal exit it has already completed long ago.
     if let Err(e) = catchup_handle.await {
         if !e.is_cancelled() {
-            tracing::error!(err = %e, "driver_catchup join failed");
+            error!(err = %e, "driver_catchup join failed");
             exit_code = 1;
         }
     }
@@ -616,7 +669,7 @@ async fn main() -> eyre::Result<()> {
     // gap-fill. A failure here is logged but does not change the exit code —
     // the re-witness fallback still handles any unflushed blocks on restart.
     if let Err(e) = hub_for_shutdown.flush_pending().await {
-        tracing::error!(err = %e, "cold witness flush_pending failed at shutdown");
+        error!(err = %e, "cold witness flush_pending failed at shutdown");
     }
 
     if exit_code != 0 {

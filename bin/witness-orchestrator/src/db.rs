@@ -340,7 +340,11 @@ impl Db {
             "INSERT OR REPLACE INTO meta(key, value) VALUES('l1_checkpoint', ?1)",
             params![block_number.to_string()],
         ) {
-            error!(err = %e, "Failed to persist l1_checkpoint");
+            warn!(
+                err = %e,
+                event = "save_l1_checkpoint_failed",
+                "save_l1_checkpoint failed — will retry next tick"
+            );
         }
     }
 
@@ -357,7 +361,11 @@ impl Db {
 
     pub(crate) fn clear_start_batch_id(&self) {
         if let Err(e) = self.conn.execute("DELETE FROM meta WHERE key = 'start_batch_id'", []) {
-            error!(err = %e, "Failed to clear start_batch_id");
+            warn!(
+                err = %e,
+                event = "clear_start_batch_id_failed",
+                "clear_start_batch_id failed — will retry next tick"
+            );
         }
     }
 
@@ -387,6 +395,55 @@ impl Db {
             .ok()
             .flatten()
             .map(|v| v as u64)
+    }
+
+    /// Snapshot of batch row counts grouped by status. Returned in the order
+    /// the heartbeat worker logs them (committed → accepted → dispatched →
+    /// preconfirmed → finalized). Missing statuses are reported as zero.
+    pub(crate) fn batch_status_counts(&self) -> [(BatchStatus, u64); 5] {
+        let mut counts: [(BatchStatus, u64); 5] = [
+            (BatchStatus::Committed, 0),
+            (BatchStatus::Accepted, 0),
+            (BatchStatus::Dispatched, 0),
+            (BatchStatus::Preconfirmed, 0),
+            (BatchStatus::Finalized, 0),
+        ];
+        let mut stmt =
+            match self.conn.prepare("SELECT status, COUNT(*) FROM batches GROUP BY status") {
+                Ok(s) => s,
+                Err(_) => return counts,
+            };
+        let rows = stmt.query_map([], |row| {
+            let status: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((status, count))
+        });
+        if let Ok(iter) = rows {
+            for r in iter.flatten() {
+                if let Some(s) = BatchStatus::from_db(&r.0) {
+                    if let Some(slot) = counts.iter_mut().find(|(t, _)| *t == s) {
+                        slot.1 = r.1.max(0) as u64;
+                    }
+                }
+            }
+        }
+        counts
+    }
+
+    /// Snapshot of active challenge row counts, broken down into rows that
+    /// have not yet reached the terminal `Resolved` status. Returned as a
+    /// single u64 so the heartbeat line stays compact; per-status detail
+    /// lives in Prometheus.
+    pub(crate) fn active_challenge_count(&self) -> u64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM challenges WHERE status NOT IN ('resolved', 'failed')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(0)
     }
 
     /// `MAX(block_number)` across `block_responses` rows. Used at startup to
@@ -454,7 +511,12 @@ impl Db {
         let mut stmt = match self.conn.prepare(sql) {
             Ok(s) => s,
             Err(e) => {
-                error!(err = %e, "missing_blocks_for_unsent_batches prepare failed");
+                warn!(
+                    err = %e,
+                    event = "db_prepare_failed",
+                    op = "missing_blocks_for_unsent_batches",
+                    "db prepare failed — will retry next tick"
+                );
                 return vec![];
             }
         };
@@ -659,7 +721,12 @@ impl Db {
         ) {
             Ok(s) => s,
             Err(e) => {
-                error!(err = %e, "dispatched_for_finalization_check prepare failed");
+                warn!(
+                    err = %e,
+                    event = "db_prepare_failed",
+                    op = "dispatched_for_finalization_check",
+                    "db prepare failed — will retry next tick"
+                );
                 return vec![];
             }
         };
@@ -769,7 +836,12 @@ impl Db {
             match self.conn.prepare("SELECT response FROM block_responses ORDER BY block_number") {
                 Ok(s) => s,
                 Err(e) => {
-                    error!(err = %e, "load_responses prepare failed");
+                    warn!(
+                        err = %e,
+                        event = "db_prepare_failed",
+                        op = "load_responses",
+                        "db prepare failed — will retry next tick"
+                    );
                     return vec![];
                 }
             };
@@ -956,7 +1028,12 @@ impl Db {
         ) {
             Ok(s) => s,
             Err(e) => {
-                error!(err = %e, "dispatched_challenges_with_l1_block prepare failed");
+                warn!(
+                    err = %e,
+                    event = "db_prepare_failed",
+                    op = "dispatched_challenges_with_l1_block",
+                    "db prepare failed — will retry next tick"
+                );
                 return vec![];
             }
         };
@@ -983,7 +1060,11 @@ impl Db {
         let tx = match self.conn.transaction() {
             Ok(tx) => tx,
             Err(e) => {
-                error!(err = %e, "wipe_for_revert: begin tx failed");
+                error!(
+                    err = %e,
+                    event = "wipe_for_revert_begin_failed",
+                    "wipe_for_revert: begin tx failed"
+                );
                 return;
             }
         };
@@ -1011,11 +1092,19 @@ impl Db {
         match res {
             Ok(()) => {
                 if let Err(e) = tx.commit() {
-                    error!(err = %e, "wipe_for_revert: commit failed");
+                    error!(
+                        err = %e,
+                        event = "wipe_for_revert_commit_failed",
+                        "wipe_for_revert: commit failed"
+                    );
                 }
             }
             Err(e) => {
-                error!(err = %e, "wipe_for_revert: statement failed — rolling back");
+                error!(
+                    err = %e,
+                    event = "wipe_for_revert_statement_failed",
+                    "wipe_for_revert: statement failed — rolling back"
+                );
             }
         }
     }
@@ -1254,7 +1343,7 @@ pub(crate) async fn run_db_writer(
     mut rx: mpsc::UnboundedReceiver<DbCommand>,
     db: Arc<std::sync::Mutex<Db>>,
 ) {
-    tracing::info!("DB writer actor started");
+    info!("DB writer actor started");
     let mut buffer: Vec<AsyncOp> = Vec::with_capacity(DB_BUFFER_FLUSH_SIZE);
     let mut ticker = interval(DB_BUFFER_FLUSH_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1288,7 +1377,7 @@ pub(crate) async fn run_db_writer(
             }
         }
     }
-    tracing::info!("DB writer actor exited");
+    info!("DB writer actor exited");
 }
 
 fn flush_async_buffer(db: &Arc<std::sync::Mutex<Db>>, buffer: &mut Vec<AsyncOp>) {
@@ -1301,7 +1390,12 @@ fn flush_async_buffer(db: &Arc<std::sync::Mutex<Db>>, buffer: &mut Vec<AsyncOp>)
     let tx = match guard.conn.transaction() {
         Ok(t) => t,
         Err(e) => {
-            error!(err = %e, count, "db writer: begin tx failed — batch dropped");
+            warn!(
+                err = %e,
+                count,
+                event = "db_begin_tx_failed",
+                "db begin tx failed — batch dropped, will retry next tick"
+            );
             return;
         }
     };
@@ -1309,7 +1403,12 @@ fn flush_async_buffer(db: &Arc<std::sync::Mutex<Db>>, buffer: &mut Vec<AsyncOp>)
         apply_async_op(&tx, op);
     }
     if let Err(e) = tx.commit() {
-        error!(err = %e, count, "db writer: commit failed — batch lost");
+        warn!(
+            err = %e,
+            count,
+            event = "db_commit_failed",
+            "db commit failed — batch lost, will retry next tick"
+        );
     }
 }
 
@@ -1319,7 +1418,11 @@ fn apply_async_op(tx: &rusqlite::Transaction<'_>, op: AsyncOp) {
             let blob = match bincode::serialize(&resp) {
                 Ok(b) => b,
                 Err(e) => {
-                    error!(err = %e, "save_response: serialize failed");
+                    error!(
+                        err = %e,
+                        event = "save_response_serialize_failed",
+                        "save_response: serialize failed"
+                    );
                     return;
                 }
             };
@@ -1327,7 +1430,12 @@ fn apply_async_op(tx: &rusqlite::Transaction<'_>, op: AsyncOp) {
                 "INSERT OR REPLACE INTO block_responses(block_number, response) VALUES(?1, ?2)",
                 params![resp.block_number as i64, blob],
             ) {
-                error!(err = %e, block_number = resp.block_number, "save_response in batch");
+                warn!(
+                    err = %e,
+                    block_number = resp.block_number,
+                    event = "save_response_failed",
+                    "save_response failed — will retry next tick"
+                );
             }
         }
         AsyncOp::DeleteResponsesBatch(blocks) => {
@@ -1336,7 +1444,12 @@ fn apply_async_op(tx: &rusqlite::Transaction<'_>, op: AsyncOp) {
                     "DELETE FROM block_responses WHERE block_number = ?1",
                     params![block as i64],
                 ) {
-                    error!(err = %e, block_number = block, "delete_responses_batch row");
+                    warn!(
+                        err = %e,
+                        block_number = block,
+                        event = "delete_response_failed",
+                        "delete_response failed — will retry next tick"
+                    );
                 }
             }
         }
@@ -1345,7 +1458,12 @@ fn apply_async_op(tx: &rusqlite::Transaction<'_>, op: AsyncOp) {
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('l1_checkpoint', ?1)",
                 params![cp.to_string()],
             ) {
-                error!(err = %e, cp, "save_l1_checkpoint in batch");
+                warn!(
+                    err = %e,
+                    cp,
+                    event = "save_l1_checkpoint_failed",
+                    "save_l1_checkpoint failed — will retry next tick"
+                );
             }
         }
     }
@@ -1356,7 +1474,13 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
     match op {
         SyncOp::PatchBatch { batch_index, patch } => {
             if let Err(e) = guard.patch_batch(batch_index, &patch) {
-                error!(err = %e, batch_index, "patch_batch failed");
+                warn!(
+                    err = %e,
+                    batch_index,
+                    event = "db_patch_failed",
+                    op = "patch_batch",
+                    "db patch failed — will retry next tick"
+                );
             }
         }
         SyncOp::ObserveCommitted { batch_index, from_block, to_block } => {
@@ -1379,15 +1503,22 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
                 last_status_change_at: now,
             };
             if let Err(e) = guard.upsert_batch(&row) {
-                error!(err = %e, batch_index, "observe_committed upsert failed");
+                warn!(
+                    err = %e,
+                    batch_index,
+                    event = "db_upsert_failed",
+                    op = "observe_committed",
+                    "db upsert failed — will retry next tick"
+                );
                 return;
             }
             info!(
                 batch_index,
+                event = "batch_committed_observed",
                 from_block,
                 to_block,
-                status = ?row.status,
-                "New batch registered"
+                status = row.status.as_str(),
+                "batch committed observed"
             );
         }
         SyncOp::ObserveSubmitted { batch_index } => match guard.find_batch(batch_index) {
@@ -1395,16 +1526,23 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
                 let patch =
                     BatchPatch { status: Some(BatchStatus::Accepted), ..Default::default() };
                 if let Err(e) = guard.patch_batch(batch_index, &patch) {
-                    error!(err = %e, batch_index, "observe_submitted patch failed");
+                    warn!(
+                        err = %e,
+                        batch_index,
+                        event = "db_patch_failed",
+                        op = "observe_submitted",
+                        "db patch failed — will retry next tick"
+                    );
                     return;
                 }
-                info!(batch_index, "Batch marked Accepted (blobs in L1)");
+                info!(batch_index, event = "batch_accepted", "batch accepted");
             }
             Some(_) => { /* already past Accepted; idempotent no-op */ }
             None => {
                 error!(
                     batch_index,
-                    "ObserveSubmitted with no prior BatchCommitted row — invariant violation \
+                    event = "observe_submitted_invariant_violation",
+                    "observe_submitted with no prior BatchCommitted row — invariant violation \
                      (contract semantics + chain-ordered L1 listener guarantee BatchCommitted \
                      is observed first)"
                 );
@@ -1426,10 +1564,22 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
                         ..Default::default()
                     };
                     if let Err(e) = guard.patch_batch(batch_index, &patch) {
-                        error!(err = %e, batch_index, "observe_preconfirmed (our) patch failed");
+                        warn!(
+                            err = %e,
+                            batch_index,
+                            event = "db_patch_failed",
+                            op = "observe_preconfirmed_local",
+                            "db patch failed — will retry next tick"
+                        );
                         return;
                     }
-                    info!(batch_index, %tx_hash, l1_block, "PRECONFIRMED via our broadcast");
+                    info!(
+                        batch_index,
+                        event = "batch_preconfirmed_local",
+                        %tx_hash,
+                        l1_block,
+                        "batch preconfirmed via own broadcast"
+                    );
                 }
                 // (c) external takeover — never seen in current production but kept for
                 //     edge case (future second validator).
@@ -1444,10 +1594,22 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
                         ..Default::default()
                     };
                     if let Err(e) = guard.patch_batch(batch_index, &patch) {
-                        error!(err = %e, batch_index, "observe_preconfirmed (external) patch failed");
+                        warn!(
+                            err = %e,
+                            batch_index,
+                            event = "db_patch_failed",
+                            op = "observe_preconfirmed_external",
+                            "db patch failed — will retry next tick"
+                        );
                         return;
                     }
-                    warn!(batch_index, %tx_hash, l1_block, "PRECONFIRMED via external takeover");
+                    warn!(
+                        batch_index,
+                        event = "batch_preconfirmed_external",
+                        %tx_hash,
+                        l1_block,
+                        "batch preconfirmed via external takeover"
+                    );
                 }
                 // (d) row absent — insert at Preconfirmed (very early external batch).
                 None => {
@@ -1466,14 +1628,22 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
                         last_status_change_at: now,
                     };
                     if let Err(e) = guard.upsert_batch(&row) {
-                        error!(err = %e, batch_index, "observe_preconfirmed insert failed");
+                        warn!(
+                            err = %e,
+                            batch_index,
+                            event = "db_upsert_failed",
+                            op = "observe_preconfirmed_insert",
+                            "db upsert failed — will retry next tick"
+                        );
                         return;
                     }
                     warn!(
                         batch_index,
+                        event = "batch_preconfirmed_external",
                         %tx_hash,
                         l1_block,
-                        "PRECONFIRMED via external takeover (no prior row)"
+                        reason = "no_prior_row",
+                        "batch preconfirmed via external takeover (no prior row)"
                     );
                 }
             }
@@ -1481,7 +1651,13 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
         SyncOp::ObserveFinalized { batch_index } => {
             let patch = BatchPatch { status: Some(BatchStatus::Finalized), ..Default::default() };
             if let Err(e) = guard.patch_batch(batch_index, &patch) {
-                error!(err = %e, batch_index, "observe_finalized patch failed");
+                warn!(
+                    err = %e,
+                    batch_index,
+                    event = "db_patch_failed",
+                    op = "observe_finalized",
+                    "db patch failed — will retry next tick"
+                );
             }
         }
         SyncOp::ObserveReorgToDispatched { batch_index } => {
@@ -1502,7 +1678,13 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
                 ..Default::default()
             };
             if let Err(e) = guard.patch_batch(batch_index, &patch) {
-                error!(err = %e, batch_index, "observe_reorg_to_dispatched patch failed");
+                warn!(
+                    err = %e,
+                    batch_index,
+                    event = "db_patch_failed",
+                    op = "observe_reorg_to_dispatched",
+                    "db patch failed — will retry next tick"
+                );
             }
         }
         SyncOp::RollbackToAccepted { batch_index } => {
@@ -1527,13 +1709,25 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
                 ..Default::default()
             };
             if let Err(e) = guard.patch_batch(batch_index, &patch) {
-                error!(err = %e, batch_index, "rollback_to_accepted patch failed");
+                warn!(
+                    err = %e,
+                    batch_index,
+                    event = "db_patch_failed",
+                    op = "rollback_to_accepted",
+                    "db patch failed — will retry next tick"
+                );
             }
         }
         SyncOp::InvalidateSignature { batch_index } => {
             let patch = BatchPatch { signature: Some(None), ..Default::default() };
             if let Err(e) = guard.patch_batch(batch_index, &patch) {
-                error!(err = %e, batch_index, "invalidate_signature patch failed");
+                warn!(
+                    err = %e,
+                    batch_index,
+                    event = "db_patch_failed",
+                    op = "invalidate_signature",
+                    "db patch failed — will retry next tick"
+                );
             }
         }
         SyncOp::WipeForRevert { start_batch_id, l1_block } => {
@@ -1541,12 +1735,24 @@ fn run_sync_op(db: &Arc<std::sync::Mutex<Db>>, op: SyncOp) {
         }
         SyncOp::InsertChallenge(row) => {
             if let Err(e) = guard.insert_challenge(&row) {
-                error!(err = %e, batch_index = row.batch_index, "insert_challenge failed");
+                warn!(
+                    err = %e,
+                    batch_index = row.batch_index,
+                    event = "db_insert_failed",
+                    op = "insert_challenge",
+                    "db insert failed — will retry next tick"
+                );
             }
         }
         SyncOp::PatchChallenge { challenge_id, patch } => {
             if let Err(e) = guard.patch_challenge(challenge_id, &patch) {
-                error!(err = %e, challenge_id, "patch_challenge failed");
+                warn!(
+                    err = %e,
+                    challenge_id,
+                    event = "db_patch_failed",
+                    op = "patch_challenge",
+                    "db patch failed — will retry next tick"
+                );
             }
         }
     }

@@ -36,7 +36,7 @@ use nitro_types::ChallengeSp1Request;
 use rsp_client_executor::io::EthClientExecutorInput;
 use serde::{Deserialize, Serialize};
 use tokio::time::MissedTickBehavior;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     blob_builder_mdbx::build_blobs_from_mdbx,
@@ -220,15 +220,23 @@ async fn check_and_fail_if_deadline_expired(
     )
     .increment(1);
     error!(
+        event = "challenge_deadline_expired",
         challenge_id = row.challenge_id,
+        batch_index = row.batch_index,
         kind = row.kind.as_str(),
-        deadline = row.deadline,
+        deadline_l1_block = row.deadline,
         current_l1_block,
         "challenge deadline expired — marking failed (rollup will go corrupted; \
          operator must call revertBatches)"
     );
     if let Err(e) = db::record_challenge_failed(&shared.db_tx, row.challenge_id).await {
-        tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_failed (deadline) failed");
+        warn!(
+            challenge_id = row.challenge_id,
+            err = %e,
+            event = "record_challenge_failed_failed",
+            reason = "deadline",
+            "record_challenge_failed failed"
+        );
     }
     true
 }
@@ -252,11 +260,12 @@ enum ResolveError {
 /// (missing batch in DB, commitment not in batch's L2 range, etc.).
 async fn mark_invariant_violation(shared: &OrchestratorShared, row: &ChallengeRow, reason: &str) {
     error!(
+        event = "challenge_invariant_violation",
         challenge_id = row.challenge_id,
         kind = row.kind.as_str(),
         batch_index = row.batch_index,
         reason,
-        "INVARIANT VIOLATION — marking challenge Failed; operator action required"
+        "challenge invariant violation — marking failed; operator action required"
     );
     metrics::counter!(
         "orchestrator_challenge_invariant_violation_total",
@@ -264,7 +273,13 @@ async fn mark_invariant_violation(shared: &OrchestratorShared, row: &ChallengeRo
     )
     .increment(1);
     if let Err(e) = db::record_challenge_failed(&shared.db_tx, row.challenge_id).await {
-        tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_failed (invariant) failed");
+        warn!(
+            challenge_id = row.challenge_id,
+            err = %e,
+            event = "record_challenge_failed_failed",
+            reason = "invariant",
+            "record_challenge_failed failed"
+        );
     }
 }
 
@@ -272,6 +287,10 @@ async fn mark_invariant_violation(shared: &OrchestratorShared, row: &ChallengeRo
 // Block-kind status handlers
 // ============================================================================
 
+#[tracing::instrument(
+    skip_all,
+    fields(challenge_id = row.challenge_id, batch_index = row.batch_index, kind = row.kind.as_str())
+)]
 async fn handle_block_received(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
@@ -377,7 +396,12 @@ async fn handle_block_received(
                 db::record_challenge_sp1_requested(&shared.db_tx, row.challenge_id, request_id)
                     .await
             {
-                tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_sp1_requested failed");
+                warn!(
+                    challenge_id = row.challenge_id,
+                    err = %e,
+                    event = "record_challenge_sp1_requested_failed",
+                    "record_challenge_sp1_requested failed"
+                );
             }
             info!(
                 challenge_id = row.challenge_id,
@@ -399,6 +423,10 @@ async fn handle_block_received(
     }
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(challenge_id = row.challenge_id, batch_index = row.batch_index, kind = row.kind.as_str())
+)]
 async fn handle_sp1_proving(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
@@ -409,7 +437,8 @@ async fn handle_sp1_proving(
     let Some(request_id) = row.sp1_request_id else {
         error!(
             challenge_id = row.challenge_id,
-            "BUG: Sp1Proving row without sp1_request_id (CHECK constraint violated)"
+            event = "sp1_proving_missing_request_id_invariant",
+            "sp1_proving row without sp1_request_id (check constraint violated)"
         );
         return;
     };
@@ -419,7 +448,12 @@ async fn handle_sp1_proving(
     // ~SP1_STATUS_POLL_INTERVAL_SECS even if the call errors mid-flight,
     // preventing a tight retry loop against the proxy.
     if let Err(e) = db::stamp_challenge_polled(&shared.db_tx, row.challenge_id).await {
-        tracing::error!(challenge_id = row.challenge_id, err = %e, "stamp_challenge_polled failed");
+        warn!(
+            challenge_id = row.challenge_id,
+            err = %e,
+            event = "stamp_challenge_polled_failed",
+            "stamp_challenge_polled failed"
+        );
     }
 
     match poll_sp1_status(
@@ -434,7 +468,12 @@ async fn handle_sp1_proving(
             if let Err(e) =
                 db::record_challenge_sp1_proved(&shared.db_tx, row.challenge_id, proof_bytes).await
             {
-                tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_sp1_proved failed");
+                warn!(
+                    challenge_id = row.challenge_id,
+                    err = %e,
+                    event = "record_challenge_sp1_proved_failed",
+                    "record_challenge_sp1_proved failed"
+                );
             }
             info!(challenge_id = row.challenge_id, "SP1 proof ready");
         }
@@ -453,7 +492,12 @@ async fn handle_sp1_proving(
             if let Err(e) =
                 db::record_challenge_sp1_lost_reset(&shared.db_tx, row.challenge_id).await
             {
-                tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_sp1_lost_reset failed");
+                warn!(
+                    challenge_id = row.challenge_id,
+                    err = %e,
+                    event = "record_challenge_sp1_lost_reset_failed",
+                    "record_challenge_sp1_lost_reset failed"
+                );
             }
         }
         Err(Sp1StatusError::Other(e)) => {
@@ -467,6 +511,10 @@ async fn handle_sp1_proving(
     }
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(challenge_id = row.challenge_id, batch_index = row.batch_index, kind = row.kind.as_str())
+)]
 async fn handle_sp1_proved(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
@@ -491,7 +539,8 @@ async fn handle_dispatched_resume(
         error!(
             challenge_id = row.challenge_id,
             kind = row.kind.as_str(),
-            "BUG: Dispatched challenge row without persisted nonce — skipping resume"
+            event = "dispatched_challenge_missing_nonce_invariant",
+            "dispatched challenge row without persisted nonce — skipping resume"
         );
         return;
     };
@@ -600,6 +649,10 @@ async fn handle_dispatched_resume(
 /// revert during prepare (e.g. `AccessControlUnauthorizedAccount`) must NOT
 /// burn a nonce, because tail-CAS `release` cannot rewind past concurrent
 /// allocations from other workers.
+#[tracing::instrument(
+    skip_all,
+    fields(challenge_id = row.challenge_id, batch_index = row.batch_index, kind = row.kind.as_str())
+)]
 async fn run_resolve_lifecycle(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
@@ -709,6 +762,7 @@ async fn compute_block_budget(l1_provider: &impl Provider, deadline: u64) -> u64
 
 async fn fail_with_reason(shared: &OrchestratorShared, row: &ChallengeRow, reason: String) {
     error!(
+        event = "challenge_pre_broadcast_validation_failed",
         challenge_id = row.challenge_id,
         kind = row.kind.as_str(),
         reason = %reason,
@@ -720,7 +774,13 @@ async fn fail_with_reason(shared: &OrchestratorShared, row: &ChallengeRow, reaso
     )
     .increment(1);
     if let Err(e) = db::record_challenge_failed(&shared.db_tx, row.challenge_id).await {
-        tracing::error!(challenge_id = row.challenge_id, err = %e, "record_challenge_failed (pre-broadcast) failed");
+        warn!(
+            challenge_id = row.challenge_id,
+            err = %e,
+            event = "record_challenge_failed_failed",
+            reason = "pre_broadcast",
+            "record_challenge_failed failed"
+        );
     }
 }
 
@@ -749,8 +809,20 @@ async fn validate_resolve_pre_broadcast(
         input: partial.input.clone().into(),
         ..Default::default()
     };
-    match shared.config.l1_provider.call(req).await {
-        Ok(_) => Ok(()),
+    let t = std::time::Instant::now();
+    let r = shared.config.l1_provider.call(req).await;
+    let duration_ms = t.elapsed().as_millis() as u64;
+    match r {
+        Ok(_) => {
+            info!(
+                challenge_id = row.challenge_id,
+                kind = row.kind.as_str(),
+                event = "resolve_validate_done",
+                duration_ms,
+                "resolve eth_call validation passed"
+            );
+            Ok(())
+        }
         Err(e) => Err(format!(
             "eth_call simulation reverted (challenge_id={}, kind={}): {e}",
             row.challenge_id,
@@ -1001,7 +1073,7 @@ async fn post_sp1_request(
         let uncompressed_len = serialized.len();
         let compressed = zstd::encode_all(serialized.as_slice(), ZSTD_COMPRESSION_LEVEL)
             .map_err(|e| eyre::eyre!("zstd encode ChallengeSp1Request: {e}"))?;
-        tracing::debug!(
+        debug!(
             uncompressed_len,
             compressed_len = compressed.len(),
             "Compressed ChallengeSp1Request payload"
@@ -1086,13 +1158,15 @@ pub(crate) struct ResolveObserver<'a> {
 impl RbfObserver for ResolveObserver<'_> {
     async fn on_first_broadcast(&self, hash: B256, fee: u128, tip: u128) {
         info!(
-            kind = self.kind.as_str(),
+            event = "resolve_dispatched",
             challenge_id = self.challenge_id,
             batch_index = self.batch_index,
-            %hash,
+            kind = self.kind.as_str(),
+            nonce = self.nonce,
+            tx_hash = %hash,
             max_fee_per_gas = fee,
             max_priority_fee_per_gas = tip,
-            "resolve broadcast (initial)"
+            "resolve dispatched"
         );
         if let Err(e) = db::record_challenge_first_broadcast(
             &self.shared.db_tx,
@@ -1104,54 +1178,72 @@ impl RbfObserver for ResolveObserver<'_> {
         )
         .await
         {
-            tracing::error!(challenge_id = self.challenge_id, err = %e, "record_challenge_first_broadcast failed");
+            warn!(
+                challenge_id = self.challenge_id,
+                err = %e,
+                event = "record_challenge_first_broadcast_failed",
+                "record_challenge_first_broadcast failed"
+            );
         }
         crate::metrics::counter_resolve_dispatched(self.kind.as_str());
     }
 
     async fn on_rebroadcast(&self, hash: B256, fee: u128, tip: u128) {
         info!(
-            kind = self.kind.as_str(),
+            event = "resolve_rebroadcast",
             challenge_id = self.challenge_id,
             batch_index = self.batch_index,
-            %hash,
+            kind = self.kind.as_str(),
+            tx_hash = %hash,
             max_fee_per_gas = fee,
             max_priority_fee_per_gas = tip,
-            "resolve RBF rebroadcast"
+            "resolve rebroadcast"
         );
         if let Err(e) =
             db::record_challenge_rebroadcast(&self.shared.db_tx, self.challenge_id, hash, fee, tip)
                 .await
         {
-            tracing::error!(challenge_id = self.challenge_id, err = %e, "record_challenge_rebroadcast failed");
+            warn!(
+                challenge_id = self.challenge_id,
+                err = %e,
+                event = "record_challenge_rebroadcast_failed",
+                "record_challenge_rebroadcast failed"
+            );
         }
     }
 
     async fn on_submitted(&self, hash: B256, l1_block: u64) {
         info!(
-            kind = self.kind.as_str(),
+            event = "resolve_confirmed",
             challenge_id = self.challenge_id,
             batch_index = self.batch_index,
-            %hash,
+            kind = self.kind.as_str(),
+            tx_hash = %hash,
             l1_block,
-            "resolve confirmed on L1"
+            "resolve confirmed"
         );
         if let Err(e) =
             db::record_challenge_submitted(&self.shared.db_tx, self.challenge_id, l1_block).await
         {
-            tracing::error!(challenge_id = self.challenge_id, err = %e, "record_challenge_submitted failed");
+            warn!(
+                challenge_id = self.challenge_id,
+                err = %e,
+                event = "record_challenge_submitted_failed",
+                "record_challenge_submitted failed"
+            );
         }
         crate::metrics::counter_resolve_submitted(self.kind.as_str());
     }
 
     async fn on_reverted(&self, hash: B256, kind: RevertKind) {
         warn!(
-            kind = self.kind.as_str(),
+            event = "resolve_reverted",
             challenge_id = self.challenge_id,
             batch_index = self.batch_index,
-            %hash,
-            ?kind,
-            "resolve REVERTED on L1 — alert + retry"
+            kind = self.kind.as_str(),
+            tx_hash = %hash,
+            revert_kind = kind.as_str(),
+            "resolve reverted"
         );
         crate::metrics::counter_resolve_rejected(self.kind.as_str());
         // Roll back to the fresh-dispatch entry point so the worker re-runs
@@ -1166,7 +1258,13 @@ impl RbfObserver for ResolveObserver<'_> {
         )
         .await
         {
-            tracing::error!(challenge_id = self.challenge_id, err = %e, "rollback_challenge_dispatch (reverted) failed");
+            warn!(
+                challenge_id = self.challenge_id,
+                err = %e,
+                event = "rollback_challenge_dispatch_failed",
+                reason = "reverted",
+                "rollback_challenge_dispatch failed"
+            );
         }
     }
 
@@ -1186,7 +1284,13 @@ impl RbfObserver for ResolveObserver<'_> {
         )
         .await
         {
-            tracing::error!(challenge_id = self.challenge_id, err = %e, "rollback_challenge_dispatch (pre-receipt) failed");
+            warn!(
+                challenge_id = self.challenge_id,
+                err = %e,
+                event = "rollback_challenge_dispatch_failed",
+                reason = "pre_receipt",
+                "rollback_challenge_dispatch failed"
+            );
         }
     }
 
