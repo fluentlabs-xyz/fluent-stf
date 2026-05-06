@@ -69,7 +69,6 @@ mod l1_listener;
 mod metrics;
 mod orchestrator;
 mod rbf;
-mod tracing_format;
 mod types;
 
 use std::{

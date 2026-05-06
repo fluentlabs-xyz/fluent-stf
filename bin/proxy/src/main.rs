@@ -66,7 +66,7 @@ use sp1_sdk::{
 };
 
 use c_kzg::{Blob as CKzgBlob, KzgSettings};
-use tracing::info;
+use tracing::{info, warn, Instrument};
 
 pub fn rpc_url() -> String {
     if let Ok(url) = env::var("RPC_URL") {
@@ -186,6 +186,7 @@ async fn require_api_key(
     let provided = headers.get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("");
 
     if provided != state.api_key {
+        warn!(event = "auth_rejected", "auth rejected — invalid or missing x-api-key");
         return (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse { error: "Invalid or missing x-api-key".into() }),
@@ -318,6 +319,7 @@ async fn build_client_input(
 /// Body: bincode-serialized `EthClientExecutorInput`, optionally zstd-compressed
 /// (indicated by `Content-Encoding: zstd`).
 /// Headers: `Content-Type: application/octet-stream`.
+#[tracing::instrument(skip_all, fields(block_number = tracing::field::Empty))]
 async fn sign_block_execution(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -325,6 +327,9 @@ async fn sign_block_execution(
 ) -> Result<Json<EthExecutionResponse>, HandlerError> {
     let body = maybe_decompress(&headers, &body)?;
     let input = decode_bincode::<EthClientExecutorInput>(&body)?;
+    let block_number = input.current_block.header.number;
+    tracing::Span::current().record("block_number", block_number);
+    info!(event = "sign_block_execution_received", "sign-block-execution request received");
 
     let response = enclave::execute_block(input, state.nitro, state.att_cfg.clone())
         .await
@@ -367,6 +372,7 @@ fn decode_bincode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Hand
 /// Caller (witness-orchestrator) passes pre-built EIP-4844 blobs reconstructed
 /// from L2 transaction data; the proxy forwards them to the enclave for
 /// signing. No L1 / Beacon API access on this path.
+#[tracing::instrument(skip_all, fields(from_block = req.from_block, to_block = req.to_block, num_blobs = req.blobs.len()))]
 async fn sign_batch_root(
     State(state): State<AppState>,
     Json(req): Json<SignBatchRootRequest>,
@@ -381,6 +387,8 @@ async fn sign_batch_root(
     if req.blobs.is_empty() {
         return Err(bad_request("blobs field is required and must not be empty"));
     }
+
+    info!(event = "sign_batch_root_received", "sign-batch-root request received");
 
     // Blobs are now provided by the courier — no L1/Beacon fetch needed
     let outcome = enclave::submit_batch(
@@ -421,6 +429,13 @@ async fn sign_batch_root(
 /// `rsp_blob_builder::build_blobs_from_l2`). The proxy is a thin SP1
 /// forwarder on this path: no L1 / Beacon access, no host-execute, no
 /// witness-hub lookup.
+#[tracing::instrument(
+    skip_all,
+    fields(
+        block_number = tracing::field::Empty,
+        request_id = tracing::field::Empty,
+    ),
+)]
 async fn challenge_sp1_request(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -446,21 +461,26 @@ async fn challenge_sp1_request(
     stdin.write_slice(&serialized_blobs);
 
     let challenge_id = B256::random();
+    let request_id_hex = hex::encode(challenge_id);
+    tracing::Span::current().record("block_number", block_number);
+    tracing::Span::current().record("request_id", request_id_hex.as_str());
 
     if let Some(db) = db::db() {
         db.create_challenge(challenge_id, block_number);
     }
 
     info!(
-        block_number,
+        event = "challenge_proof_accepted",
         num_blobs = raw_blobs.len(),
-        challenge_id = %hex::encode(challenge_id),
-        "Challenge proof request accepted, starting background retry loop"
+        "challenge proof accepted, starting background retry loop",
     );
 
     let client = sp1.client.clone();
     let pk = sp1.pk.clone();
-    tokio::spawn(challenge::run_challenge_proof(client, pk, stdin, challenge_id, block_number));
+    tokio::spawn(
+        challenge::run_challenge_proof(client, pk, stdin, challenge_id, block_number)
+            .in_current_span(),
+    );
 
     Ok(Json(Sp1RequestResponse { request_id: challenge_id }))
 }
@@ -468,6 +488,7 @@ async fn challenge_sp1_request(
 /// `POST /challenge/sp1/status`
 /// Body: `{ request_id }`
 /// Returns: `Sp1ProofResponse` (200) | 202 Accepted (pending) | 404 (not found)
+#[tracing::instrument(skip_all, fields(request_id = %hex::encode(req.request_id)))]
 async fn challenge_sp1_status(Json(req): Json<Sp1StatusRequest>) -> impl IntoResponse {
     let challenge_id = req.request_id;
 
@@ -487,7 +508,7 @@ async fn challenge_sp1_status(Json(req): Json<Sp1StatusRequest>) -> impl IntoRes
     match row.status.as_str() {
         "completed" => {
             let proof_bytes = row.proof_bytes.unwrap_or_default();
-            info!(challenge_id = %hex::encode(challenge_id), "Challenge proof ready");
+            info!(event = "challenge_proof_ready", "challenge proof ready");
             (StatusCode::OK, Json(Sp1ProofResponse { proof_bytes })).into_response()
         }
         "failed" => {
@@ -495,7 +516,7 @@ async fn challenge_sp1_status(Json(req): Json<Sp1StatusRequest>) -> impl IntoRes
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error })).into_response()
         }
         _ => {
-            info!(challenge_id = %hex::encode(challenge_id), "Challenge proof still pending");
+            info!(event = "challenge_proof_pending", "challenge proof pending");
             StatusCode::ACCEPTED.into_response()
         }
     }
@@ -515,15 +536,24 @@ async fn resume_all_pending_challenges(sp1_state: &Sp1State) {
         db.load_pending_challenges()
     };
     if rows.is_empty() {
-        info!("No pending challenges to resume");
+        info!(event = "challenge_resume_none", "no pending challenges to resume");
         return;
     }
-    info!(count = rows.len(), "Resuming pending challenges");
+    info!(event = "challenge_resume_started", count = rows.len(), "resuming pending challenges");
     for row in rows {
         match row.sp1_request_id {
             Some(sp1_id) => {
                 let client = sp1_state.client.clone();
-                tokio::spawn(challenge::resume_challenge_proof(client, row.challenge_id, sp1_id));
+                let request_id_hex = hex::encode(row.challenge_id);
+                tokio::spawn(
+                    challenge::resume_challenge_proof(client, row.challenge_id, sp1_id).instrument(
+                        tracing::info_span!(
+                            "challenge_resume_worker",
+                            worker = "challenge_resume",
+                            request_id = %request_id_hex,
+                        ),
+                    ),
+                );
             }
             None => {
                 if let Some(db) = crate::db::db() {
@@ -547,6 +577,7 @@ async fn resume_all_pending_challenges(sp1_state: &Sp1State) {
 /// from L2 RPC and reconstructs blobs from L2 tx data via blob-builder.
 /// Body: `{ block_number?, block_hash?, batch_index }`. Returns
 /// `{ success, error? }`.
+#[tracing::instrument(skip_all, fields(batch_index = req.batch_index, block_number = tracing::field::Empty))]
 async fn mock_sp1_request(
     State(state): State<AppState>,
     Json(req): Json<MockSp1Request>,
@@ -559,16 +590,17 @@ async fn mock_sp1_request(
 
     let l1 = require_l1(&state)?;
 
-    tracing::info!(
-        block_number = ?req.block_number,
-        block_hash = ?req.block_hash,
-        batch_index = req.batch_index,
-        "Starting mock SP1 local execution"
+    info!(
+        event = "mock_sp1_received",
+        requested_block_number = ?req.block_number,
+        requested_block_hash = ?req.block_hash,
+        "mock sp1 execution received",
     );
 
     let raw_blobs = fetch_challenge_blobs(l1, req.batch_index).await?;
     let client_input = build_client_input(req.block_number, req.block_hash, &state.chain).await?;
     let block_number = client_input.current_block.header.number;
+    tracing::Span::current().record("block_number", block_number);
     let blob_input = prepare_blob_input(&raw_blobs)?;
 
     let mut stdin = SP1Stdin::new();
@@ -579,7 +611,7 @@ async fn mock_sp1_request(
         .map_err(|e| internal(format!("Failed to serialize blob input: {e}")))?;
     stdin.write_slice(&serialized_blobs);
 
-    info!(block_number, "Executing SP1 program locally (CPU)");
+    info!(event = "mock_sp1_executing", "executing sp1 program locally (cpu)");
 
     let handle = tokio::runtime::Handle::current();
     let result = tokio::task::spawn_blocking(move || {
@@ -594,14 +626,14 @@ async fn mock_sp1_request(
     match result {
         Ok((_public_values, report)) => {
             info!(
-                block_number,
+                event = "mock_sp1_done",
                 total_instructions = report.total_instruction_count(),
-                "Mock SP1 execution succeeded"
+                "mock sp1 execution succeeded",
             );
             Ok(Json(MockSp1Response { success: true, error: None }))
         }
         Err(e) => {
-            tracing::warn!(block_number, err = %e, "Mock SP1 execution failed");
+            warn!(event = "mock_sp1_failed", err = %e, "mock sp1 execution failed");
             Ok(Json(MockSp1Response { success: false, error: Some(format!("{e}")) }))
         }
     }
@@ -611,9 +643,44 @@ async fn mock_sp1_request(
 // Entry-point
 // ---------------------------------------------------------------------------
 
+/// Default `EnvFilter` directives. Trims noisy external crates to `warn` so
+/// production logs are not drowned by RPC retry / connection-pool / vsock
+/// chatter. `RUST_LOG`, when set, replaces this list verbatim; last directive
+/// wins, so operators can re-enable any crate (e.g. `RUST_LOG=info,alloy=debug`).
+const DEFAULT_TRACING_DIRECTIVES: &str = "info,\
+    alloy=warn,\
+    reth=warn,\
+    hyper=warn,\
+    hyper_util=warn,\
+    reqwest=warn,\
+    tower=warn,\
+    h2=warn";
+
+fn init_tracing() {
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_TRACING_DIRECTIVES));
+
+    let format = std::env::var("LOG_FORMAT").unwrap_or_else(|_| "pretty".into());
+    let deploy_env = std::env::var("DEPLOY_ENV").unwrap_or_else(|_| "unknown".into());
+
+    match format.as_str() {
+        "json" => {
+            let layer = fmt::layer().with_ansi(false).event_format(
+                tracing_format::ServiceJson::new("proxy", env!("CARGO_PKG_VERSION"), deploy_env),
+            );
+            tracing_subscriber::registry().with(env_filter).with(layer).init();
+        }
+        _ => {
+            tracing_subscriber::registry().with(env_filter).with(fmt::layer()).init();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
 
     let db_path = std::env::var("PROXY_DB_PATH").unwrap_or_else(|_| "./proxy.db".into());
     db::init(&db_path)?;
@@ -622,7 +689,10 @@ async fn main() -> eyre::Result<()> {
     let mut sp1_elf_bytes: Option<Arc<Vec<u8>>> = None;
     let sp1: Option<LazySp1> = match std::env::var("SP1_ELF_PATH") {
         Err(_) => {
-            info!("SP1_ELF_PATH not set — /challenge/sp1 endpoints disabled");
+            info!(
+                event = "sp1_disabled",
+                "sp1_elf_path not set — /challenge/sp1 endpoints disabled"
+            );
             None
         }
         Ok(elf_path) => {
@@ -634,22 +704,29 @@ async fn main() -> eyre::Result<()> {
             let cell = Arc::new(OnceCell::new());
             let cell_clone = cell.clone();
 
-            tokio::spawn(async move {
-                let elf = Elf::from(elf_bytes);
-                let client =
-                    ProverClient::builder().network_for(NetworkMode::Mainnet).build().await;
-                let pk = client.setup(elf).await.unwrap();
-                let vk = pk.verifying_key();
-                info!(vk_hash = %hex::encode(vk.hash_bytes()), "SP1 prover initialised (background)");
-                let state = Sp1State { client: Arc::new(client), pk: Arc::new(pk) };
-                let _ = cell_clone.set(state.clone());
-                // Now that SP1 is ready, resume any in-flight challenge
-                // proofs whose `tokio::spawn` worker did not survive the
-                // process restart.
-                resume_all_pending_challenges(&state).await;
-            });
+            tokio::spawn(
+                async move {
+                    let elf = Elf::from(elf_bytes);
+                    let client =
+                        ProverClient::builder().network_for(NetworkMode::Mainnet).build().await;
+                    let pk = client.setup(elf).await.unwrap();
+                    let vk = pk.verifying_key();
+                    info!(
+                        event = "sp1_prover_initialised",
+                        vk_hash = %vk.bytes32(),
+                        "sp1 prover initialised (background)",
+                    );
+                    let state = Sp1State { client: Arc::new(client), pk: Arc::new(pk) };
+                    let _ = cell_clone.set(state.clone());
+                    // Now that SP1 is ready, resume any in-flight challenge
+                    // proofs whose `tokio::spawn` worker did not survive the
+                    // process restart.
+                    resume_all_pending_challenges(&state).await;
+                }
+                .instrument(tracing::info_span!("sp1_init", worker = "sp1_init")),
+            );
 
-            info!("SP1 prover initialization started in background");
+            info!(event = "sp1_init_started", "sp1 prover initialization started in background");
             Some(cell)
         }
     };
@@ -671,16 +748,20 @@ async fn main() -> eyre::Result<()> {
                 env::var("L1_ROLLUP_DEPLOY_BLOCK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
 
             info!(
+                event = "l1_context_initialized",
                 l1_rpc = %l1_rpc,
                 contract_addr = %l1_addr,
                 deploy_block,
-                "L1 context initialized for batch metadata lookup"
+                "l1 context initialized for batch metadata lookup",
             );
 
             Some(L1State { l1_provider, contract_addr, deploy_block })
         }
         _ => {
-            info!("L1_RPC_URL/L1_ROLLUP_ADDR not set — challenge endpoints disabled");
+            info!(
+                event = "l1_disabled",
+                "l1_rpc_url/l1_rollup_addr not set — challenge endpoints disabled"
+            );
             None
         }
     };
@@ -690,12 +771,14 @@ async fn main() -> eyre::Result<()> {
     let att_cfg: Option<Arc<attestation::AttestationConfig>> =
         match attestation::AttestationConfig::from_env().await {
             Ok(cfg) => {
-                info!("AttestationConfig initialised");
+                info!(event = "attestation_config_initialised", "attestation config initialised");
                 Some(Arc::new(cfg))
             }
             Err(e) => {
-                tracing::warn!(
-                    "AttestationConfig unavailable: {e} — running without attestation proving"
+                warn!(
+                    event = "attestation_config_unavailable",
+                    err = %e,
+                    "attestation config unavailable — running without attestation proving",
                 );
                 None
             }
@@ -704,7 +787,7 @@ async fn main() -> eyre::Result<()> {
     attestation::driver::resume_all_pending(att_cfg.as_ref()).await;
 
     attestation::driver::ensure_handshake(&nitro, att_cfg.as_ref()).await?;
-    info!("Nitro enclave handshake complete");
+    info!(event = "enclave_handshake_complete", "nitro enclave handshake complete");
 
     let api_key = std::env::var("API_KEY")?;
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
@@ -726,7 +809,7 @@ async fn main() -> eyre::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-    info!("Listening on {listen_addr}");
+    info!(event = "proxy_listening", listen_addr = %listen_addr, "proxy listening");
     axum::serve(listener, app).await?;
 
     Ok(())

@@ -12,6 +12,7 @@ members = [
     "crates/batch-merkle",
     "crates/l1-rollup-client",
     "bin/witness-orchestrator",
+    "crates/tracing-format",
 ]
 exclude = []
 resolver = "2"
@@ -100,6 +101,7 @@ fluent-stf-primitives = { path = "./crates/primitives", default-features = false
 rsp-provider = { path = "./crates/provider" }
 nitro-types = { path = "./crates/nitro-types" }
 witness-orchestrator = { path = "./bin/witness-orchestrator", package = "witness-orchestrator-bin" }
+tracing-format = { path = "./crates/tracing-format" }
 
 # --- sp1 ---
 sp1-core-executor = { version = "6.1.0", features = ["bigint-rug"] }

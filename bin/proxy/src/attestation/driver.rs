@@ -3,7 +3,7 @@
 use std::{sync::Arc, time::Duration};
 
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::types::NitroConfig;
 
@@ -31,20 +31,26 @@ pub(crate) async fn ensure_handshake(
         crate::enclave::handshake_with_enclave(enclave).await?;
 
     if !is_new_key {
-        info!("Handshake: enclave already initialised");
+        info!(event = "enclave_already_initialised", "handshake: enclave already initialised");
         return Ok(());
     }
 
     if let Some(db) = crate::db::db() {
         db.insert_pending_attestation(&public_key, &attestation);
     }
-    info!("Handshake: new enclave key generated, pending attestation row inserted");
+    info!(
+        event = "enclave_handshake_new_key",
+        "handshake: new enclave key generated, pending attestation row inserted"
+    );
 
     match att_cfg {
         Some(cfg) => {
             tokio::spawn(run_prove_loop(public_key, attestation, cfg.clone()));
         }
-        None => warn!("AttestationConfig not configured — skipping background prove task"),
+        None => warn!(
+            event = "attestation_config_unavailable_skip_spawn",
+            "attestation config not configured — skipping background prove task"
+        ),
     }
 
     Ok(())
@@ -57,7 +63,10 @@ pub(crate) async fn ensure_handshake(
 /// than a duplicate spawn.
 pub(crate) async fn resume_all_pending(att_cfg: Option<&Arc<AttestationConfig>>) {
     let Some(cfg) = att_cfg else {
-        info!("AttestationConfig not configured — no pending attestations will be resumed");
+        info!(
+            event = "attestation_resume_skipped_no_config",
+            "attestation config not configured — no pending attestations will be resumed"
+        );
         return;
     };
 
@@ -67,11 +76,15 @@ pub(crate) async fn resume_all_pending(att_cfg: Option<&Arc<AttestationConfig>>)
     };
 
     if rows.is_empty() {
-        info!("No pending attestations to resume");
+        info!(event = "attestation_resume_none", "no pending attestations to resume");
         return;
     }
 
-    info!(count = rows.len(), "Resuming pending attestations");
+    info!(
+        event = "attestation_resume_started",
+        count = rows.len(),
+        "resuming pending attestations"
+    );
     for row in rows {
         tokio::spawn(run_prove_loop(row.public_key, row.attestation, cfg.clone()));
     }
@@ -82,14 +95,15 @@ async fn run_prove_loop(public_key: Vec<u8>, attestation: Vec<u8>, cfg: Arc<Atte
     loop {
         match prove_and_submit_for_key(&cfg, &public_key, &attestation).await {
             Ok(()) => {
-                info!(pk = %pk_hex, "Attestation complete — L1 submission confirmed");
+                info!(event = "attestation_complete", enclave_pubkey = %pk_hex, "attestation complete — l1 submission confirmed");
                 return;
             }
             Err(e) => {
-                error!(
-                    pk = %pk_hex,
+                warn!(
+                    event = "attestation_run_failed",
+                    enclave_pubkey = %pk_hex,
                     err = %e,
-                    "Attestation run failed — retrying in 30s"
+                    "attestation run failed — retrying in 30s",
                 );
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }

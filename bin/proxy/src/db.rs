@@ -2,7 +2,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use revm_primitives::B256;
 use rusqlite::{params, Connection};
-use tracing::error;
+use tracing::{error, warn};
 
 static DB: OnceLock<Mutex<Db>> = OnceLock::new();
 
@@ -16,7 +16,7 @@ pub(crate) fn db() -> Option<MutexGuard<'static, Db>> {
     match mutex.lock() {
         Ok(guard) => Some(guard),
         Err(e) => {
-            error!("DB mutex poisoned: {e}");
+            error!(event = "db_mutex_poisoned", err = %e, "db mutex poisoned");
             None
         }
     }
@@ -67,26 +67,28 @@ impl Db {
              ON CONFLICT(public_key) DO NOTHING",
             params![public_key, attestation, now],
         ) {
-            error!(err = %e, "Failed to insert pending_attestation");
+            warn!(event = "db_insert_pending_attestation_failed", err = %e, "db insert pending_attestation failed");
         }
     }
 
     pub(crate) fn load_pending_attestations(&self) -> Vec<PendingAttestation> {
-        let mut stmt =
-            match self.conn.prepare("SELECT public_key, attestation FROM pending_attestation") {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(err = %e, "Failed to prepare load_pending_attestations");
-                    return Vec::new();
-                }
-            };
+        let mut stmt = match self
+            .conn
+            .prepare("SELECT public_key, attestation FROM pending_attestation")
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(event = "db_load_pending_attestations_prepare_failed", err = %e, "db load_pending_attestations prepare failed");
+                return Vec::new();
+            }
+        };
         let rows = stmt.query_map([], |row| {
             Ok(PendingAttestation { public_key: row.get(0)?, attestation: row.get(1)? })
         });
         match rows {
             Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
             Err(e) => {
-                error!(err = %e, "Failed to query pending_attestation");
+                warn!(event = "db_query_pending_attestation_failed", err = %e, "db query pending_attestation failed");
                 Vec::new()
             }
         }
@@ -109,7 +111,7 @@ impl Db {
             "UPDATE pending_attestation SET request_id = ?2 WHERE public_key = ?1",
             params![public_key, request_id.as_slice()],
         ) {
-            error!(err = %e, "Failed to update request_id");
+            warn!(event = "db_update_request_id_failed", err = %e, "db update request_id failed");
         }
     }
 
@@ -118,7 +120,7 @@ impl Db {
             "UPDATE pending_attestation SET request_id = NULL WHERE public_key = ?1",
             params![public_key],
         ) {
-            error!(err = %e, "Failed to clear request_id");
+            warn!(event = "db_clear_request_id_failed", err = %e, "db clear request_id failed");
         }
     }
 
@@ -127,7 +129,7 @@ impl Db {
             .conn
             .execute("DELETE FROM pending_attestation WHERE public_key = ?1", params![public_key])
         {
-            error!(err = %e, "Failed to delete pending_attestation");
+            warn!(event = "db_delete_pending_attestation_failed", err = %e, "db delete pending_attestation failed");
         }
     }
 
@@ -143,7 +145,7 @@ impl Db {
              VALUES(?1, ?2, 'pending', ?3)",
             params![challenge_id.as_slice(), block_number, now],
         ) {
-            error!(err = %e, "Failed to create challenge");
+            warn!(event = "db_create_challenge_failed", err = %e, "db create challenge failed");
         }
     }
 
@@ -152,7 +154,7 @@ impl Db {
             "UPDATE challenges SET sp1_request_id = ?2 WHERE challenge_id = ?1",
             params![challenge_id.as_slice(), sp1_request_id.as_slice()],
         ) {
-            error!(err = %e, "Failed to update challenge sp1_request_id");
+            warn!(event = "db_update_challenge_sp1_request_id_failed", err = %e, "db update challenge sp1_request_id failed");
         }
     }
 
@@ -167,7 +169,7 @@ impl Db {
              WHERE challenge_id = ?1",
             params![challenge_id.as_slice(), proof_bytes, public_values,],
         ) {
-            error!(err = %e, "Failed to set challenge completed");
+            warn!(event = "db_set_challenge_completed_failed", err = %e, "db set challenge completed failed");
         }
     }
 
@@ -176,7 +178,7 @@ impl Db {
             "UPDATE challenges SET status = 'failed', error = ?2 WHERE challenge_id = ?1",
             params![challenge_id.as_slice(), err_msg],
         ) {
-            error!(err = %e, "Failed to set challenge failed");
+            warn!(event = "db_set_challenge_failed_failed", err = %e, "db set challenge failed failed");
         }
     }
 
@@ -211,7 +213,7 @@ impl Db {
         {
             Ok(s) => s,
             Err(e) => {
-                error!(err = %e, "Failed to prepare load_pending_challenges");
+                warn!(event = "db_load_pending_challenges_prepare_failed", err = %e, "db load_pending_challenges prepare failed");
                 return Vec::new();
             }
         };
@@ -231,7 +233,7 @@ impl Db {
         match rows {
             Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
             Err(e) => {
-                error!(err = %e, "Failed to query pending challenges");
+                warn!(event = "db_query_pending_challenges_failed", err = %e, "db query pending challenges failed");
                 Vec::new()
             }
         }

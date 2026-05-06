@@ -20,6 +20,7 @@ serde_json.workspace = true
 eyre.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-format.workspace = true
 bytes.workspace = true
 axum = { workspace = true }
 metrics.workspace = true

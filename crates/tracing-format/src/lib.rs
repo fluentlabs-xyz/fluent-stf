@@ -26,7 +26,8 @@ use tracing_subscriber::{
 };
 
 /// Wraps the stock JSON event formatter and prepends static identity fields.
-pub(crate) struct ServiceJson {
+#[derive(Debug)]
+pub struct ServiceJson {
     inner: Format<Json, SystemTime>,
     service: &'static str,
     version: &'static str,
@@ -34,7 +35,7 @@ pub(crate) struct ServiceJson {
 }
 
 impl ServiceJson {
-    pub(crate) fn new(service: &'static str, version: &'static str, env: String) -> Self {
+    pub fn new(service: &'static str, version: &'static str, env: String) -> Self {
         let inner = tracing_subscriber::fmt::format()
             .json()
             .flatten_event(true)

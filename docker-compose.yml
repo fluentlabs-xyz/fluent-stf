@@ -50,6 +50,8 @@ services:
       LISTEN_ADDR: ${PROXY_LISTEN_ADDR}
       PROXY_DB_PATH: ${PROXY_DB_PATH}
       RUST_LOG: ${RUST_LOG}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
       L1_RPC_URL: ${L1_RPC_URL:?L1_RPC_URL is required in .env}
       L1_ROLLUP_ADDR: ${L1_ROLLUP_ADDR:?L1_ROLLUP_ADDR is required in .env}

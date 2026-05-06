@@ -34,9 +34,10 @@ pub(crate) async fn run_challenge_proof(
     loop {
         if started.elapsed() > RUN_CHALLENGE_OUTER_BUDGET {
             warn!(
-                challenge_id = %hex::encode(challenge_id),
+                event = "challenge_outer_budget_exceeded",
+                request_id = %hex::encode(challenge_id),
                 elapsed_secs = started.elapsed().as_secs(),
-                "run_challenge_proof: outer budget exceeded — giving up"
+                "challenge outer budget exceeded — giving up",
             );
             if let Some(db) = crate::db::db() {
                 db.set_challenge_failed(challenge_id, "outer wall-clock budget exceeded");
@@ -47,9 +48,11 @@ pub(crate) async fn run_challenge_proof(
         let whitelist = match fetch_ha_whitelist(&blacklist).await {
             Ok(w) => w,
             Err(e) => {
-                tracing::error!(
-                    challenge_id = %hex::encode(challenge_id),
-                    "Failed to fetch HA whitelist: {e}"
+                warn!(
+                    event = "fetch_ha_whitelist_failed",
+                    request_id = %hex::encode(challenge_id),
+                    err = %e,
+                    "fetch ha whitelist failed",
                 );
                 if let Some(db) = crate::db::db() {
                     db.set_challenge_failed(challenge_id, &format!("{e}"));
@@ -59,11 +62,12 @@ pub(crate) async fn run_challenge_proof(
         };
 
         info!(
-            challenge_id = %hex::encode(challenge_id),
+            event = "sp1_request_submitting",
+            request_id = %hex::encode(challenge_id),
             block_number,
             whitelist_size = whitelist.len(),
             blacklist_size = blacklist.len(),
-            "Submitting challenge proof to SP1 network"
+            "submitting challenge proof to sp1 network",
         );
 
         let id = match client
@@ -76,9 +80,11 @@ pub(crate) async fn run_challenge_proof(
         {
             Ok(id) => id,
             Err(e) => {
-                tracing::error!(
-                    challenge_id = %hex::encode(challenge_id),
-                    "Challenge proof request failed: {e}"
+                warn!(
+                    event = "sp1_request_submit_failed",
+                    request_id = %hex::encode(challenge_id),
+                    err = %e,
+                    "sp1 request submit failed",
                 );
                 if let Some(db) = crate::db::db() {
                     db.set_challenge_failed(challenge_id, &format!("{e}"));
@@ -92,16 +98,18 @@ pub(crate) async fn run_challenge_proof(
         }
 
         info!(
-            challenge_id = %hex::encode(challenge_id),
+            event = "sp1_request_submitted",
+            request_id = %hex::encode(challenge_id),
             sp1_request_id = %hex::encode(id),
-            "Challenge proof submitted"
+            "challenge proof submitted",
         );
 
         match client.wait_proof(id, Some(WAIT_PROOF_TIMEOUT), None).await {
             Ok(proof) => {
                 info!(
-                    challenge_id = %hex::encode(challenge_id),
-                    "Challenge proof ready"
+                    event = "sp1_proof_ready",
+                    request_id = %hex::encode(challenge_id),
+                    "sp1 proof ready",
                 );
 
                 let proof_bytes = proof.bytes();
@@ -122,9 +130,11 @@ pub(crate) async fn run_challenge_proof(
                 });
 
                 if !is_retriable {
-                    tracing::error!(
-                        challenge_id = %hex::encode(challenge_id),
-                        "Challenge proof failed (non-retriable): {e}"
+                    warn!(
+                        event = "sp1_proof_failed_non_retriable",
+                        request_id = %hex::encode(challenge_id),
+                        err = %e,
+                        "sp1 proof failed (non-retriable)",
                     );
                     if let Some(db) = crate::db::db() {
                         db.set_challenge_failed(challenge_id, &format!("{e}"));
@@ -133,24 +143,27 @@ pub(crate) async fn run_challenge_proof(
                 }
 
                 if let Some(fulfiller) = identify_fulfiller(&client, id).await {
-                    tracing::warn!(
-                        challenge_id = %hex::encode(challenge_id),
+                    warn!(
+                        event = "challenge_prover_unfulfillable",
+                        request_id = %hex::encode(challenge_id),
                         fulfiller = %fulfiller,
-                        "Challenge prover returned unfulfillable — blacklisting"
+                        "challenge prover returned unfulfillable — blacklisting",
                     );
                     blacklist.insert(fulfiller);
                 } else {
-                    tracing::warn!(
-                        challenge_id = %hex::encode(challenge_id),
-                        "Challenge proof failed, could not identify fulfiller"
+                    warn!(
+                        event = "challenge_prover_unfulfillable_unknown",
+                        request_id = %hex::encode(challenge_id),
+                        "challenge proof failed, could not identify fulfiller",
                     );
                 }
 
                 let ha_count = fetch_ha_prover_count().await.unwrap_or(0);
                 if ha_count > 0 && blacklist.len() >= ha_count {
-                    tracing::warn!(
-                        "All HA provers blacklisted ({}) — resetting blacklist",
-                        blacklist.len()
+                    warn!(
+                        event = "ha_blacklist_reset",
+                        blacklist_size = blacklist.len(),
+                        "all ha provers blacklisted — resetting blacklist",
                     );
                     blacklist.clear();
                 }
@@ -174,9 +187,10 @@ pub(crate) async fn resume_challenge_proof(
     sp1_request_id: B256,
 ) {
     info!(
-        challenge_id = %hex::encode(challenge_id),
+        event = "challenge_resume_starting",
+        request_id = %hex::encode(challenge_id),
         sp1_request_id = %hex::encode(sp1_request_id),
-        "Resuming challenge proof from saved request_id"
+        "resuming challenge proof from saved request id",
     );
     match client.wait_proof(sp1_request_id, Some(WAIT_PROOF_TIMEOUT), None).await {
         Ok(proof) => {
@@ -186,15 +200,17 @@ pub(crate) async fn resume_challenge_proof(
                 db.set_challenge_completed(challenge_id, &proof_bytes, &public_values);
             }
             info!(
-                challenge_id = %hex::encode(challenge_id),
-                "Resumed challenge proof completed"
+                event = "challenge_resume_done",
+                request_id = %hex::encode(challenge_id),
+                "challenge resume done",
             );
         }
         Err(e) => {
             warn!(
-                challenge_id = %hex::encode(challenge_id),
+                event = "challenge_resume_failed",
+                request_id = %hex::encode(challenge_id),
                 err = %e,
-                "Resume failed — marking failed; orchestrator will re-issue"
+                "challenge resume failed — marking failed; orchestrator will re-issue",
             );
             if let Some(db) = crate::db::db() {
                 db.set_challenge_failed(challenge_id, &format!("resume failed: {e}"));

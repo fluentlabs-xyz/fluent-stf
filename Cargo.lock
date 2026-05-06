@@ -6952,6 +6952,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-format",
  "tracing-subscriber 0.3.23",
  "url",
  "vsock",
@@ -11371,6 +11372,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-format"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "tracing-futures"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13018,6 +13028,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-format",
  "tracing-subscriber 0.3.23",
  "url",
  "zstd",

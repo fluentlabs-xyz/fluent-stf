@@ -49,8 +49,9 @@ impl AttestationConfig {
             .map_err(|e| eyre!("Failed to setup nitro validator proving key: {e}"))?;
 
         info!(
+            event = "nitro_validator_sp1_initialised",
             vk_hash = %pk.verifying_key().bytes32(),
-            "Nitro validator SP1 prover initialised"
+            "nitro validator sp1 prover initialised",
         );
 
         let l1_rpc = std::env::var("L1_RPC_URL").map_err(|_| eyre!("L1_RPC_URL not set"))?;
@@ -90,7 +91,7 @@ pub(crate) async fn prove_and_submit_for_key(
     let saved_id = crate::db::db().and_then(|db| db.get_request_id(public_key));
 
     if let Some(id) = saved_id {
-        info!(request_id = %hex::encode(id), "Resuming pending attestation proof");
+        info!(event = "attestation_resume_starting", sp1_request_id = %hex::encode(id), "resuming pending attestation proof");
         match config.prover.wait_proof(id, None, None).await {
             Ok(proof) => {
                 submit_proof_to_l1(config, public_key, &proof).await?;
@@ -100,7 +101,7 @@ pub(crate) async fn prove_and_submit_for_key(
                 return Ok(());
             }
             Err(e) => {
-                warn!("Failed to resume saved proof: {e} — will submit fresh request");
+                warn!(event = "attestation_resume_failed", err = %e, "failed to resume saved proof — will submit fresh request");
                 if let Some(db) = crate::db::db() {
                     db.clear_request_id(public_key);
                 }
@@ -120,9 +121,10 @@ pub(crate) async fn prove_and_submit_for_key(
         let whitelist = fetch_ha_whitelist(&blacklist).await?;
 
         info!(
+            event = "attestation_request_submitting",
             whitelist_size = whitelist.len(),
             blacklist_size = blacklist.len(),
-            "Submitting attestation proof to SP1 network"
+            "submitting attestation proof to sp1 network",
         );
 
         let id = config
@@ -137,7 +139,7 @@ pub(crate) async fn prove_and_submit_for_key(
         if let Some(db) = crate::db::db() {
             db.set_request_id(public_key, id);
         }
-        info!(request_id = %hex::encode(id), "Attestation proof submitted");
+        info!(event = "attestation_request_submitted", sp1_request_id = %hex::encode(id), "attestation proof submitted");
 
         match config.prover.wait_proof(id, None, None).await {
             Ok(proof) => {
@@ -167,17 +169,19 @@ pub(crate) async fn prove_and_submit_for_key(
 
                 if let Some(fulfiller) = identify_fulfiller(&config.prover, id).await {
                     warn!(
-                        request_id = %hex::encode(id),
+                        event = "attestation_prover_unfulfillable",
+                        sp1_request_id = %hex::encode(id),
                         fulfiller = %fulfiller,
-                        error = %e,
-                        "Proof request failed with retriable error — blacklisting fulfiller"
+                        err = %e,
+                        "attestation proof request failed (retriable) — blacklisting fulfiller",
                     );
                     blacklist.insert(fulfiller);
                 } else {
                     warn!(
-                        request_id = %hex::encode(id),
-                        error = %e,
-                        "Proof request failed with retriable error, could not identify fulfiller"
+                        event = "attestation_prover_unfulfillable_unknown",
+                        sp1_request_id = %hex::encode(id),
+                        err = %e,
+                        "attestation proof request failed (retriable) — could not identify fulfiller",
                     );
                 }
 
@@ -187,7 +191,11 @@ pub(crate) async fn prove_and_submit_for_key(
 
                 let ha_count = fetch_ha_prover_count().await.unwrap_or(0);
                 if ha_count > 0 && blacklist.len() >= ha_count {
-                    warn!("All HA provers blacklisted ({}) — resetting blacklist", blacklist.len());
+                    warn!(
+                        event = "ha_blacklist_reset",
+                        blacklist_size = blacklist.len(),
+                        "all ha provers blacklisted — resetting blacklist"
+                    );
                     blacklist.clear();
                 }
             }
@@ -285,9 +293,10 @@ async fn submit_proof_to_l1(
     }
 
     info!(
-        address = %local_address,
+        event = "attestation_l1_submitting",
+        enclave_address = %local_address,
         attestation_time,
-        "Submitting attestation proof to L1"
+        "submitting attestation proof to l1",
     );
 
     let proof_bytes = proof.bytes();
