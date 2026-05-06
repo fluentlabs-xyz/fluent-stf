@@ -1429,10 +1429,10 @@ async fn signer_worker(shared: Arc<OrchestratorShared>) {
         }
 
         'work: {
-            // Cache-completeness gate (not SQL): see `Db::first_accepted_unsigned`.
+            // Cache-completeness gate (not SQL): see `Db::first_signable`.
             let pick: Option<(u64, u64, u64, Vec<EthExecutionResponse>)> = {
                 let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
-                g.first_accepted_unsigned().and_then(|batch_index| {
+                g.first_signable().and_then(|batch_index| {
                     let batch = g.find_batch(batch_index)?;
                     let from_block = batch.from_block;
                     let to_block = batch.to_block;

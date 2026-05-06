@@ -541,17 +541,17 @@ impl Db {
         stmt.query_row(params![batch_index as i64], row_to_batch_row).optional().ok().flatten()
     }
 
-    /// Lowest-index batch ready for `/sign-batch-root`: status=accepted,
-    /// `signature IS NULL`. Caller must additionally check
-    /// `cache.has_range(from, to)` against the in-memory `ResponseCache` —
-    /// gating on the SQL `block_responses` table would slip an extra writer-
-    /// flush cycle (~100 ms per batch) of latency, since the cache is
-    /// always ahead of the async-flushed DB rows.
-    pub(crate) fn first_accepted_unsigned(&self) -> Option<u64> {
+    /// Lowest-index unsigned batch eligible for `/sign-batch-root`. Caller
+    /// must also check `cache.has_range(from, to)` — gating on the SQL
+    /// `block_responses` table would slip ~100 ms of writer-flush latency.
+    /// Wait-for-blob-on-L1 is enforced separately by the dispatcher's
+    /// `preflight()` against on-chain `getBatch.status == SUBMITTED`.
+    pub(crate) fn first_signable(&self) -> Option<u64> {
         self.conn
             .query_row(
                 "SELECT b.batch_index FROM batches b \
-                 WHERE b.status = 'accepted' AND b.signature IS NULL \
+                 WHERE b.status IN ('committed', 'accepted') \
+                   AND b.signature IS NULL \
                  ORDER BY b.batch_index LIMIT 1",
                 [],
                 |row| row.get::<_, i64>(0),
@@ -2331,5 +2331,85 @@ mod tests {
             let row = g.find_batch(5).expect("row still present");
             assert_eq!(row.status, BatchStatus::Accepted);
         }
+    }
+
+    fn dummy_submit_batch_response() -> SubmitBatchResponse {
+        SubmitBatchResponse {
+            batch_root: vec![0u8; 32],
+            versioned_hashes: vec![],
+            signature: vec![0u8; 65],
+        }
+    }
+
+    #[test]
+    fn first_signable_picks_committed_row() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        let arc = Arc::new(std::sync::Mutex::new(db));
+        run_sync_op(
+            &arc,
+            SyncOp::ObserveCommitted { batch_index: 5, from_block: 100, to_block: 110 },
+        );
+        let g = arc.lock().unwrap();
+        assert_eq!(g.first_signable(), Some(5), "Committed + signature NULL must be signable",);
+    }
+
+    #[test]
+    fn first_signable_picks_accepted_row() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        let arc = Arc::new(std::sync::Mutex::new(db));
+        run_sync_op(
+            &arc,
+            SyncOp::ObserveCommitted { batch_index: 5, from_block: 100, to_block: 110 },
+        );
+        run_sync_op(&arc, SyncOp::ObserveSubmitted { batch_index: 5 });
+        let g = arc.lock().unwrap();
+        assert_eq!(
+            g.first_signable(),
+            Some(5),
+            "Accepted + signature NULL must remain signable (back-compat with pre-change behavior)",
+        );
+    }
+
+    #[test]
+    fn first_signable_skips_signed_row() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        let arc = Arc::new(std::sync::Mutex::new(db));
+        run_sync_op(
+            &arc,
+            SyncOp::ObserveCommitted { batch_index: 5, from_block: 100, to_block: 110 },
+        );
+        run_sync_op(
+            &arc,
+            SyncOp::PatchBatch {
+                batch_index: 5,
+                patch: BatchPatch {
+                    signature: Some(Some(dummy_submit_batch_response())),
+                    ..Default::default()
+                },
+            },
+        );
+        let g = arc.lock().unwrap();
+        assert!(
+            g.first_signable().is_none(),
+            "row with non-null signature must be filtered out regardless of status",
+        );
+    }
+
+    #[test]
+    fn first_signable_picks_lowest_index() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        let arc = Arc::new(std::sync::Mutex::new(db));
+        // Reverse insertion order: batch 7 first, then batch 5. Result must
+        // be 5 (lowest index), preserving strict-sequential signing order.
+        run_sync_op(
+            &arc,
+            SyncOp::ObserveCommitted { batch_index: 7, from_block: 200, to_block: 210 },
+        );
+        run_sync_op(
+            &arc,
+            SyncOp::ObserveCommitted { batch_index: 5, from_block: 100, to_block: 110 },
+        );
+        let g = arc.lock().unwrap();
+        assert_eq!(g.first_signable(), Some(5), "must pick lowest-index unsigned row");
     }
 }
