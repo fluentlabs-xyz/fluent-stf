@@ -206,11 +206,7 @@ async fn check_and_fail_if_deadline_expired(
     if current_l1_block <= row.deadline {
         return false;
     }
-    metrics::counter!(
-        "orchestrator_challenge_deadline_expired_total",
-        "kind" => row.kind.as_str(),
-    )
-    .increment(1);
+    crate::metrics::count_challenge_deadline_expired(row.kind.as_str());
     error!(
         event = "challenge_deadline_expired",
         challenge_id = row.challenge_id,
@@ -255,11 +251,7 @@ async fn mark_invariant_violation(shared: &OrchestratorShared, row: &ChallengeRo
         reason,
         "challenge invariant violation — marking failed; operator action required"
     );
-    metrics::counter!(
-        "orchestrator_challenge_invariant_violation_total",
-        "kind" => row.kind.as_str(),
-    )
-    .increment(1);
+    crate::metrics::count_challenge_invariant_violation(row.kind.as_str());
     if let Err(e) = db::record_challenge_failed(&shared.db_tx, row.challenge_id).await {
         warn!(
             challenge_id = row.challenge_id,
@@ -464,11 +456,7 @@ async fn handle_sp1_proving(
         }
         Ok(Sp1StatusOutcome::Pending) => {}
         Err(Sp1StatusError::Lost) => {
-            metrics::counter!(
-                "orchestrator_challenge_sp1_request_lost_total",
-                "kind" => row.kind.as_str(),
-            )
-            .increment(1);
+            crate::metrics::count_challenge_sp1_request_lost(row.kind.as_str());
             warn!(
                 challenge_id = row.challenge_id,
                 %request_id,
@@ -743,11 +731,7 @@ async fn fail_with_reason(shared: &OrchestratorShared, row: &ChallengeRow, reaso
         reason = %reason,
         "pre-broadcast validation failed — marking challenge failed"
     );
-    metrics::counter!(
-        "orchestrator_challenge_pre_broadcast_failed_total",
-        "kind" => row.kind.as_str(),
-    )
-    .increment(1);
+    crate::metrics::count_challenge_pre_broadcast_failed(row.kind.as_str());
     if let Err(e) = db::record_challenge_failed(&shared.db_tx, row.challenge_id).await {
         warn!(
             challenge_id = row.challenge_id,

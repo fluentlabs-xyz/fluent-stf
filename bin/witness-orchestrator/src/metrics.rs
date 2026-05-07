@@ -42,6 +42,20 @@ pub(crate) const L1_RESOLVE_REJECTED_TOTAL: &str = "orchestrator_l1_resolve_reje
 pub(crate) const L1_RESOLVE_PRE_RECEIPT_FAILURE_TOTAL: &str =
     "orchestrator_l1_resolve_pre_receipt_failure_total";
 
+pub(crate) const CHALLENGE_DEADLINE_EXPIRED_TOTAL: &str =
+    "orchestrator_challenge_deadline_expired_total";
+pub(crate) const CHALLENGE_INVARIANT_VIOLATION_TOTAL: &str =
+    "orchestrator_challenge_invariant_violation_total";
+pub(crate) const CHALLENGE_SP1_REQUEST_LOST_TOTAL: &str =
+    "orchestrator_challenge_sp1_request_lost_total";
+pub(crate) const CHALLENGE_PRE_BROADCAST_FAILED_TOTAL: &str =
+    "orchestrator_challenge_pre_broadcast_failed_total";
+pub(crate) const CHALLENGE_REVERTED_POST_MINE_TOTAL: &str =
+    "orchestrator_challenge_reverted_post_mine_total";
+pub(crate) const CHALLENGE_REORG_DETECTED_TOTAL: &str =
+    "orchestrator_challenge_reorg_detected_total";
+pub(crate) const BATCH_REORG_DETECTED_TOTAL: &str = "orchestrator_batch_reorg_detected_total";
+
 // Histogram (not counter) so the cumulative spend is readable via `_sum`;
 // a `u64` counter cannot represent sub-ETH amounts (`0.002 as u64 == 0`).
 pub(crate) const L1_DISPATCH_COST_ETH: &str = "orchestrator_l1_dispatch_cost_eth";
@@ -51,9 +65,12 @@ pub(crate) const NONCE_PENDING_L1: &str = "orchestrator_nonce_pending_l1";
 // Regression sentinel for the defer-allocate invariant — should remain 0.
 pub(crate) const NONCE_LEAKS_TOTAL: &str = "orchestrator_nonce_leaks_total";
 
-/// Go reference: `ExponentialBuckets(0.5, 2, 12)` — 0.5s .. ~2048s.
-const SIGN_DURATION_BUCKETS: &[f64] =
-    &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0];
+/// Go reference: `ExponentialBuckets(0.5, 2, 12)` plus two operator-defensive
+/// buckets at the top so SP1 cold-start outliers up to ~2 h stay measurable
+/// instead of pegging the percentile output at the bucket cap.
+const SIGN_DURATION_BUCKETS: &[f64] = &[
+    0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0,
+];
 
 /// Go reference: `ExponentialBuckets(1e-5, 2, 16)` — 10 μETH .. ~0.6 ETH.
 const COST_ETH_BUCKETS: &[f64] = &[
@@ -166,6 +183,51 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
         "Resolve-tx hard-failures before any receipt (initial broadcast error, \
          stuck-at-cap, nonce advanced). Labels: kind=block|batch_root"
     );
+    metrics::describe_counter!(
+        CHALLENGE_DEADLINE_EXPIRED_TOTAL,
+        "Challenges that crossed the on-chain resolution deadline before a \
+         successful resolveBlockChallenge / resolveBatchRootChallenge tx \
+         mined. Sentinel — operator must call Rollup.revertBatches. \
+         Labels: kind=block|batch_root"
+    );
+    metrics::describe_counter!(
+        CHALLENGE_INVARIANT_VIOLATION_TOTAL,
+        "Challenge rows transitioned to Failed because an invariant the \
+         resolver assumes is violated (missing batch in DB, commitment \
+         outside batch range, etc.). Sentinel — rollup wedged. \
+         Labels: kind=block|batch_root"
+    );
+    metrics::describe_counter!(
+        CHALLENGE_SP1_REQUEST_LOST_TOTAL,
+        "Proxy returned 404 for an SP1 request id we issued — the request \
+         state was lost (proxy restart with stale DB or DB wipe). The \
+         orchestrator clears the request_id and re-issues. \
+         Labels: kind=block|batch_root"
+    );
+    metrics::describe_counter!(
+        CHALLENGE_PRE_BROADCAST_FAILED_TOTAL,
+        "Resolve-tx failed pre-broadcast validation (eth_call simulation \
+         reverted with the signed calldata). Row marked Failed. Labels: \
+         kind=block|batch_root"
+    );
+    metrics::describe_counter!(
+        CHALLENGE_REVERTED_POST_MINE_TOTAL,
+        "Resolve-tx receipt observed status=0 by the finalization ticker \
+         (RBF receipt-watcher missed the failure earlier). RBF state \
+         cleared for retry."
+    );
+    metrics::describe_counter!(
+        CHALLENGE_REORG_DETECTED_TOTAL,
+        "Challenge resolve-tx receipt vanished between observations — \
+         suspected L1 reorg. l1_block cleared so the active worker \
+         re-broadcasts."
+    );
+    metrics::describe_counter!(
+        BATCH_REORG_DETECTED_TOTAL,
+        "preconfirmBatch tx receipt vanished after BatchPreconfirmed event \
+         — suspected L1 reorg. Status rolled back to Dispatched; \
+         dispatcher resumes RBF against the persisted nonce."
+    );
 
     metrics::describe_histogram!(
         L1_DISPATCH_COST_ETH,
@@ -180,8 +242,10 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
     );
     metrics::describe_gauge!(
         NONCE_PENDING_L1,
-        "Last observed eth_getTransactionCount(signer, pending) value. Updated on \
-         bootstrap and on resync."
+        "L1 pending nonce for the orchestrator's submitter wallet \
+         (eth_getTransactionCount(signer, pending)). Refreshed on bootstrap, \
+         after nonce-too-low resync, and once per FINALIZATION_TICK (~30s). \
+         Compare with NONCE_ALLOCATOR_NEXT to spot drift."
     );
     metrics::describe_counter!(
         NONCE_LEAKS_TOTAL,
@@ -230,6 +294,34 @@ pub(crate) fn counter_resolve_rejected(kind: &'static str) {
 
 pub(crate) fn counter_resolve_pre_receipt_failure(kind: &'static str) {
     metrics::counter!(L1_RESOLVE_PRE_RECEIPT_FAILURE_TOTAL, "kind" => kind).increment(1);
+}
+
+pub(crate) fn count_challenge_deadline_expired(kind: &'static str) {
+    metrics::counter!(CHALLENGE_DEADLINE_EXPIRED_TOTAL, "kind" => kind).increment(1);
+}
+
+pub(crate) fn count_challenge_invariant_violation(kind: &'static str) {
+    metrics::counter!(CHALLENGE_INVARIANT_VIOLATION_TOTAL, "kind" => kind).increment(1);
+}
+
+pub(crate) fn count_challenge_sp1_request_lost(kind: &'static str) {
+    metrics::counter!(CHALLENGE_SP1_REQUEST_LOST_TOTAL, "kind" => kind).increment(1);
+}
+
+pub(crate) fn count_challenge_pre_broadcast_failed(kind: &'static str) {
+    metrics::counter!(CHALLENGE_PRE_BROADCAST_FAILED_TOTAL, "kind" => kind).increment(1);
+}
+
+pub(crate) fn count_challenge_reverted_post_mine() {
+    metrics::counter!(CHALLENGE_REVERTED_POST_MINE_TOTAL).increment(1);
+}
+
+pub(crate) fn count_challenge_reorg_detected() {
+    metrics::counter!(CHALLENGE_REORG_DETECTED_TOTAL).increment(1);
+}
+
+pub(crate) fn count_batch_reorg_detected() {
+    metrics::counter!(BATCH_REORG_DETECTED_TOTAL).increment(1);
 }
 
 /// Classify a sign-endpoint error by substring. Any error whose display output

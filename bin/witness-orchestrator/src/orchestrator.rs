@@ -447,12 +447,12 @@ impl Orchestrator {
         {
             let g = db.lock().unwrap_or_else(|e| e.into_inner());
             let checkpoint = g.highest_dispatched_to_block().unwrap_or(0);
-            let dispatched_max: Option<(u64, u64, u64)> = g
+            let preconfirmed_max: Option<(u64, u64, u64)> = g
                 .find_highest_with_status_at_or_above(BatchStatus::Dispatched)
                 .map(|b| (b.batch_index, b.from_block, b.to_block));
             let signed_max: Option<(u64, u64, u64)> =
                 g.find_highest_signed().map(|b| (b.batch_index, b.from_block, b.to_block));
-            crate::metrics::seed_gauges_on_startup(checkpoint, dispatched_max, signed_max);
+            crate::metrics::seed_gauges_on_startup(checkpoint, preconfirmed_max, signed_max);
         }
 
         let initial_last_batch_end: Option<u64> = {
@@ -1508,6 +1508,26 @@ async fn finalization_worker(shared: Arc<OrchestratorShared>) {
             .await;
         }
 
+        // Refresh nonce_pending_l1 gauge so dashboard "drift" panels reflect
+        // near-real-time state. NonceAllocator only writes the gauge on
+        // bootstrap and after nonce-too-low resync; without this refresh the
+        // value stays frozen for hours on a healthy pipeline. RPC errors are
+        // non-fatal — gauge keeps its previous value.
+        match shared
+            .config
+            .l1_provider
+            .get_transaction_count(shared.config.l1_signer_address)
+            .pending()
+            .await
+        {
+            Ok(pending) => crate::metrics::set_nonce_pending_l1(pending),
+            Err(e) => warn!(
+                err = %e,
+                event = "nonce_pending_l1_refresh_failed",
+                "nonce_pending_l1 refresh failed"
+            ),
+        }
+
         // Reorg detection for dispatched challenge rows. The active worker
         // owns the in-flight RBF lifecycle (dispatched + l1_block IS NULL);
         // here we only watch rows that have already observed a receipt.
@@ -1549,7 +1569,7 @@ async fn apply_challenge_reorg_check(
         match check {
             ReceiptCheck::Found { .. } => {} // challenge tx mined fine; nothing to do
             ReceiptCheck::Reverted { .. } => {
-                metrics::counter!("orchestrator_challenge_reverted_post_mine_total").increment(1);
+                crate::metrics::count_challenge_reverted_post_mine();
                 warn!(
                     challenge_id,
                     %tx_hash,
@@ -1562,7 +1582,7 @@ async fn apply_challenge_reorg_check(
                 }
             }
             ReceiptCheck::Missing => {
-                metrics::counter!("orchestrator_challenge_reorg_detected_total").increment(1);
+                crate::metrics::count_challenge_reorg_detected();
                 warn!(
                     challenge_id,
                     %tx_hash,
@@ -1667,7 +1687,7 @@ async fn apply_finalization_changes(
                     );
                     continue;
                 }
-                metrics::counter!("orchestrator_batch_reorg_detected_total").increment(1);
+                crate::metrics::count_batch_reorg_detected();
                 warn!(
                     batch_index,
                     %tx_hash,
