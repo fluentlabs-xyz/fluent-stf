@@ -42,6 +42,8 @@ alloy-signer-local.workspace = true
 alloy-eips.workspace = true
 alloy-consensus.workspace = true
 alloy-rpc-client.workspace = true
+alloy-json-rpc.workspace = true
+alloy-transport.workspace = true
 
 # workspace crates
 rsp-blob-builder.workspace = true

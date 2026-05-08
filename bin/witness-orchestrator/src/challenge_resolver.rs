@@ -18,19 +18,22 @@
 //! ordering would not respect after backfill.
 //!
 //! Pre-broadcast safety: every resolve template runs through
-//! `validate_resolve_pre_broadcast` (cheap local merkle/chain assertions
-//! plus an `eth_call` simulation against the contract). On any failure
-//! the row is marked `Failed` and we do NOT broadcast — there is no
-//! recovery by retry from the same inputs.
+//! `validate_resolve_pre_broadcast` (eth_call simulation against the
+//! contract). Transport errors and the rollup-global `RollupCorrupted`
+//! revert retry via `DispatchBackoff`; other contract reverts mark the
+//! row terminal `Failed` (retry can't fix calldata-specific reverts).
 
 use std::{sync::Arc, time::Duration};
 
+use alloy_json_rpc::RpcError;
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionRequest;
+use alloy_sol_types::SolError;
+use alloy_transport::TransportErrorKind;
 use l1_rollup_client::{
     prepare_resolve_batch_root_challenge_tx, prepare_resolve_block_challenge_tx, L2BlockHeaderV1,
-    MerkleProof, RollupTxPartial,
+    MerkleProof, RollupCorrupted, RollupTxPartial,
 };
 use nitro_types::ChallengeSp1Request;
 use rsp_client_executor::io::EthClientExecutorInput;
@@ -536,9 +539,24 @@ async fn handle_dispatched_resume(
         }
     };
 
-    if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &partial).await {
-        fail_with_reason(shared, row, reason).await;
-        return;
+    match validate_resolve_pre_broadcast(shared, row, &partial).await {
+        SimOutcome::Ok => {}
+        SimOutcome::Retry { reason } => {
+            crate::metrics::count_challenge_validate_retry(row.kind.as_str(), reason);
+            warn!(
+                challenge_id = row.challenge_id,
+                kind = row.kind.as_str(),
+                event = "resolve_validate_retry",
+                reason,
+                "resolve eth_call validation transient — backoff"
+            );
+            backoff.apply(reason);
+            return;
+        }
+        SimOutcome::Terminal { reason } => {
+            fail_with_reason(shared, row, reason).await;
+            return;
+        }
     }
 
     if let Err(e) = l1_rollup_client::finalize_partial(
@@ -646,9 +664,24 @@ async fn run_resolve_lifecycle(
         }
     };
 
-    if let Err(reason) = validate_resolve_pre_broadcast(shared, row, &partial).await {
-        fail_with_reason(shared, row, reason).await;
-        return;
+    match validate_resolve_pre_broadcast(shared, row, &partial).await {
+        SimOutcome::Ok => {}
+        SimOutcome::Retry { reason } => {
+            crate::metrics::count_challenge_validate_retry(row.kind.as_str(), reason);
+            warn!(
+                challenge_id = row.challenge_id,
+                kind = row.kind.as_str(),
+                event = "resolve_validate_retry",
+                reason,
+                "resolve eth_call validation transient — backoff"
+            );
+            backoff.apply(reason);
+            return;
+        }
+        SimOutcome::Terminal { reason } => {
+            fail_with_reason(shared, row, reason).await;
+            return;
+        }
     }
 
     if let Err(e) = l1_rollup_client::finalize_partial(
@@ -743,21 +776,65 @@ async fn fail_with_reason(shared: &OrchestratorShared, row: &ChallengeRow, reaso
     }
 }
 
+/// Outcome of resolve-tx `eth_call` simulation. See `classify_call_error`
+/// for the retry/terminal split.
+#[derive(Debug)]
+enum SimOutcome {
+    Ok,
+    Retry { reason: &'static str },
+    Terminal { reason: String },
+}
+
+/// Classify an alloy RPC error from the resolve-tx simulation. The
+/// retry/terminal decision hinges on one custom error
+/// (`RollupCorrupted`, which reflects rollup-global state and may
+/// clear independently); any other contract revert is terminal because
+/// retry against the same calldata cannot succeed.
+fn classify_call_error(
+    err: &RpcError<TransportErrorKind, Box<serde_json::value::RawValue>>,
+) -> SimOutcome {
+    match err {
+        RpcError::Transport(TransportErrorKind::HttpError(http)) => {
+            let reason = match http.status {
+                429 => "transport_429",
+                500..=599 => "transport_5xx",
+                _ => "transport_http_other",
+            };
+            SimOutcome::Retry { reason }
+        }
+        RpcError::Transport(_) => SimOutcome::Retry { reason: "transport_other" },
+        RpcError::ErrorResp(payload) => match payload.as_revert_data() {
+            Some(data) if data.starts_with(&RollupCorrupted::SELECTOR) => {
+                SimOutcome::Retry { reason: "rollup_corrupted" }
+            }
+            Some(data) => {
+                let mut sel = [0u8; 4];
+                let n = data.len().min(4);
+                sel[..n].copy_from_slice(&data[..n]);
+                SimOutcome::Terminal {
+                    reason: format!(
+                        "contract revert (selector=0x{:02x}{:02x}{:02x}{:02x})",
+                        sel[0], sel[1], sel[2], sel[3]
+                    ),
+                }
+            }
+            None => SimOutcome::Retry { reason: "error_resp_no_data" },
+        },
+        // DeserError / SerError / NullResp / LocalUsageError / UnsupportedFeature
+        // — all are typically transient on a flapping endpoint.
+        _ => SimOutcome::Retry { reason: "rpc_other" },
+    }
+}
+
 /// Catch-all defense before broadcasting a resolve tx: simulate the
-/// signed calldata via `eth_call`. If the contract would revert, we
-/// surface the revert reason and abort — there is no recovery from the
-/// same inputs, retry is wasted gas.
-///
-/// Local merkle / chain-linkage assertions are NOT duplicated here
-/// because they are already implicit in `prepare_resolve_partial` (which
-/// produces calldata derived from the same headers/leaves the contract
-/// re-validates). The simulation is the catch-all; it covers any future
-/// contract revert path automatically.
+/// signed calldata via `eth_call`. Local merkle / chain-linkage
+/// assertions are not duplicated here — they are implicit in
+/// `prepare_resolve_partial`'s calldata derivation.
 async fn validate_resolve_pre_broadcast(
     shared: &OrchestratorShared,
     row: &ChallengeRow,
     partial: &RollupTxPartial,
-) -> Result<(), String> {
+) -> SimOutcome {
     let req = TransactionRequest {
         from: Some(shared.config.l1_signer_address),
         to: Some(partial.to.into()),
@@ -776,13 +853,9 @@ async fn validate_resolve_pre_broadcast(
                 duration_ms,
                 "resolve eth_call validation passed"
             );
-            Ok(())
+            SimOutcome::Ok
         }
-        Err(e) => Err(format!(
-            "eth_call simulation reverted (challenge_id={}, kind={}): {e}",
-            row.challenge_id,
-            row.kind.as_str()
-        )),
+        Err(e) => classify_call_error(&e),
     }
 }
 
@@ -1401,5 +1474,78 @@ mod tests {
             last_header_876.blockHash, headers_877[0].previousBlockHash,
             "cross-batch chain break: last(876).blockHash != first(877).previousBlockHash"
         );
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::{classify_call_error, SimOutcome};
+    use alloy_json_rpc::{ErrorPayload, RpcError};
+    use alloy_sol_types::SolError;
+    use alloy_transport::{HttpError, TransportErrorKind};
+    use l1_rollup_client::RollupCorrupted;
+    use serde_json::value::RawValue;
+
+    fn http(status: u16) -> RpcError<TransportErrorKind, Box<RawValue>> {
+        RpcError::Transport(TransportErrorKind::HttpError(HttpError {
+            status,
+            body: String::new(),
+        }))
+    }
+
+    fn err_resp(
+        message: &str,
+        data_hex: Option<&str>,
+    ) -> RpcError<TransportErrorKind, Box<RawValue>> {
+        let data =
+            data_hex.map(|h| RawValue::from_string(format!("\"{h}\"")).expect("valid raw value"));
+        RpcError::ErrorResp(ErrorPayload {
+            code: -32000,
+            message: message.to_string().into(),
+            data,
+        })
+    }
+
+    #[test]
+    fn http_429_retries_as_transport_429() {
+        assert!(matches!(
+            classify_call_error(&http(429)),
+            SimOutcome::Retry { reason: "transport_429" }
+        ));
+    }
+
+    #[test]
+    fn http_503_retries_as_transport_5xx() {
+        assert!(matches!(
+            classify_call_error(&http(503)),
+            SimOutcome::Retry { reason: "transport_5xx" }
+        ));
+    }
+
+    #[test]
+    fn rollup_corrupted_selector_retries() {
+        let sel = <RollupCorrupted as SolError>::SELECTOR;
+        let hex_payload = format!("0x{:02x}{:02x}{:02x}{:02x}", sel[0], sel[1], sel[2], sel[3]);
+        assert!(matches!(
+            classify_call_error(&err_resp("execution reverted", Some(&hex_payload))),
+            SimOutcome::Retry { reason: "rollup_corrupted" }
+        ));
+    }
+
+    #[test]
+    fn other_revert_terminates() {
+        let hex_payload = "0xdeadbeef00000000000000000000000000000000000000000000000000000000";
+        assert!(matches!(
+            classify_call_error(&err_resp("execution reverted", Some(hex_payload))),
+            SimOutcome::Terminal { .. }
+        ));
+    }
+
+    #[test]
+    fn error_resp_without_data_retries() {
+        assert!(matches!(
+            classify_call_error(&err_resp("internal error", None)),
+            SimOutcome::Retry { reason: "error_resp_no_data" }
+        ));
     }
 }

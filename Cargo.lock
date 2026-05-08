@@ -13020,6 +13020,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-json-rpc",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
@@ -13029,6 +13030,7 @@ dependencies = [
  "alloy-signer",
  "alloy-signer-local",
  "alloy-sol-types",
+ "alloy-transport",
  "async-channel",
  "async-trait",
  "axum 0.8.9",

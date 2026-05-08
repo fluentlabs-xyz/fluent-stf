@@ -50,6 +50,8 @@ pub(crate) const CHALLENGE_SP1_REQUEST_LOST_TOTAL: &str =
     "orchestrator_challenge_sp1_request_lost_total";
 pub(crate) const CHALLENGE_PRE_BROADCAST_FAILED_TOTAL: &str =
     "orchestrator_challenge_pre_broadcast_failed_total";
+pub(crate) const CHALLENGE_VALIDATE_RETRY_TOTAL: &str =
+    "orchestrator_challenge_validate_retry_total";
 pub(crate) const CHALLENGE_REVERTED_POST_MINE_TOTAL: &str =
     "orchestrator_challenge_reverted_post_mine_total";
 pub(crate) const CHALLENGE_REORG_DETECTED_TOTAL: &str =
@@ -211,6 +213,16 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
          kind=block|batch_root"
     );
     metrics::describe_counter!(
+        CHALLENGE_VALIDATE_RETRY_TOTAL,
+        "Resolve-tx pre-broadcast simulation hit a retryable error and the \
+         worker applied DispatchBackoff. Labels: kind=block|batch_root; \
+         reason ∈ {transport_429, transport_5xx, transport_http_other, \
+         transport_other, rollup_corrupted, error_resp_no_data, rpc_other}. \
+         Bursts on transport_* indicate L1 RPC-provider degradation; bursts \
+         on rollup_corrupted indicate the rollup is globally wedged and \
+         operator must call revertBatches."
+    );
+    metrics::describe_counter!(
         CHALLENGE_REVERTED_POST_MINE_TOTAL,
         "Resolve-tx receipt observed status=0 by the finalization ticker \
          (RBF receipt-watcher missed the failure earlier). RBF state \
@@ -310,6 +322,11 @@ pub(crate) fn count_challenge_sp1_request_lost(kind: &'static str) {
 
 pub(crate) fn count_challenge_pre_broadcast_failed(kind: &'static str) {
     metrics::counter!(CHALLENGE_PRE_BROADCAST_FAILED_TOTAL, "kind" => kind).increment(1);
+}
+
+pub(crate) fn count_challenge_validate_retry(kind: &'static str, reason: &'static str) {
+    metrics::counter!(CHALLENGE_VALIDATE_RETRY_TOTAL, "kind" => kind, "reason" => reason)
+        .increment(1);
 }
 
 pub(crate) fn count_challenge_reverted_post_mine() {
