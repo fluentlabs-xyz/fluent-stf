@@ -196,6 +196,13 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-json}
       DEPLOY_ENV: ${DEPLOY_ENV:-production}
       RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
+      # Container-internal paths — match the same pattern witness-orchestrator
+      # uses (Dockerfile keeps only HOME + SP1_ELF_PATH; everything else is
+      # operator-tunable through .env so MDBX layout can be redirected without
+      # rebuilding the image).
+      DATADIR: ${CANARY_DRIVER_DIR:-/var/lib/canary/canary-driver}
+      WITNESS_COLD_FILE: ${CANARY_COLD_FILE:-/var/lib/canary/canary-driver/cold.redb}
+      DB_PATH: ${CANARY_DB_PATH:-/var/lib/canary/sp1_canary.db}
       # Canary tunables — defaults match canary's main.rs DEFAULT_*
       # constants except SP1_WORKERS (1 vs code default 2) — sized to the
       # 16g shm_size cap (one ~10 GB SP1 trace ring per worker). Raise

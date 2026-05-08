@@ -310,9 +310,6 @@ COPY rsp-client-${NETWORK}.elf /opt/elfs/sp1-client.elf
 COPY --from=builder /app/sp1-executor-canary /usr/local/bin/sp1-executor-canary
 
 ENV SP1_ELF_PATH=/opt/elfs/sp1-client.elf \
-    DATADIR=/var/lib/canary/canary-driver \
-    WITNESS_COLD_FILE=/var/lib/canary/canary-driver/cold.redb \
-    DB_PATH=/var/lib/canary/sp1_canary.db \
     HOME=/var/lib/canary
 
 USER nonroot:nonroot
