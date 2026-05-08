@@ -15,8 +15,10 @@ alloy-eips.workspace = true
 alloy-provider.workspace = true
 alloy-rlp.workspace = true
 brotlic.workspace = true
+c-kzg = { workspace = true }
 eyre.workspace = true
 futures.workspace = true
+nitro-types.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

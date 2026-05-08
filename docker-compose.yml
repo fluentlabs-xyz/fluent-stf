@@ -142,6 +142,7 @@ services:
       L1_POLL_INTERVAL_SECS: ${L1_POLL_INTERVAL_SECS}
       L1_SAFE_BLOCKS: ${L1_SAFE_BLOCKS}
       L2_SAFE_BLOCKS: ${L2_SAFE_BLOCKS}
+      MAX_LOOKAHEAD_BLOCKS: ${MAX_LOOKAHEAD_BLOCKS}
       RBF_BUMP_INTERVAL_SECS: ${RBF_BUMP_INTERVAL_SECS}
       RBF_BUMP_PERCENT: ${RBF_BUMP_PERCENT}
       RBF_MAX_FEE_PER_GAS_WEI: ${RBF_MAX_FEE_PER_GAS_WEI}
@@ -173,3 +174,71 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  sp1-executor-canary:
+    profiles: [canary]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: rsp-canary
+      args:
+        NETWORK: ${NETWORK}
+    image: fluent-stf/sp1-executor-canary:${NETWORK}
+    container_name: fluent-canary
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    network_mode: host
+    volumes:
+      - ${CANARY_DATA_DIR:-./data/canary}:/var/lib/canary
+    environment:
+      RUST_LOG: ${RUST_LOG}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
+      RPC_URL: ${RPC_URL:?RPC_URL is required in .env}
+      # Canary tunables — defaults match canary's main.rs DEFAULT_*
+      # constants except SP1_WORKERS (1 vs code default 2) — sized to the
+      # 16g shm_size cap (one ~10 GB SP1 trace ring per worker). Raise
+      # alongside shm_size if you bump SP1_WORKERS.
+      SP1_WORKERS: ${CANARY_SP1_WORKERS:-1}
+      CANARY_WINDOW_SIZE: ${CANARY_WINDOW_SIZE:-1024}
+      MAX_LOOKAHEAD_BLOCKS: ${CANARY_MAX_LOOKAHEAD:-4096}
+      WITNESS_RETENTION_BLOCKS: ${CANARY_WITNESS_RETENTION_BLOCKS:-172800}
+      MDBX_MAX_SIZE: ${CANARY_MDBX_MAX_SIZE:-549755813888}
+      L2_SAFE_BLOCKS: ${CANARY_L2_SAFE_BLOCKS:-10}
+      CANARY_SKIP_EMPTY_BLOCKS: ${CANARY_SKIP_EMPTY_BLOCKS:-true}
+      FLUENT_METRICS_ADDR: ${CANARY_METRICS_ADDR:-0.0.0.0:9091}
+      WITNESS_FROM_BLOCK: ${CANARY_WITNESS_FROM_BLOCK:-}
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    # SP1 v6 native JIT executor uses /dev/shm for shared memory between
+    # parent and child processes (~10 GB trace ring + 128 MiB memory
+    # image per active worker). Sized to SP1_WORKERS=1 with headroom.
+    shm_size: 16g
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Read-only root filesystem. SP1 caches data under $HOME/.sp1/ —
+    # because the Dockerfile sets HOME=/var/lib/canary and that path is a
+    # writable bind-mount, SP1 operates normally without requiring
+    # writable rootfs.
+    read_only: true
+    tmpfs:
+      # `exec` is required: SP1 v6 native executor extracts a JIT runner
+      # binary into /tmp at startup and execve()s it. Default tmpfs is
+      # mounted with noexec, which blocks the spawn.
+      - /tmp:size=1g,mode=1777,exec
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "-", "http://${CANARY_METRICS_ADDR:-0.0.0.0:9091}/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s

@@ -59,7 +59,6 @@ rusqlite.workspace = true
 
 aws-config = { version = "1"}
 aws-credential-types = "1"
-c-kzg = "2.1.7"
 
 # attestation parsing deps (always available for local execute)
 ciborium = "0.2.2"

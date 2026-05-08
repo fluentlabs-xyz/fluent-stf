@@ -28,9 +28,9 @@ const TOTAL_BYTES_KEY: &str = "total_bytes";
 /// Default batch size for tip-following cold writes. 128 blocks amortizes one
 /// `redb` fsync across ~2 minutes of L2 production at 1 s/block, which on the
 /// observed hardware removes redb from the per-block critical path.
-pub(crate) const DEFAULT_COLD_BATCH_SIZE: usize = 32;
+pub const DEFAULT_COLD_BATCH_SIZE: usize = 32;
 
-pub(crate) struct WitnessHub {
+pub struct WitnessHub {
     db: Arc<Database>,
     retention_blocks: u64,
     batch_size: usize,
@@ -49,11 +49,7 @@ impl WitnessHub {
     /// Retention prunes every commit (`block_number < highest - retention_blocks`);
     /// `retention_blocks == 0` disables retention (archive mode).
     /// `batch_size < 1` is clamped to 1.
-    pub(crate) fn new(
-        cold_file: PathBuf,
-        retention_blocks: u64,
-        batch_size: usize,
-    ) -> eyre::Result<Self> {
+    pub fn new(cold_file: PathBuf, retention_blocks: u64, batch_size: usize) -> eyre::Result<Self> {
         if let Some(parent) = cold_file.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -81,7 +77,7 @@ impl WitnessHub {
     }
 
     /// Single-block commit; returns after redb fsync.
-    pub(crate) async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
+    pub async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
         let compressed = compress_payload(payload).await?;
         let entries = vec![(block_number, compressed)];
         self.commit_entries(entries).await
@@ -92,7 +88,7 @@ impl WitnessHub {
     /// the buffer reaches `batch_size`. On crash before flush the buffered
     /// blocks are lost from cold; the driver's re-witness fallback rebuilds them
     /// from MDBX on restart.
-    pub(crate) async fn push_batched(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
+    pub async fn push_batched(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
         let compressed = compress_payload(payload).await?;
         let to_flush = {
             let mut buf = self.buffer.lock().await;
@@ -111,7 +107,7 @@ impl WitnessHub {
 
     /// Drain and commit any pending buffered entries. Safe to call on shutdown
     /// or at phase boundaries; no-op if the buffer is empty.
-    pub(crate) async fn flush_pending(&self) -> eyre::Result<()> {
+    pub async fn flush_pending(&self) -> eyre::Result<()> {
         let entries = {
             let mut buf = self.buffer.lock().await;
             if buf.is_empty() {
@@ -126,7 +122,7 @@ impl WitnessHub {
     /// `(removed_count, bytes_freed)`. Expected to be called at boot time
     /// before any `push` / `push_batched` activity — buffered entries are not
     /// considered. Updates `total_bytes` in the same redb transaction.
-    pub(crate) async fn unwind_above(&self, target: u64) -> eyre::Result<(u64, u64)> {
+    pub async fn unwind_above(&self, target: u64) -> eyre::Result<(u64, u64)> {
         let db = Arc::clone(&self.db);
         let join = tokio::task::spawn_blocking(move || -> Result<(u64, u64), redb::Error> {
             let write_txn = db.begin_write()?;
@@ -165,7 +161,7 @@ impl WitnessHub {
     ///
     /// Under window retention the newest row is never evicted, so
     /// `table.last()` is the resume point.
-    pub(crate) fn last_committed_block(&self) -> eyre::Result<Option<u64>> {
+    pub fn last_committed_block(&self) -> eyre::Result<Option<u64>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(COLD_TABLE)?;
         let last = table.last()?.map(|(k, _)| k.value());
@@ -175,7 +171,7 @@ impl WitnessHub {
     /// Look up a single witness by block number. Returns `None` if missing
     /// or on decode failure. Checks the in-memory buffer first so tip-following
     /// callers can read back their own recent writes before the batch flushes.
-    pub(crate) async fn get_witness(&self, block_number: u64) -> Option<ProveRequest> {
+    pub async fn get_witness(&self, block_number: u64) -> Option<ProveRequest> {
         {
             let buf = self.buffer.lock().await;
             if let Some(compressed) =

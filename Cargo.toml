@@ -12,6 +12,7 @@ members = [
     "crates/batch-merkle",
     "crates/l1-rollup-client",
     "bin/witness-orchestrator",
+    "bin/sp1-executor-canary",
     "crates/tracing-format",
 ]
 exclude = []
@@ -100,7 +101,7 @@ rsp-mpt = { path = "./crates/mpt" }
 fluent-stf-primitives = { path = "./crates/primitives", default-features = false }
 rsp-provider = { path = "./crates/provider" }
 nitro-types = { path = "./crates/nitro-types" }
-witness-orchestrator = { path = "./bin/witness-orchestrator", package = "witness-orchestrator-bin" }
+witness-orchestrator = { path = "./bin/witness-orchestrator", package = "witness-orchestrator-bin", default-features = false }
 tracing-format = { path = "./crates/tracing-format" }
 
 # --- sp1 ---
@@ -176,6 +177,7 @@ op-alloy-network = "0.18.12"
 op-alloy-rpc-types = "0.18.12"
 
 kzg-rs = { git = "https://github.com/succinctlabs/kzg-rs" }
+c-kzg = { version = "2.1.7", default-features = false }
 
 [workspace.lints]
 rust.missing_debug_implementations = "warn"

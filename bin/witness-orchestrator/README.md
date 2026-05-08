@@ -34,6 +34,7 @@ for signed execution + batch-root signing, accumulates batches, submits
 | `L1_POLL_INTERVAL_SECS` | `60` | L1 listener poll cadence. |
 | `L1_SAFE_BLOCKS` | `7` | L1 reorg-safety lag (blocks treated as unfinalized). |
 | `L2_SAFE_BLOCKS` | `10` | L2 reorg-safety lag for the embedded driver (`remote_tip - L2_SAFE_BLOCKS`). |
+| `MAX_LOOKAHEAD_BLOCKS` | `4096` | Hard cap on driver lookahead vs `orchestrator_tip` (last L1-finalized L2 block). Driver idles when `block_number > orchestrator_tip + MAX_LOOKAHEAD_BLOCKS`, bounding witness-hub growth when L1 finalization stalls. |
 | `RBF_BUMP_INTERVAL_SECS` | `15` | Per-bump sleep in the RBF loop. |
 | `RBF_BUMP_PERCENT` | `20` | Per-bump fee multiplier (must satisfy EIP-1559's +12.5% minimum). |
 | `RBF_MAX_FEE_PER_GAS_WEI` | `500000000000` | Hard fee cap; reaching it is an operator-attention event. |

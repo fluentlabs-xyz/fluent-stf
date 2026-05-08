@@ -13,6 +13,9 @@
 //! sequencer. The pure-Rust `brotli` crate produces different output on real
 //! transaction data and would break the SP1 verifier's versioned-hash check.
 
+pub mod kzg_input;
+pub use kzg_input::prepare_blob_verification_input;
+
 use std::io::Write;
 
 use alloy_consensus::{Block, TxEnvelope};

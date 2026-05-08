@@ -71,7 +71,7 @@ reth-primitives-traits = { workspace = true }
 reth-storage-api = { workspace = true }
 
 # blob inspection
-c-kzg = "2.1.7"
+c-kzg = { workspace = true }
 sha2 = "0.10"
 brotli = "8"
 alloy-rlp.workspace = true

@@ -10,7 +10,7 @@ use reth_node_types::NodeTypes;
 use reth_provider::EthStorage;
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct FluentMdbxNode;
+pub struct FluentMdbxNode;
 
 impl NodeTypes for FluentMdbxNode {
     type Primitives = EthPrimitives;

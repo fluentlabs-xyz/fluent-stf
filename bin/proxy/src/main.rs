@@ -65,7 +65,7 @@ use sp1_sdk::{
     Elf, HashableKey, Prover, ProverClient, ProvingKey, SP1ProvingKey, SP1Stdin,
 };
 
-use c_kzg::{Blob as CKzgBlob, KzgSettings};
+use rsp_blob_builder::prepare_blob_verification_input;
 use tracing::{info, warn, Instrument};
 
 pub fn rpc_url() -> String {
@@ -130,8 +130,6 @@ struct ChainContext {
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
-
-use nitro_types::BlobVerificationInput;
 
 /// `POST /mock/sp1/request` — block ref + batch index for blob fetching.
 #[derive(Deserialize)]
@@ -216,36 +214,6 @@ fn require_l1(state: &AppState) -> Result<&L1State, HandlerError> {
 
 /// Generates KZG commitments and proofs on the host using Fiat-Shamir.
 /// This witness is sent to SP1 to avoid heavy MSMs inside the zkVM.
-fn prepare_blob_input(raw_blobs: &[Vec<u8>]) -> Result<BlobVerificationInput, HandlerError> {
-    let setup_str = std::str::from_utf8(include_bytes!("../../client/trusted_setup.txt"))
-        .map_err(|_| internal("Invalid trusted setup UTF-8"))?;
-    let settings = KzgSettings::parse_kzg_trusted_setup(setup_str, 0)
-        .map_err(|e| internal(format!("Failed to parse KZG settings: {e}")))?;
-
-    let mut commitments = Vec::with_capacity(raw_blobs.len());
-    let mut proofs = Vec::with_capacity(raw_blobs.len());
-
-    for raw in raw_blobs {
-        let blob = CKzgBlob::from_bytes(raw)
-            .map_err(|e| bad_request(format!("Invalid blob bytes: {e}")))?;
-
-        let commitment = settings
-            .blob_to_kzg_commitment(&blob)
-            .map_err(|e| internal(format!("KZG commitment failed: {e}")))?;
-
-        let commitment_bytes = commitment.to_bytes();
-
-        let proof = settings
-            .compute_blob_kzg_proof(&blob, &commitment_bytes)
-            .map_err(|e| internal(format!("KZG proof generation failed: {e}")))?;
-
-        commitments.push(commitment_bytes.to_vec());
-        proofs.push(proof.to_bytes().to_vec());
-    }
-
-    Ok(BlobVerificationInput { blobs: raw_blobs.to_vec(), commitments, proofs })
-}
-
 /// Fetch blobs for a challenge endpoint by reconstructing them from L2 tx data.
 ///
 /// Resolves the batch's L2 block range via an L1 `acceptNextBatch` calldata
@@ -449,7 +417,8 @@ async fn challenge_sp1_request(
     let raw_blobs = payload.blobs;
 
     let block_number = client_input.current_block.header.number;
-    let blob_input = prepare_blob_input(&raw_blobs)?;
+    let blob_input =
+        prepare_blob_verification_input(&raw_blobs).map_err(|e| internal(format!("KZG: {e}")))?;
 
     let mut stdin = SP1Stdin::new();
     let serialized_input = bincode::serialize(&client_input)
@@ -601,7 +570,8 @@ async fn mock_sp1_request(
     let client_input = build_client_input(req.block_number, req.block_hash, &state.chain).await?;
     let block_number = client_input.current_block.header.number;
     tracing::Span::current().record("block_number", block_number);
-    let blob_input = prepare_blob_input(&raw_blobs)?;
+    let blob_input =
+        prepare_blob_verification_input(&raw_blobs).map_err(|e| internal(format!("KZG: {e}")))?;
 
     let mut stdin = SP1Stdin::new();
     let serialized_input = bincode::serialize(&client_input)

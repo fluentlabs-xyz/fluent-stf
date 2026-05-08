@@ -3,7 +3,7 @@ use rsp_host_executor::events_hash::{
     calculate_deposit_hash_inner, calculate_withdrawal_root_inner, count_deposits_inner,
 };
 
-pub(crate) fn calculate_withdrawal_root_from_reth_receipts(
+pub fn calculate_withdrawal_root_from_reth_receipts(
     receipts: &[reth_ethereum_primitives::Receipt],
     bridge_address: Address,
     send_topic: B256,
@@ -19,7 +19,7 @@ pub(crate) fn calculate_withdrawal_root_from_reth_receipts(
     )
 }
 
-pub(crate) fn calculate_deposit_hash_from_reth_receipts(
+pub fn calculate_deposit_hash_from_reth_receipts(
     receipts: &[reth_ethereum_primitives::Receipt],
     bridge_address: Address,
     receive_topic: B256,
@@ -31,7 +31,7 @@ pub(crate) fn calculate_deposit_hash_from_reth_receipts(
     )
 }
 
-pub(crate) fn count_deposits_from_reth_receipts(
+pub fn count_deposits_from_reth_receipts(
     receipts: &[reth_ethereum_primitives::Receipt],
     bridge_address: Address,
     receive_topic: B256,

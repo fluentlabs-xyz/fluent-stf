@@ -1,3 +1,6 @@
+// Used only by orchestrator-internal modules; lib target does not consume
+// these but the `pub mod types` declaration in lib.rs forces compilation.
+#[allow(unused_imports)]
 pub(crate) use nitro_types::{
     EthExecutionResponse, InvalidSignaturesResponse, SignBatchRootRequest, SubmitBatchResponse,
 };
@@ -5,7 +8,7 @@ pub(crate) use nitro_types::{
 /// Bincode-serialized `ClientExecutorInput<FluentPrimitives>` for `block_number`,
 /// forwarded to the proving backend as-is.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ProveRequest {
-    pub(crate) block_number: u64,
-    pub(crate) payload: Vec<u8>,
+pub struct ProveRequest {
+    pub block_number: u64,
+    pub payload: Vec<u8>,
 }

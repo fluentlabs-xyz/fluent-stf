@@ -7,7 +7,7 @@ use crate::driver::Driver;
 /// `Ok(None)` when `to_block` exceeds the driver's MDBX tip — caller's
 /// next worker tick should retry. Output is byte-identical to
 /// `rsp_blob_builder::build_blobs_from_l2(rpc, from, to)` for the same range.
-pub(crate) async fn build_blobs_from_mdbx(
+pub async fn build_blobs_from_mdbx(
     driver: &Arc<Driver>,
     from_block: u64,
     to_block: u64,

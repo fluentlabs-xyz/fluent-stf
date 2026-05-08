@@ -3,10 +3,12 @@
 //! The driver runs as an autonomous background actor: consumers build an
 //! `Arc<Driver>`, call `advance_to_witness_from_block` once at startup, then
 //! spawn `run_background_loop` which pulls blocks from L2 RPC, commits them
-//! to MDBX, produces witnesses, and pushes them into the `WitnessHub` at a
-//! rate bounded by the orchestrator-supplied `Arc<AtomicU64>` lookahead
-//! watermark. Witness consumers (feeder, witness-server) read from the hub
-//! directly.
+//! to MDBX, produces witnesses, and pushes them into the `WitnessHub`. Two
+//! gates bound production: the L2-tip safety lag (`remote_tip -
+//! l2_safe_blocks`) and the consumer-supplied watermark
+//! (`consumer_tip.load() + max_lookahead_blocks`). Consumers that don't
+//! need back-pressure pass `max_lookahead_blocks: u64::MAX` to disable the
+//! gate (the `consumer_tip` value is then ignored).
 
 use std::{
     ops::RangeInclusive,
@@ -89,7 +91,7 @@ const CATCHUP_BATCH_PIPELINE: usize = 2;
 
 /// Open a writable `ProviderFactory<N>` against a fresh or existing
 /// reth datadir. Layout: `<datadir>/{db,static_files,rocksdb}`.
-pub(crate) fn open_writable_factory<N>(
+pub fn open_writable_factory<N>(
     datadir: &Path,
     chain_spec: Arc<ChainSpec>,
     mdbx_max_size: u64,
@@ -266,7 +268,7 @@ fn ensure_genesis_initialized(factory: &ProviderFactory<DriverNode>) -> eyre::Re
     Ok(())
 }
 
-pub(crate) struct DriverConfig {
+pub struct DriverConfig {
     pub factory: ProviderFactory<DriverNode>,
     pub rpc: RootProvider<Ethereum>,
     pub host_executor: Arc<EthHostExecutor>,
@@ -283,6 +285,14 @@ pub(crate) struct DriverConfig {
     /// `advance_to_witness_from_block` and the background loop as
     /// `remote_tip.saturating_sub(l2_safe_blocks)`.
     pub l2_safe_blocks: u64,
+    /// Watermark consumed by the lookahead gate. The driver idles when
+    /// `block_number > consumer_tip.load() + max_lookahead_blocks`. To
+    /// disable the gate, pass `max_lookahead_blocks: u64::MAX` — the value
+    /// stored here is then ignored.
+    pub consumer_tip: Arc<std::sync::atomic::AtomicU64>,
+    /// Hard cap on how far ahead of `consumer_tip` the driver may
+    /// produce. `u64::MAX` disables the gate (sentinel = unbounded).
+    pub max_lookahead_blocks: u64,
 }
 
 struct FetchedBlock {
@@ -309,7 +319,7 @@ struct WitnessJob {
 /// Pull-shaped forward-sync driver. Construct once, then drive through the
 /// two public async methods. The driver serializes MDBX-writing work
 /// internally and survives any number of concurrent `&self` callers.
-pub(crate) struct Driver {
+pub struct Driver {
     factory: ProviderFactory<DriverNode>,
     rpc: RootProvider<Ethereum>,
     host_executor: Arc<EthHostExecutor>,
@@ -326,6 +336,12 @@ pub(crate) struct Driver {
     /// here while another call is in flight (MDBX writable txn is single-writer).
     state: AsyncMutex<DriverState>,
     l2_safe_blocks: u64,
+    /// Consumer-supplied watermark; combined with `max_lookahead_blocks`
+    /// to gate `produce_next_witness` so the driver does not run
+    /// arbitrarily far ahead of a slow consumer.
+    consumer_tip: Arc<std::sync::atomic::AtomicU64>,
+    /// `u64::MAX` = unbounded (orchestrator default).
+    max_lookahead_blocks: u64,
 }
 
 struct DriverState {
@@ -338,14 +354,14 @@ impl Driver {
     /// Used by the heartbeat worker for an at-a-glance snapshot of how far
     /// MDBX has been wound. Returns `None` if the underlying call fails — the
     /// heartbeat falls back to reporting zero rather than blocking.
-    pub(crate) fn mdbx_tip(&self) -> Option<u64> {
+    pub fn mdbx_tip(&self) -> Option<u64> {
         self.factory.best_block_number().ok()
     }
 
     /// Construct the driver. Runs genesis init, static-file heal, and the
     /// cold_last vs mdbx_tip invariant check. Fails loudly on any
     /// invariant violation.
-    pub(crate) fn new(cfg: DriverConfig) -> eyre::Result<Self> {
+    pub fn new(cfg: DriverConfig) -> eyre::Result<Self> {
         ensure_genesis_initialized(&cfg.factory)?;
 
         // Cold writes are buffered across up to `DEFAULT_COLD_BATCH_SIZE` blocks
@@ -404,6 +420,8 @@ impl Driver {
             ready: AtomicBool::new(false),
             state: AsyncMutex::new(DriverState { next }),
             l2_safe_blocks: cfg.l2_safe_blocks,
+            consumer_tip: cfg.consumer_tip,
+            max_lookahead_blocks: cfg.max_lookahead_blocks,
         })
     }
 
@@ -412,7 +430,7 @@ impl Driver {
     /// batched-prefetch pipeline (CATCHUP_BATCH_SIZE / CATCHUP_BATCH_PIPELINE).
     /// Sets `ready = true` on successful completion. Must be called exactly
     /// once before any `try_take_new_block` call returns a witness.
-    pub(crate) async fn advance_to_witness_from_block(
+    pub async fn advance_to_witness_from_block(
         &self,
         shutdown: &CancellationToken,
     ) -> eyre::Result<()> {
@@ -561,10 +579,7 @@ impl Driver {
     /// Returns `Ok(None)` when `block_number > MDBX tip` (not yet committed)
     /// or `block_number == 0` (no parent state). `Err(_)` only on a fatal
     /// rebuild failure (RPC, executor, serialization).
-    pub(crate) async fn get_or_build_witness(
-        &self,
-        block_number: u64,
-    ) -> eyre::Result<Option<Vec<u8>>> {
+    pub async fn get_or_build_witness(&self, block_number: u64) -> eyre::Result<Option<Vec<u8>>> {
         if let Some(cached) = self.hub.get_witness(block_number).await {
             return Ok(Some(cached.payload));
         }
@@ -594,7 +609,7 @@ impl Driver {
     /// `range.end() > mdbx_tip` so the caller can retry on the next
     /// worker tick instead of falling back to RPC. Target-leaf lookup
     /// (`leaves.iter().position(...)`) is left to the caller.
-    pub(crate) async fn collect_l2_block_headers(
+    pub async fn collect_l2_block_headers(
         &self,
         range: RangeInclusive<u64>,
     ) -> eyre::Result<Option<(Vec<L2BlockHeader>, Vec<B256>)>> {
@@ -674,7 +689,7 @@ impl Driver {
     /// shaped to slot directly into `rsp_blob_builder`'s encoder pipeline.
     /// Returns `Ok(None)` when `range.end() > mdbx_tip` (caller retries
     /// next tick).
-    pub(crate) async fn collect_blob_inputs(
+    pub async fn collect_blob_inputs(
         &self,
         range: RangeInclusive<u64>,
     ) -> eyre::Result<Option<Vec<rsp_blob_builder::FetchedBlock>>> {
@@ -724,7 +739,7 @@ impl Driver {
     /// Returns `Err(_)` only on an unrecoverable MDBX / witness-build / hub
     /// push failure — the caller should cancel the root shutdown token on
     /// that signal.
-    pub(crate) async fn run_background_loop(
+    pub async fn run_background_loop(
         self: Arc<Self>,
         shutdown: CancellationToken,
     ) -> eyre::Result<()> {
@@ -822,6 +837,14 @@ impl Driver {
         };
         if block_number > remote_tip.saturating_sub(self.l2_safe_blocks) {
             return Ok(Produced::Idle);
+        }
+
+        // Consumer-aware lookahead. `u64::MAX` sentinel = unbounded.
+        if self.max_lookahead_blocks != u64::MAX {
+            let consumer = self.consumer_tip.load(std::sync::atomic::Ordering::Relaxed);
+            if block_number > consumer.saturating_add(self.max_lookahead_blocks) {
+                return Ok(Produced::Idle);
+            }
         }
 
         let fetched = match fetch_block(&self.rpc, block_number).await {
@@ -1235,7 +1258,7 @@ async fn rewitness_phase(
 /// Must be called exactly once, between `open_writable_factory` and
 /// `Driver::new`. Fatal on MDBX or cold-store failure — operator restarts
 /// with env still set and the next boot retries.
-pub(crate) async fn unwind_to(
+pub async fn unwind_to(
     factory: ProviderFactory<DriverNode>,
     hub: Arc<WitnessHub>,
     target: u64,

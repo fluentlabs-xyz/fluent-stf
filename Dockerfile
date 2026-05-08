@@ -20,6 +20,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY bin/proxy/ bin/proxy/
 COPY bin/witness-orchestrator/ bin/witness-orchestrator/
+COPY bin/sp1-executor-canary/ bin/sp1-executor-canary/
 RUN cargo chef prepare --recipe-path recipe.json
 
 ###############################################################################
@@ -49,7 +50,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo chef cook --profile release --recipe-path recipe.json \
         --no-default-features --features "${NETWORK}" \
-        -p proxy -p witness-orchestrator-bin
+        -p proxy -p witness-orchestrator-bin -p sp1-executor-canary
 
 # Application source. trusted_setup.txt is pulled via include_bytes! in
 # bin/proxy/src/main.rs; the file ships with bin/client but is read at
@@ -58,6 +59,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY bin/proxy/ bin/proxy/
 COPY bin/witness-orchestrator/ bin/witness-orchestrator/
+COPY bin/sp1-executor-canary/ bin/sp1-executor-canary/
 COPY bin/client/trusted_setup.txt bin/client/trusted_setup.txt
 
 # Single cargo build — compiles both binaries against a unified dep graph.
@@ -67,10 +69,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
     cargo build --profile release --locked \
-        -p proxy -p witness-orchestrator-bin \
+        -p proxy -p witness-orchestrator-bin -p sp1-executor-canary \
         --no-default-features --features "${NETWORK}" \
     && cp /app/target/release/proxy /app/proxy \
-    && cp /app/target/release/witness-orchestrator /app/witness-orchestrator
+    && cp /app/target/release/witness-orchestrator /app/witness-orchestrator \
+    && cp /app/target/release/sp1-executor-canary /app/sp1-executor-canary
 
 ###############################################################################
 #                                                                             #
@@ -272,3 +275,47 @@ USER nonroot:nonroot
 WORKDIR /var/lib/witness
 
 ENTRYPOINT ["/usr/local/bin/witness-orchestrator"]
+
+###############################################################################
+#                                                                             #
+#                          SP1 Executor Canary Prep                           #
+#                                                                             #
+###############################################################################
+FROM debian:bookworm-slim AS rsp-canary-prep
+RUN mkdir -p /out/var/lib/canary /out/opt/elfs && \
+    chown -R 65532:65532 /out/var/lib/canary
+
+###############################################################################
+#                                                                             #
+#                            SP1 Executor Canary                              #
+#                                                                             #
+###############################################################################
+FROM gcr.io/distroless/cc-debian12:nonroot AS rsp-canary
+
+ARG NETWORK=mainnet
+
+# busybox (static) for the /metrics HTTP healthcheck — distroless has no
+# shell/wget. ~1MB overhead, single binary, musl-static.
+COPY --from=busybox:1.37.0-musl /bin/busybox /busybox
+
+COPY --from=rsp-canary-prep --chown=65532:65532 /out/var/lib/canary /var/lib/canary
+COPY --from=rsp-canary-prep /out/opt/elfs /opt/elfs
+
+# Same rsp-client ELF the proxy bakes in: canary's whole point is to
+# re-execute production blocks through the **identical** pinned ELF
+# that proxy signs preconfirmations with. If these two artifacts
+# diverge the canary stops being a canary.
+COPY rsp-client-${NETWORK}.elf /opt/elfs/sp1-client.elf
+
+COPY --from=builder /app/sp1-executor-canary /usr/local/bin/sp1-executor-canary
+
+ENV SP1_ELF_PATH=/opt/elfs/sp1-client.elf \
+    DATADIR=/var/lib/canary/canary-driver \
+    WITNESS_COLD_FILE=/var/lib/canary/canary-driver/cold.redb \
+    DB_PATH=/var/lib/canary/sp1_canary.db \
+    HOME=/var/lib/canary
+
+USER nonroot:nonroot
+WORKDIR /var/lib/canary
+
+ENTRYPOINT ["/usr/local/bin/sp1-executor-canary"]

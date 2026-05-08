@@ -4,6 +4,12 @@
 //! See `README.md` and `.env.example` for env-var configuration and the
 //! `/metrics` surface.
 
+// Hybrid lib+bin: items used externally are `pub` for the lib target.
+// The bin target reaches them via `crate::*` and rustc flags them as
+// "unreachable from this crate root". Suppress at bin level — the lib
+// target keeps the warning live for genuinely unreachable items.
+#![allow(unreachable_pub)]
+
 mod blob_builder_mdbx;
 mod block_response_cache;
 mod challenge_db;
@@ -54,6 +60,10 @@ const DEFAULT_MDBX_MAX_SIZE: u64 = 512 * 1024 * 1024 * 1024;
 const DEFAULT_WITNESS_RETENTION_BLOCKS: u64 = 172_800;
 /// Default listen address for the Prometheus `/metrics` HTTP server.
 const DEFAULT_METRICS_LISTEN_ADDR: &str = "0.0.0.0:9090";
+/// Default cap on driver lookahead vs `orchestrator_tip` (last L1-finalized
+/// L2 block). At ~1 block/s this bounds the witness hub to ~68 minutes of
+/// production ahead of L1 finalization before the driver idles.
+const DEFAULT_MAX_LOOKAHEAD_BLOCKS: u64 = 4096;
 
 /// Default `EnvFilter` directives. Trims noisy external crates to `warn` so
 /// production logs are not drowned by RPC retry / connection-pool / MDBX
@@ -159,6 +169,10 @@ async fn main() -> eyre::Result<()> {
         std::env::var("L1_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
     let l2_safe_blocks: u64 =
         std::env::var("L2_SAFE_BLOCKS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let max_lookahead_blocks: u64 = std::env::var("MAX_LOOKAHEAD_BLOCKS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_LOOKAHEAD_BLOCKS);
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(http_timeout_secs))
@@ -456,6 +470,11 @@ async fn main() -> eyre::Result<()> {
             witness_from_block,
             orchestrator_checkpoint,
             l2_safe_blocks,
+            // Driver idles when `block_number > orchestrator_tip + max_lookahead_blocks`.
+            // `orchestrator_tip` advances on L1 batch finalization, so this caps
+            // how far the witness hub can run ahead of last-finalized L1 state.
+            consumer_tip: Arc::clone(&orchestrator_tip),
+            max_lookahead_blocks,
         })
         .expect("Driver::new failed"),
     );

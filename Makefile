@@ -1,7 +1,8 @@
 .PHONY: build-client-docker build-nitro-validator-docker \
-        build-enclave build-enclave-docker build-proxy build-release \
+        build-enclave build-enclave-docker build-proxy build-canary build-release \
         run run-sp1-only run-enclave clean help \
-        compose-build compose-up compose-down compose-logs download-genesis-cache
+        compose-build compose-up compose-down compose-logs download-genesis-cache \
+        compose-build-canary compose-up-canary compose-down-canary compose-logs-canary
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 CLIENT_DIR   := bin/client
@@ -184,6 +185,12 @@ build-proxy:
 	RUSTFLAGS="-C target-cpu=native" cargo build --release -p proxy \
 		--no-default-features --features $(NETWORK)
 
+# ─── SP1 executor canary ──────────────────────────────────────────────────────
+
+build-canary:
+	RUSTFLAGS="-C target-cpu=native" cargo build --release -p sp1-executor-canary \
+		--no-default-features --features $(NETWORK)
+
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
 ## Build and run with both backends (Nitro + SP1)
@@ -226,6 +233,10 @@ help:
 	@echo "  compose-up                    Start proxy + witness-orchestrator in background"
 	@echo "  compose-down                  Stop the compose stack (volumes preserved)"
 	@echo "  compose-logs                  Tail compose logs"
+	@echo "  compose-build-canary          Build canary image (opt-in via --profile canary)"
+	@echo "  compose-up-canary             Start canary container (independent of prod stack)"
+	@echo "  compose-down-canary           Stop and remove canary container only"
+	@echo "  compose-logs-canary           Tail canary logs"
 	@echo "  clean                         Remove build artifacts"
 	@echo ""
 	@echo "Overrides:"
@@ -294,3 +305,29 @@ compose-down:
 ## Tail compose logs.
 compose-logs:
 	$(DOCKER_COMPOSE) logs -f --tail=200
+
+# ─── Docker Compose — canary profile ──────────────────────────────────────────
+# All four targets gate on `--profile canary`; without the flag,
+# `docker compose` silently skips services with `profiles:` clauses
+# (image not built / container not started, no error). Each target is
+# scoped to the `sp1-executor-canary` service so canary lifecycle is
+# independent of the production proxy + orchestrator stack.
+
+## Build canary image (opt-in). Reuses the same genesis cache + ELF
+## prerequisites as `compose-build`.
+compose-build-canary: download-genesis-cache build-client-docker build-nitro-validator-docker
+	DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
+		NETWORK=$(NETWORK) $(DOCKER_COMPOSE) --profile canary build sp1-executor-canary
+
+## Start the canary container in the background (does not affect prod stack).
+compose-up-canary:
+	NETWORK=$(NETWORK) $(DOCKER_COMPOSE) --profile canary up -d sp1-executor-canary
+
+## Stop and remove only the canary container (volumes preserved).
+compose-down-canary:
+	$(DOCKER_COMPOSE) --profile canary stop sp1-executor-canary
+	$(DOCKER_COMPOSE) --profile canary rm -f sp1-executor-canary
+
+## Tail canary logs.
+compose-logs-canary:
+	$(DOCKER_COMPOSE) logs -f --tail=200 sp1-executor-canary

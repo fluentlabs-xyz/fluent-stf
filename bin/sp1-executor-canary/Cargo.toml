@@ -1,0 +1,86 @@
+[package]
+name = "sp1-executor-canary"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sp1-executor-canary"
+path = "src/main.rs"
+
+[dependencies]
+# workspace crates (lib targets)
+# `witness-orchestrator` has its own `default = ["mainnet", "zstd-block-payload"]`
+# — disable defaults and forward the canary's network feature explicitly via
+# `[features]` below; otherwise both `mainnet` and `<chosen>` activate at once
+# and `fluent-stf-primitives` fails the mutual-exclusion compile_error.
+witness-orchestrator = { workspace = true, default-features = false }
+rsp-blob-builder.workspace = true
+rsp-host-executor = { workspace = true, default-features = false }
+rsp-client-executor = { workspace = true }
+rsp-provider.workspace = true
+fluent-stf-primitives = { workspace = true, default-features = false }
+nitro-types.workspace = true
+l1-rollup-client.workspace = true
+tracing-format.workspace = true
+
+# reth — same set the witness-orchestrator pulls (factory open + provider reads)
+reth-db.workspace = true
+reth-provider.workspace = true
+reth-chainspec.workspace = true
+reth-node-types.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-tasks.workspace = true
+
+# alloy
+alloy-primitives = { workspace = true, features = ["k256"] }
+alloy-provider.workspace = true
+alloy-network.workspace = true
+alloy-rpc-types.workspace = true
+
+# sp1
+sp1-sdk = { workspace = true, features = ["network"] }
+
+# async / runtime / tracing / errors
+tokio = { workspace = true, features = ["full"] }
+async-channel.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# metrics
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+axum.workspace = true
+
+# persistence
+rusqlite.workspace = true
+
+# misc
+bincode.workspace = true
+serde.workspace = true
+sha2 = "0.10"
+hex.workspace = true
+url.workspace = true
+
+[features]
+default = ["mainnet"]
+mainnet = [
+    "fluent-stf-primitives/mainnet",
+    "rsp-host-executor/mainnet",
+    "witness-orchestrator/mainnet",
+]
+testnet = [
+    "fluent-stf-primitives/testnet",
+    "rsp-host-executor/testnet",
+    "witness-orchestrator/testnet",
+]
+devnet  = [
+    "fluent-stf-primitives/devnet",
+    "rsp-host-executor/devnet",
+    "witness-orchestrator/devnet",
+]
+
+[lints]
+workspace = true
