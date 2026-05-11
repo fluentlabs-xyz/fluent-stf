@@ -49,7 +49,7 @@ build-client-docker: download-genesis-cache
 		--output type=local,dest=. \
 		--no-cache \
 		-f Dockerfile .
-	@if [ -f nitro-validator-$(NETWORK).vkey ]; then \
+	@if [ -f rsp-client-$(NETWORK).vkey ]; then \
 		python3 scripts/update_readme_vkeys.py \
 			rsp-client-$(NETWORK).vkey \
 			nitro-validator-$(NETWORK).vkey \

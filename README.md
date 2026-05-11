@@ -141,9 +141,10 @@ All commands below run from the repository root. To independently verify that th
 # Option A — reproduce a single network (inspect raw artifacts manually).
 #
 # NETWORK ∈ {mainnet, testnet, devnet}.
+make build-enclave-docker         NETWORK=mainnet # runs nixos/nix inside Docker
 make build-client-docker          NETWORK=mainnet
 make build-nitro-validator-docker NETWORK=mainnet
-make build-enclave-docker         NETWORK=mainnet   # runs nixos/nix inside Docker
+   
 
 jq -r .PCR0 rsp-client-enclave-mainnet.eif.pcrs.json    # must match §3.3
 cat rsp-client-mainnet.vkey                             # must match §3.3
