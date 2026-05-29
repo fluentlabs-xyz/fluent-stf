@@ -18,11 +18,12 @@ use std::fmt;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{
     fmt::{
-        format::{Format, Json, Writer},
+        format::{Format, Json, JsonFields, Writer},
         time::SystemTime,
         FmtContext, FormatEvent, FormatFields,
     },
     registry::LookupSpan,
+    Layer,
 };
 
 /// Wraps the stock JSON event formatter and prepends static identity fields.
@@ -74,6 +75,16 @@ where
             body,
         )
     }
+}
+
+pub fn json_layer<S>(service: &'static str, version: &'static str, env: String) -> impl Layer<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .event_format(ServiceJson::new(service, version, env))
+        .fmt_fields(JsonFields::new())
 }
 
 /// Minimal JSON string escape for the three static identity fields. Only the
@@ -154,7 +165,8 @@ mod tests {
         let layer = fmt::layer()
             .with_writer(CaptureWriter(buf))
             .with_ansi(false)
-            .event_format(ServiceJson::new("witness-orchestrator", "0.1.0", "test".to_string()));
+            .event_format(ServiceJson::new("witness-orchestrator", "0.1.0", "test".to_string()))
+            .fmt_fields(fmt::format::JsonFields::new());
         Registry::default().with(layer)
     }
 
@@ -180,5 +192,26 @@ mod tests {
         assert_eq!(parsed["service"], "witness-orchestrator");
         assert_eq!(parsed["version"], "0.1.0");
         assert_eq!(parsed["env"], "test");
+    }
+
+    #[test]
+    fn span_fields_render_as_json_object() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        tracing::subscriber::with_default(build_subscriber(Arc::clone(&buf)), || {
+            let span = tracing::info_span!("witness_phase", block_number = 42u64);
+            let _e = span.enter();
+            tracing::info!("inside span");
+        });
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let line = output.lines().next().expect("at least one log line");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+
+        assert_eq!(parsed["span"]["name"], "witness_phase");
+        assert_eq!(parsed["span"]["block_number"], 42);
+        assert!(
+            parsed["span"].get("field_error").is_none(),
+            "span rendered with field_error — JsonFields wiring regressed: {}",
+            parsed["span"]
+        );
     }
 }

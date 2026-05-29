@@ -843,6 +843,7 @@ impl Driver {
         if self.max_lookahead_blocks != u64::MAX {
             let consumer = self.consumer_tip.load(std::sync::atomic::Ordering::Relaxed);
             if block_number > consumer.saturating_add(self.max_lookahead_blocks) {
+                crate::metrics::count_lookahead_gate_idle();
                 return Ok(Produced::Idle);
             }
         }
@@ -1249,15 +1250,16 @@ async fn rewitness_phase(
 }
 
 /// Boot-time unwind entry. `target` is interpreted with reth-CLI semantic:
-/// `UNWIND_TO_BLOCK=N` removes N and everything above (new MDBX tip = N-1).
-/// Bounds checks short-circuit (warn/info + skip, never error) for:
-///   - `target == 0`       — would underflow `N-1`.
-///   - `target > mdbx_tip` — likely typo; silent no-op with warn.
+/// the target block is REMOVED along with everything above it (new MDBX tip =
+/// `target - 1`). Bounds checks short-circuit (warn/info + skip, never error)
+/// for:
+///   - `target == 0`       — would underflow `target - 1`.
+///   - `target > mdbx_tip` — nothing to remove; no-op with warn.
 ///   - `target == mdbx_tip` — already aligned.
 ///
 /// Must be called exactly once, between `open_writable_factory` and
-/// `Driver::new`. Fatal on MDBX or cold-store failure — operator restarts
-/// with env still set and the next boot retries.
+/// `Driver::new`. Fatal on MDBX or cold-store failure — operator restarts and
+/// the next boot retries.
 pub async fn unwind_to(
     factory: ProviderFactory<DriverNode>,
     hub: Arc<WitnessHub>,
@@ -1267,23 +1269,23 @@ pub async fn unwind_to(
         factory.best_block_number().map_err(|e| eyre!("unwind: best_block_number: {e}"))?;
 
     if target == 0 {
-        warn!(target, "UNWIND_TO_BLOCK=0 is not supported (minimum is 1) — skipping");
+        warn!(target, "unwind target 0 is not supported (minimum is 1) — skipping");
         return Ok(());
     }
     if target > mdbx_tip_before {
-        warn!(target, mdbx_tip_before, "UNWIND_TO_BLOCK above current tip — skipping");
+        warn!(target, mdbx_tip_before, "unwind target above current tip — skipping");
         return Ok(());
     }
     if target == mdbx_tip_before {
-        info!(target, "UNWIND_TO_BLOCK matches current tip — skipping");
+        info!(target, "unwind target matches current tip — skipping");
         return Ok(());
     }
 
-    // reth-CLI semantic: `UNWIND_TO_BLOCK=N` means N is REMOVED along with
-    // everything above. The provider API keeps the argument block, so we pass
-    // N-1 to get the intended "strictly below N" retention.
+    // reth-CLI semantic: the target block N is REMOVED along with everything
+    // above. The provider API keeps the argument block, so we pass N-1 to get
+    // the intended "strictly below N" retention.
     let keep = target - 1;
-    info!(target, keep, mdbx_tip_before, "UNWIND_TO_BLOCK — starting MDBX + static_files unwind");
+    info!(target, keep, mdbx_tip_before, "starting MDBX + static_files unwind");
 
     let factory_clone = factory.clone();
     tokio::task::spawn_blocking(move || -> eyre::Result<()> {
@@ -1307,11 +1309,63 @@ pub async fn unwind_to(
 
     info!(
         target,
-        mdbx_tip_before,
-        mdbx_tip_after,
-        cold_removed_count,
-        cold_bytes_freed,
-        "Unwind complete — remember to UNSET UNWIND_TO_BLOCK before next restart"
+        mdbx_tip_before, mdbx_tip_after, cold_removed_count, cold_bytes_freed, "Unwind complete"
     );
     Ok(())
+}
+
+/// Boot-time unwind target for resume, given the dispatch `checkpoint`, the
+/// current MDBX `tip`, and whether the lowest needed block (`checkpoint + 1`)
+/// is present in cold.
+///
+/// The driver re-witnesses `[checkpoint+1 .. tip]` bottom-up; a block missing
+/// from cold falls through to `execute_exex_with_block` at depth `tip - N`
+/// (OOM-prone). `checkpoint + 1` is both the lowest and the deepest such block,
+/// and cold is a contiguous suffix, so its presence alone decides safety. On a
+/// cold miss we return `Some(checkpoint + 1)`: [unwind_to] removes that block
+/// and everything above it, landing `tip = checkpoint`, after which the whole
+/// gap rebuilds via the bounded fresh-tip path.
+///
+/// Returns `None` when the range has no block strictly below the tip (the lone
+/// tip block re-witnesses at depth 0, always safe) or when the lowest block is
+/// already a cold hit.
+pub fn resume_unwind_target(checkpoint: u64, tip: u64, lowest_needed_in_cold: bool) -> Option<u64> {
+    if checkpoint + 1 < tip && !lowest_needed_in_cold {
+        Some(checkpoint + 1)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_unwind_target;
+
+    #[test]
+    fn deep_gap_cold_miss_unwinds_to_checkpoint() {
+        assert_eq!(resume_unwind_target(100, 1000, false), Some(101));
+    }
+
+    #[test]
+    fn deep_gap_cold_hit_no_unwind() {
+        assert_eq!(resume_unwind_target(100, 1000, true), None);
+    }
+
+    #[test]
+    fn lone_tip_block_no_unwind_even_on_miss() {
+        // checkpoint + 1 == tip: the only needed block is at the tip (depth 0),
+        // safe to re-witness on a cold miss; no unwind.
+        assert_eq!(resume_unwind_target(999, 1000, false), None);
+    }
+
+    #[test]
+    fn checkpoint_at_or_above_tip_no_unwind() {
+        assert_eq!(resume_unwind_target(1000, 1000, false), None);
+        assert_eq!(resume_unwind_target(1001, 1000, false), None);
+    }
+
+    #[test]
+    fn boundary_two_block_gap_unwinds() {
+        assert_eq!(resume_unwind_target(998, 1000, false), Some(999));
+    }
 }

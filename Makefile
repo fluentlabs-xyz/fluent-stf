@@ -315,8 +315,8 @@ compose-logs:
 
 ## Build canary image (opt-in). Reuses the same genesis cache + ELF
 ## prerequisites as `compose-build`.
-compose-build-canary: download-genesis-cache build-client-docker build-nitro-validator-docker
-	DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
+compose-build-canary:
+		DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
 		NETWORK=$(NETWORK) $(DOCKER_COMPOSE) --profile canary build sp1-executor-canary
 
 ## Start the canary container in the background (does not affect prod stack).

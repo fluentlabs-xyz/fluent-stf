@@ -8,8 +8,7 @@
 //!   BEFORE allocating a nonce (defer-allocate ordering).
 //! - [`bump_loop`] — broadcast → sleep+poll → bump → broadcast cycle.
 //! - [`try_broadcast`] / [`poll_for_terminal`] — extracted phases of the loop.
-//! - [`handle_submitted`] / [`handle_reverted`] / [`handle_failed_then_undispatch`] — terminal
-//!   outcome handlers, used by both the loop and `preflight`.
+//! - [`handle_submitted`] / [`handle_reverted`] — terminal outcome handlers.
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
@@ -88,6 +87,13 @@ impl RbfObserver for PreconfirmObserver<'_> {
                 "record_broadcast failed"
             );
             return;
+        }
+        let to_block = {
+            let g = self.shared.db.lock().unwrap_or_else(|e| e.into_inner());
+            g.find_batch(self.batch_index).map(|b| b.to_block)
+        };
+        if let Some(to_block) = to_block {
+            crate::orchestrator::advance_orchestrator_tip(&self.shared.orchestrator_tip, to_block);
         }
         info!(
             batch_index = self.batch_index,
@@ -256,6 +262,26 @@ pub(crate) async fn run(
 
     let nonce = shared.nonce_allocator.allocate();
     crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
+
+    // Write-ahead the nonce binding before any broadcast. After this durable
+    // commit a crash/cancel resumes at THIS nonce via `first_inflight_resume`
+    // instead of re-allocating — which is what prevents the duplicate
+    // preconfirmBatch double-dispatch. This is the only place a release is
+    // correct: nothing has been broadcast yet.
+    if let Err(e) = db::record_dispatch_intent(&shared.db_tx, batch_index, nonce, fee, tip).await {
+        warn!(
+            batch_index,
+            nonce,
+            err = %e,
+            event = "record_dispatch_intent_failed",
+            "record_dispatch_intent failed — releasing nonce, no broadcast"
+        );
+        if !shared.nonce_allocator.release_with_outcome(nonce) {
+            crate::metrics::count_nonce_leak();
+        }
+        crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
+        return;
+    }
 
     let template = partial.with_nonce(nonce);
 
@@ -592,10 +618,11 @@ async fn bump_loop(
 
     let mut max_fee_per_gas = initial_fee;
     let mut max_priority_fee_per_gas = initial_tip;
-    let mut current_hash: Option<B256> = resume.as_ref().map(|r| r.tx_hash);
-    // The resume path inherits an in-mempool tx from a prior process;
-    // skip the first broadcast so we do not get an "already known" reject.
-    let mut just_resumed = resume.is_some();
+    let mut current_hash: Option<B256> = resume.as_ref().and_then(|r| r.tx_hash);
+    // Skip the first broadcast only when we inherit a real in-mempool tx (resume
+    // WITH a persisted tx_hash). A write-ahead intent row (nonce persisted,
+    // tx_hash NULL) has no prior tx, so we broadcast at the persisted nonce.
+    let mut just_resumed = current_hash.is_some();
     let mut at_cap_logged = max_fee_per_gas >= max_fee_cap;
     // Resume already at-cap anchors at the current L1 block — we don't
     // know when the prior process first hit cap, so the budget restarts
@@ -645,9 +672,16 @@ async fn bump_loop(
                         batch_index,
                         elapsed_blocks,
                         block_budget,
-                        "RBF: stuck at fee cap past L1 block budget — giving up so dispatcher can retry"
+                        "RBF: stuck at fee cap past L1 block budget — pausing; will resume at the \
+                         SAME nonce (no undispatch, no re-allocation)"
                     );
-                    handle_failed_then_undispatch(observer, backoff, "stuck-at-cap timeout").await;
+                    // Do NOT roll back to Accepted: the tx at this nonce is still
+                    // live in the mempool. Undispatch would re-dispatch the batch
+                    // at a NEW nonce while the old tx remains; when the old one
+                    // mines the new one reverts (double-dispatch). Leaving the row
+                    // Dispatched lets first_inflight_resume re-bump the SAME nonce
+                    // once backoff elapses.
+                    backoff.apply("stuck-at-cap timeout");
                     return;
                 }
             }
@@ -689,7 +723,7 @@ async fn try_broadcast(
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
     current_hash: Option<B256>,
-    nonce: u64,
+    _nonce: u64,
     observer: &dyn RbfObserver,
     backoff: &mut DispatchBackoff,
 ) -> BroadcastResult {
@@ -701,10 +735,10 @@ async fn try_broadcast(
     let t = std::time::Instant::now();
     let res = tokio::select! {
         _ = cancel.cancelled() => {
-            if was_first && !shared.nonce_allocator.release_with_outcome(nonce) {
-                crate::metrics::count_nonce_leak();
-                warn!(batch_index, nonce, "NonceAllocator: release lost race — leaked");
-            }
+            // The nonce is durably bound to this batch (write-ahead intent)
+            // before we reach here, so it must NOT be released — restart
+            // resumes at this nonce. Releasing would let a later allocate()
+            // hand the same nonce to a different batch within the process.
             crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
             info!(batch_index, "RBF dispatch cancelled (shutdown)");
             return BroadcastResult::Done;
@@ -746,7 +780,6 @@ async fn try_broadcast(
                 template,
                 e,
                 current_hash,
-                nonce,
                 observer,
                 backoff,
             )
@@ -762,7 +795,6 @@ async fn handle_broadcast_error(
     template: &RollupTxTemplate,
     err: eyre::Report,
     current_hash: Option<B256>,
-    nonce: u64,
     observer: &dyn RbfObserver,
     backoff: &mut DispatchBackoff,
 ) -> BroadcastResult {
@@ -774,13 +806,16 @@ async fn handle_broadcast_error(
     .increment(1);
 
     let Some(prior) = current_hash else {
-        // After defer-allocate this branch fires only when the wallet-
-        // exclusivity invariant is broken (an external tx ate our slot
-        // between allocate and the very first broadcast — a tiny race
-        // window). Resync rebases the allocator to the new pending so
-        // future allocations land on a free slot. Releasing here would
-        // re-issue the same nonce we just lost, producing duplicates.
+        // First broadcast failed. The nonce binding is already persisted
+        // (write-ahead intent), so the nonce is NOT released here — leaving
+        // the intent lets `first_inflight_resume` re-broadcast at the same
+        // nonce on the next tick, which is what keeps the dispatch idempotent
+        // across crashes (no re-allocation, no duplicate).
         if is_nonce_too_low_error(&msg) {
+            // The nonce is dead — already consumed on-chain, so no orphan can
+            // ever mine at it. Rebase the allocator past pending and roll the
+            // intent back to Accepted so the next dispatch takes a fresh nonce
+            // instead of looping forever re-broadcasting the dead one.
             match shared
                 .nonce_allocator
                 .resync(&shared.config.l1_provider, shared.config.l1_signer_address)
@@ -794,12 +829,7 @@ async fn handle_broadcast_error(
                     warn!(batch_index, err = %sync_err, "NonceAllocator resync after nonce-too-low failed");
                 }
             }
-        } else {
-            if !shared.nonce_allocator.release_with_outcome(nonce) {
-                crate::metrics::count_nonce_leak();
-                warn!(batch_index, nonce, "NonceAllocator: release lost race — leaked");
-            }
-            crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
+            observer.on_pre_receipt_failure("initial broadcast nonce-too-low").await;
         }
         warn!(batch_index, err = %msg, "initial broadcast failed");
         backoff.apply("initial broadcast failed");
@@ -989,15 +1019,6 @@ async fn handle_reverted(
         RevertKind::Oog => {}
         RevertKind::Logic => backoff.apply("Dispatch reverted (logic)"),
     }
-}
-
-async fn handle_failed_then_undispatch(
-    observer: &dyn RbfObserver,
-    backoff: &mut DispatchBackoff,
-    reason: &'static str,
-) {
-    observer.on_pre_receipt_failure(reason).await;
-    backoff.apply(reason);
 }
 
 /// Best-effort current L1 block number for the chain-time stuck-at-cap

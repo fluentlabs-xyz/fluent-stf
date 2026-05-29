@@ -575,10 +575,13 @@ async fn handle_dispatched_resume(
         return;
     }
 
-    let resume = match (row.tx_hash, row.max_fee_per_gas, row.max_priority_fee_per_gas) {
-        (Some(h), Some(fee), Some(tip)) => Some(RbfResumeState {
+    // An intent row (nonce + fees persisted, tx_hash NULL — write-ahead before
+    // the first broadcast) resumes with `tx_hash: None`; bump_loop then
+    // broadcasts at the persisted nonce instead of skipping to the poll.
+    let resume = match (row.max_fee_per_gas, row.max_priority_fee_per_gas) {
+        (Some(fee), Some(tip)) => Some(RbfResumeState {
             nonce,
-            tx_hash: h,
+            tx_hash: row.tx_hash,
             max_fee_per_gas: fee,
             max_priority_fee_per_gas: tip,
         }),
@@ -721,6 +724,27 @@ async fn run_resolve_lifecycle(
 
     let nonce = shared.nonce_allocator.allocate();
     crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
+
+    // Write-ahead the nonce binding before the first broadcast (see
+    // db::record_dispatch_intent). A crash/cancel after this durable commit
+    // resumes at THIS nonce via the Dispatched-status active-row path instead
+    // of re-allocating. Only place a release is correct: nothing broadcast yet.
+    if let Err(e) =
+        db::record_challenge_dispatch_intent(&shared.db_tx, row.challenge_id, nonce, fee, tip).await
+    {
+        warn!(
+            challenge_id = row.challenge_id,
+            nonce,
+            err = %e,
+            event = "record_challenge_dispatch_intent_failed",
+            "record_challenge_dispatch_intent failed — releasing nonce, no broadcast"
+        );
+        if !shared.nonce_allocator.release_with_outcome(nonce) {
+            crate::metrics::count_nonce_leak();
+        }
+        crate::metrics::set_nonce_allocator_next(shared.nonce_allocator.peek());
+        return;
+    }
 
     let template = partial.with_nonce(nonce);
     let observer = ResolveObserver {

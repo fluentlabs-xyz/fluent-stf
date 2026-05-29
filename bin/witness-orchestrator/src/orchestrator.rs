@@ -20,7 +20,6 @@
 //! queue independent of the feeder.
 
 use std::{
-    collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -418,7 +417,6 @@ pub(crate) struct Orchestrator {
     shared: Arc<OrchestratorShared>,
     hub: Arc<WitnessHub>,
     feeder_starting_block: u64,
-    initial_checkpoint: u64,
     high_rx: AsyncReceiver<ExecutionTask>,
     normal_tx: AsyncSender<ExecutionTask>,
     normal_rx: AsyncReceiver<ExecutionTask>,
@@ -523,7 +521,6 @@ impl Orchestrator {
             shared,
             hub,
             feeder_starting_block,
-            initial_checkpoint,
             high_rx,
             normal_tx,
             normal_rx,
@@ -541,7 +538,6 @@ impl Orchestrator {
             shared,
             hub,
             feeder_starting_block,
-            initial_checkpoint,
             high_rx,
             normal_tx,
             normal_rx,
@@ -550,8 +546,7 @@ impl Orchestrator {
             l1_events,
         } = self;
 
-        let from_block = initial_checkpoint + 1;
-        info!(from_block, "Orchestrator ready — awaiting witnesses");
+        info!(from_block = feeder_starting_block, "Orchestrator ready — awaiting witnesses");
 
         let mut workers: JoinSet<()> = JoinSet::new();
         for i in 0..EXECUTION_WORKERS {
@@ -646,7 +641,7 @@ impl Orchestrator {
             let shared = Arc::clone(&shared);
             tasks.spawn(
                 async move {
-                    router(shared, l1_events, result_rx, initial_checkpoint).await;
+                    router(shared, l1_events, result_rx).await;
                     "router"
                 }
                 .instrument(tracing::info_span!("router", worker = "router")),
@@ -1186,7 +1181,7 @@ async fn startup_recovery_feeder(
         let payload = match driver.get_or_build_witness(block_number).await {
             Ok(Some(p)) => p,
             Ok(None) => {
-                warn!(block_number, "Startup recovery: witness not available — skipping");
+                debug!(block_number, "Startup recovery: witness not available — skipping");
                 continue;
             }
             Err(e) => {
@@ -1355,7 +1350,7 @@ async fn dispatcher_worker(shared: Arc<OrchestratorShared>) {
                     info!(
                         batch_index,
                         nonce = resume.nonce,
-                        tx_hash = %resume.tx_hash,
+                        tx_hash = ?resume.tx_hash,
                         max_fee_per_gas = resume.max_fee_per_gas,
                         max_priority_fee_per_gas = resume.max_priority_fee_per_gas,
                         "RBF: resuming dispatched batch from persisted state"
@@ -1624,10 +1619,7 @@ async fn apply_finalization_changes(
                     let blocks: Vec<u64> = (from_block..=to_block).collect();
                     c.purge(&blocks);
                 }
-                let current = orchestrator_tip.load(Ordering::Relaxed);
-                if to_block > current {
-                    orchestrator_tip.store(to_block, Ordering::Relaxed);
-                }
+                advance_orchestrator_tip(orchestrator_tip, to_block);
                 info!(
                     batch_index,
                     event = "batch_finalized",
@@ -1702,17 +1694,25 @@ async fn apply_finalization_changes(
     }
 }
 
-/// Owns the per-process `checkpoint` + `confirmed` state used to advance
-/// the L2 watermark monotonically and triggers shutdown on `BatchReverted`.
+/// Monotonic watermark advance for `OrchestratorShared.orchestrator_tip`.
+/// All writers route through this helper — direct `tip.store(...)` is
+/// forbidden, otherwise a stale value silently regresses the watermark and
+/// starves the driver via the lookahead gate.
+pub(crate) fn advance_orchestrator_tip(atomic: &AtomicU64, to_block: u64) {
+    let cur = atomic.load(Ordering::Relaxed);
+    if to_block > cur {
+        atomic.store(to_block, Ordering::Relaxed);
+    }
+}
+
+/// Multiplexes L1 events and execution results onto their respective
+/// handlers. Exits on `BatchReverted` (handled inside `handle_l1_event`)
+/// or shutdown.
 async fn router(
     shared: Arc<OrchestratorShared>,
     mut l1_events: mpsc::Receiver<L1Event>,
     mut block_results: mpsc::Receiver<BlockResult>,
-    initial_checkpoint: u64,
 ) {
-    let mut checkpoint = initial_checkpoint;
-    let mut confirmed: HashSet<u64> = HashSet::new();
-
     loop {
         tokio::select! {
             biased;
@@ -1721,7 +1721,7 @@ async fn router(
                 handle_l1_event(&shared, event).await;
             }
             Some(result) = block_results.recv() => {
-                handle_block_result(&shared, result, &mut checkpoint, &mut confirmed).await;
+                handle_block_result(&shared, result).await;
             }
         }
     }
@@ -1738,6 +1738,14 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
         L1Event::BatchSubmitted { batch_index } => {
             if let Err(e) = db::observe_submitted(&shared.db_tx, batch_index).await {
                 error!(batch_index, err = %e, "observe_submitted failed");
+                return;
+            }
+            let to_block = {
+                let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
+                g.find_batch(batch_index).map(|b| b.to_block)
+            };
+            if let Some(to_block) = to_block {
+                advance_orchestrator_tip(&shared.orchestrator_tip, to_block);
             }
         }
         L1Event::BatchPreconfirmed { batch_index, tx_hash, l1_block } => {
@@ -1752,7 +1760,7 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
                 error!(batch_index, err = %e, "observe_preconfirmed failed");
                 return;
             }
-            {
+            let to_block = {
                 let g = shared.db.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(batch) = g.find_batch(batch_index) {
                     crate::metrics::set_last_batch_preconfirmed(
@@ -1760,7 +1768,13 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
                         batch.from_block,
                         batch.to_block,
                     );
+                    Some(batch.to_block)
+                } else {
+                    None
                 }
+            };
+            if let Some(to_block) = to_block {
+                advance_orchestrator_tip(&shared.orchestrator_tip, to_block);
             }
         }
         L1Event::Checkpoint(l1_block) => {
@@ -1842,12 +1856,7 @@ async fn handle_l1_event(shared: &OrchestratorShared, event: L1Event) {
     }
 }
 
-async fn handle_block_result(
-    shared: &OrchestratorShared,
-    result: BlockResult,
-    checkpoint: &mut u64,
-    confirmed: &mut HashSet<u64>,
-) {
+async fn handle_block_result(shared: &OrchestratorShared, result: BlockResult) {
     let block_number = result.block_number;
 
     if shared.cache.lock().unwrap_or_else(|e| e.into_inner()).contains(block_number) {
@@ -1875,14 +1884,6 @@ async fn handle_block_result(
     }
 
     metrics::gauge!(crate::metrics::LAST_BLOCK_EXECUTED).set(block_number as f64);
-
-    confirmed.insert(block_number);
-    while confirmed.contains(&(*checkpoint + 1)) {
-        *checkpoint += 1;
-        confirmed.remove(checkpoint);
-    }
-    let cp = *checkpoint;
-    shared.orchestrator_tip.store(cp, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -1940,5 +1941,59 @@ mod tests {
         let (fee_out, tip_out, _) = bump_fees(max_fee, tip, 20, u128::MAX);
         assert!(fee_out >= max_fee * 1125 / 1000);
         assert!(tip_out >= tip * 1125 / 1000);
+    }
+
+    #[test]
+    fn advance_orchestrator_tip_is_monotonic() {
+        let tip = AtomicU64::new(1000);
+
+        advance_orchestrator_tip(&tip, 500);
+        assert_eq!(tip.load(Ordering::Relaxed), 1000, "lower candidate must not regress");
+
+        advance_orchestrator_tip(&tip, 1500);
+        assert_eq!(tip.load(Ordering::Relaxed), 1500, "higher candidate must advance");
+
+        advance_orchestrator_tip(&tip, 1500);
+        assert_eq!(tip.load(Ordering::Relaxed), 1500, "equal candidate must not store");
+
+        advance_orchestrator_tip(&tip, 100);
+        assert_eq!(tip.load(Ordering::Relaxed), 1500, "regression attempt is no-op");
+    }
+
+    #[test]
+    fn tip_advances_through_batch_lifecycle() {
+        // Mirrors the call pattern across the four lifecycle sites
+        // (Accepted, Dispatched, Preconfirmed, Finalized) for a single batch
+        // followed by the next batch. First observation of a new to_block
+        // advances; subsequent stages on the same batch are idempotent no-ops.
+        let tip = AtomicU64::new(100);
+
+        // BatchCommitted is not a trigger.
+        assert_eq!(tip.load(Ordering::Relaxed), 100);
+
+        // BatchSubmitted -> Accepted advance fires (batch 10, to_block=200).
+        advance_orchestrator_tip(&tip, 200);
+        assert_eq!(tip.load(Ordering::Relaxed), 200);
+
+        // record_first_broadcast -> Dispatched (idempotent).
+        advance_orchestrator_tip(&tip, 200);
+        assert_eq!(tip.load(Ordering::Relaxed), 200);
+
+        // BatchPreconfirmed (idempotent).
+        advance_orchestrator_tip(&tip, 200);
+        assert_eq!(tip.load(Ordering::Relaxed), 200);
+
+        // Finalized via apply_finalization_changes (idempotent).
+        advance_orchestrator_tip(&tip, 200);
+        assert_eq!(tip.load(Ordering::Relaxed), 200);
+
+        // Next batch (idx=11, to_block=300): Accepted advance fires again.
+        advance_orchestrator_tip(&tip, 300);
+        assert_eq!(tip.load(Ordering::Relaxed), 300);
+
+        advance_orchestrator_tip(&tip, 300);
+        advance_orchestrator_tip(&tip, 300);
+        advance_orchestrator_tip(&tip, 300);
+        assert_eq!(tip.load(Ordering::Relaxed), 300);
     }
 }

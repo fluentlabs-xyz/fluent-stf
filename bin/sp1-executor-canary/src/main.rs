@@ -63,12 +63,11 @@ fn init_tracing() {
 
     match format.as_str() {
         "json" => {
-            let layer =
-                fmt::layer().with_ansi(false).event_format(tracing_format::ServiceJson::new(
-                    "sp1-executor-canary",
-                    env!("CARGO_PKG_VERSION"),
-                    deploy_env,
-                ));
+            let layer = tracing_format::json_layer(
+                "sp1-executor-canary",
+                env!("CARGO_PKG_VERSION"),
+                deploy_env,
+            );
             tracing_subscriber::registry().with(env_filter).with(layer).init();
         }
         _ => {

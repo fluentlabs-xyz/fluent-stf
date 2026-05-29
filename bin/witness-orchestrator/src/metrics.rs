@@ -58,6 +58,8 @@ pub(crate) const CHALLENGE_REORG_DETECTED_TOTAL: &str =
     "orchestrator_challenge_reorg_detected_total";
 pub(crate) const BATCH_REORG_DETECTED_TOTAL: &str = "orchestrator_batch_reorg_detected_total";
 
+pub(crate) const LOOKAHEAD_GATE_IDLE_TOTAL: &str = "orchestrator_lookahead_gate_idle_total";
+
 // Histogram (not counter) so the cumulative spend is readable via `_sum`;
 // a `u64` counter cannot represent sub-ETH amounts (`0.002 as u64 == 0`).
 pub(crate) const L1_DISPATCH_COST_ETH: &str = "orchestrator_l1_dispatch_cost_eth";
@@ -240,6 +242,13 @@ pub(crate) fn install() -> eyre::Result<PrometheusHandle> {
          — suspected L1 reorg. Status rolled back to Dispatched; \
          dispatcher resumes RBF against the persisted nonce."
     );
+    metrics::describe_counter!(
+        LOOKAHEAD_GATE_IDLE_TOTAL,
+        "Driver background loop idled because the consumer-supplied lookahead \
+         watermark blocked production (block_number > orchestrator_tip + \
+         max_lookahead_blocks). Sentinel — non-zero rate after the per-batch \
+         advance fix means the orchestrator_tip is regressing again."
+    );
 
     metrics::describe_histogram!(
         L1_DISPATCH_COST_ETH,
@@ -339,6 +348,10 @@ pub(crate) fn count_challenge_reorg_detected() {
 
 pub(crate) fn count_batch_reorg_detected() {
     metrics::counter!(BATCH_REORG_DETECTED_TOTAL).increment(1);
+}
+
+pub(crate) fn count_lookahead_gate_idle() {
+    metrics::counter!(LOOKAHEAD_GATE_IDLE_TOTAL).increment(1);
 }
 
 /// Classify a sign-endpoint error by substring. Any error whose display output

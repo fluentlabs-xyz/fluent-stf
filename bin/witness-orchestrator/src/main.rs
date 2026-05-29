@@ -90,12 +90,11 @@ fn init_tracing() {
 
     match format.as_str() {
         "json" => {
-            let layer =
-                fmt::layer().with_ansi(false).event_format(tracing_format::ServiceJson::new(
-                    "witness-orchestrator",
-                    env!("CARGO_PKG_VERSION"),
-                    deploy_env,
-                ));
+            let layer = tracing_format::json_layer(
+                "witness-orchestrator",
+                env!("CARGO_PKG_VERSION"),
+                deploy_env,
+            );
             tracing_subscriber::registry().with(env_filter).with(layer).init();
         }
         _ => {
@@ -421,35 +420,41 @@ async fn main() -> eyre::Result<()> {
     )
     .expect("failed to open writable ProviderFactory");
 
-    // Cold-aware auto-align. Must run AFTER heal_static_files_if_needed
-    // (performed inside open_writable_factory) and BEFORE Driver::new, since
-    // Driver::new snapshots `start_tip` once and never re-reads it. SQLite is
-    // NOT reconciled here — operator's responsibility.
+    // Cold-aware auto-unwind. The driver re-witnesses [checkpoint+1 .. mdbx_tip]
+    // bottom-up; a block absent from cold falls through to the depth-O(gap),
+    // OOM-prone execute_exex_with_block rebuild. checkpoint+1 is the lowest and
+    // deepest such block, and cold is a contiguous suffix, so probing it alone
+    // decides safety: a cold hit means every shallower needed block is covered
+    // too; a cold miss means we unwind the node to `checkpoint` and let the gap
+    // rebuild via the allocation-bounded fresh-tip path.
     //
-    // Unwind to `cold_last` when cold trails MDBX. The re-witness branch falls
-    // through to `execute_exex_with_block` on cold-miss, whose multiproof
-    // construction is OOM-prone at depth, so we keep re-witness on the cold-hit
-    // path and let the fresh-tip path rebuild below `cold_last` (allocation-
-    // bounded per block).
+    // Must run AFTER heal_static_files_if_needed (performed inside
+    // open_writable_factory) and BEFORE Driver::new, since Driver::new snapshots
+    // `start_tip` once and never re-reads it. SQLite is NOT reconciled here —
+    // operator's responsibility.
     let unwind_target: Option<u64> = {
         let mdbx_tip = factory
             .best_block_number()
             .map_err(|e| eyre::eyre!("startup best_block_number: {e}"))?;
-        let cold_last = hub
-            .last_committed_block()
-            .map_err(|e| eyre::eyre!("startup hub.last_committed_block: {e}"))?
-            .unwrap_or(0);
-        if mdbx_tip > cold_last {
+        let lowest_needed_in_cold = hub.get_witness(orchestrator_checkpoint + 1).await.is_some();
+        let target =
+            driver::resume_unwind_target(orchestrator_checkpoint, mdbx_tip, lowest_needed_in_cold);
+        if target.is_some() {
+            let cold_last = hub
+                .last_committed_block()
+                .map_err(|e| eyre::eyre!("startup hub.last_committed_block: {e}"))?
+                .unwrap_or(0);
             info!(
-                cold_last,
+                orchestrator_checkpoint,
                 mdbx_tip,
-                gap = mdbx_tip - cold_last,
-                "Cold trails MDBX — auto-unwind to cold_last to keep re-witness on cold-hit path"
+                cold_last,
+                probe_block = orchestrator_checkpoint + 1,
+                gap = mdbx_tip - orchestrator_checkpoint,
+                "Lowest needed block absent from cold — auto-unwind to checkpoint so the \
+                 gap rebuilds via the bounded fresh-tip path"
             );
-            Some(cold_last)
-        } else {
-            None
         }
+        target
     };
 
     if let Some(target) = unwind_target {

@@ -37,7 +37,10 @@ use crate::types::{EthExecutionResponse, SubmitBatchResponse};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RbfResumeState {
     pub(crate) nonce: u64,
-    pub(crate) tx_hash: B256,
+    /// `None` for a write-ahead intent row: the nonce is persisted but the
+    /// first broadcast either has not happened or was not recorded before a
+    /// crash. The resume path re-broadcasts at `nonce` in that case.
+    pub(crate) tx_hash: Option<B256>,
     pub(crate) max_fee_per_gas: u128,
     pub(crate) max_priority_fee_per_gas: u128,
 }
@@ -594,7 +597,7 @@ impl Db {
                         max_fee_per_gas, max_priority_fee_per_gas \
                  FROM batches \
                  WHERE status = 'dispatched' \
-                   AND nonce IS NOT NULL AND tx_hash IS NOT NULL \
+                   AND nonce IS NOT NULL \
                    AND max_fee_per_gas IS NOT NULL AND max_priority_fee_per_gas IS NOT NULL \
                    AND signature IS NOT NULL \
                    AND l1_block IS NULL \
@@ -605,7 +608,7 @@ impl Db {
             let batch_index: i64 = row.get(0)?;
             let sig_blob: Vec<u8> = row.get(1)?;
             let nonce: i64 = row.get(2)?;
-            let tx_hash_blob: Vec<u8> = row.get(3)?;
+            let tx_hash_blob: Option<Vec<u8>> = row.get(3)?;
             let max_fee: String = row.get(4)?;
             let max_priority: String = row.get(5)?;
             let sig: SubmitBatchResponse = bincode::deserialize(&sig_blob).map_err(|e| {
@@ -615,13 +618,17 @@ impl Db {
                     Box::new(std::io::Error::other(format!("signature: {e}"))),
                 )
             })?;
-            let tx_hash = B256::try_from(tx_hash_blob.as_slice()).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Blob,
-                    Box::new(std::io::Error::other(format!("tx_hash: {e}"))),
-                )
-            })?;
+            let tx_hash = tx_hash_blob
+                .map(|blob| {
+                    B256::try_from(blob.as_slice()).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Blob,
+                            Box::new(std::io::Error::other(format!("tx_hash: {e}"))),
+                        )
+                    })
+                })
+                .transpose()?;
             let resume = RbfResumeState {
                 nonce: nonce as u64,
                 tx_hash,
@@ -1764,6 +1771,28 @@ pub(crate) async fn record_first_broadcast(
     db_send_sync(db_tx, SyncOp::PatchBatch { batch_index, patch }).await
 }
 
+/// Write-ahead the (batch -> nonce) binding BEFORE the first broadcast. Sets
+/// `status=Dispatched` + nonce + fees; `tx_hash` stays NULL until the broadcast
+/// is confirmed by `record_first_broadcast`. Synchronous (awaits the SQLite
+/// commit) so the binding is durable before any tx is emitted — a crash after
+/// this point resumes at the same nonce instead of re-allocating.
+pub(crate) async fn record_dispatch_intent(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    batch_index: u64,
+    nonce: u64,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> eyre::Result<()> {
+    let patch = BatchPatch {
+        status: Some(BatchStatus::Dispatched),
+        nonce: Some(Some(nonce)),
+        max_fee_per_gas: Some(Some(max_fee_per_gas)),
+        max_priority_fee_per_gas: Some(Some(max_priority_fee_per_gas)),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchBatch { batch_index, patch }).await
+}
+
 pub(crate) async fn record_rebroadcast(
     db_tx: &mpsc::UnboundedSender<DbCommand>,
     batch_index: u64,
@@ -1939,6 +1968,26 @@ pub(crate) async fn record_challenge_first_broadcast(
     db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
 }
 
+/// Challenge-side counterpart of `record_dispatch_intent`: write-ahead the
+/// (challenge -> nonce) binding before the first resolve broadcast. `tx_hash`
+/// stays NULL until `record_challenge_first_broadcast`.
+pub(crate) async fn record_challenge_dispatch_intent(
+    db_tx: &mpsc::UnboundedSender<DbCommand>,
+    challenge_id: i64,
+    nonce: u64,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+) -> eyre::Result<()> {
+    let patch = ChallengePatch {
+        status: Some(ChallengeStatus::Dispatched),
+        nonce: Some(Some(nonce)),
+        max_fee_per_gas: Some(Some(max_fee_per_gas)),
+        max_priority_fee_per_gas: Some(Some(max_priority_fee_per_gas)),
+        ..Default::default()
+    };
+    db_send_sync(db_tx, SyncOp::PatchChallenge { challenge_id, patch }).await
+}
+
 pub(crate) async fn record_challenge_rebroadcast(
     db_tx: &mpsc::UnboundedSender<DbCommand>,
     challenge_id: i64,
@@ -2061,6 +2110,40 @@ mod tests {
         db.upsert_batch(&dispatched_row(2, None)).unwrap(); // in-flight, returned
         let (idx, _, _) = db.first_inflight_resume().expect("returns row");
         assert_eq!(idx, 2);
+    }
+
+    /// Write-ahead intent: Dispatched + nonce/fees set + tx_hash NULL (no
+    /// broadcast yet). Mirrors what `record_dispatch_intent` persists.
+    fn intent_row(batch_index: u64) -> BatchRow {
+        BatchRow { tx_hash: None, nonce: Some(9), ..dispatched_row(batch_index, None) }
+    }
+
+    #[test]
+    fn first_inflight_resume_returns_write_ahead_intent_row() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        db.upsert_batch(&intent_row(1)).unwrap();
+        let (idx, _, resume) = db.first_inflight_resume().expect("intent row resumable");
+        assert_eq!(idx, 1);
+        assert_eq!(resume.nonce, 9);
+        assert!(resume.tx_hash.is_none(), "write-ahead intent carries no tx_hash yet");
+    }
+
+    #[test]
+    fn first_inflight_resume_carries_tx_hash_when_present() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        db.upsert_batch(&dispatched_row(1, None)).unwrap();
+        let (_, _, resume) = db.first_inflight_resume().expect("returns row");
+        assert_eq!(resume.tx_hash, Some(B256::from([1u8; 32])));
+    }
+
+    #[test]
+    fn first_dispatchable_skips_write_ahead_intent_row() {
+        let db = Db::open_in_memory_for_test().unwrap();
+        db.upsert_batch(&intent_row(1)).unwrap();
+        assert!(
+            db.first_dispatchable().is_none(),
+            "a write-ahead intent (status=Dispatched) must not be re-picked for fresh dispatch"
+        );
     }
 
     fn challenge_row(
