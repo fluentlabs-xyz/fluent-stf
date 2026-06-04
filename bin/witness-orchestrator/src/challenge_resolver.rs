@@ -299,8 +299,9 @@ async fn handle_block_received(
         }
     };
 
+    // Challenge/SP1 path needs only the witness payload, not the cert.
     let witness_bytes = match shared.driver.get_or_build_witness(target_block_number).await {
-        Ok(Some(p)) => p,
+        Ok(Some((payload, _cert))) => payload,
         Ok(None) => {
             warn!(
                 challenge_id = row.challenge_id,

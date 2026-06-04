@@ -36,6 +36,7 @@ pub mod types;
 // (e.g. `crate::metrics::*`, `crate::orchestrator::RevertKind`). Kept
 // `pub(crate)` so external consumers can't import them.
 pub(crate) mod block_response_cache;
+pub(crate) mod cert_source;
 pub(crate) mod challenge_db;
 pub(crate) mod challenge_resolver;
 pub(crate) mod db;

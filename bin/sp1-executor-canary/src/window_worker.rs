@@ -123,7 +123,7 @@ pub(crate) async fn run(
                 continue;
             }
 
-            let witness_bytes = driver
+            let (witness_bytes, _cert) = driver
                 .get_or_build_witness(n)
                 .await?
                 .ok_or_else(|| eyre!("witness unavailable for block {n} despite tip ≥ {n}"))?;

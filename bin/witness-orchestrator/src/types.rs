@@ -11,4 +11,7 @@ pub(crate) use nitro_types::{
 pub struct ProveRequest {
     pub block_number: u64,
     pub payload: Vec<u8>,
+    /// Finalization cert (hex-decoded from `consensus_getFinalization`) for this
+    /// block; empty pre-activation / until the cert sidecar is populated.
+    pub cert: Vec<u8>,
 }

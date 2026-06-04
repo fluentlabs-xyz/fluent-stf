@@ -22,6 +22,10 @@ use tracing::{info, warn};
 
 use crate::types::ProveRequest;
 const COLD_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("cold_witnesses");
+/// Sidecar: finalization cert (raw bytes) per block, parallel to `COLD_TABLE`.
+/// Kept separate so the witness payload stays bare `bincode(input)` (the
+/// challenge / cold-hit readers are unchanged). Pruned in lockstep with COLD.
+const CERT_TABLE: TableDefinition<'_, u64, &[u8]> = TableDefinition::new("cold_certs");
 const META_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("cold_meta");
 const TOTAL_BYTES_KEY: &str = "total_bytes";
 
@@ -30,13 +34,21 @@ const TOTAL_BYTES_KEY: &str = "total_bytes";
 /// observed hardware removes redb from the per-block critical path.
 pub const DEFAULT_COLD_BATCH_SIZE: usize = 32;
 
+/// One cold entry: a block's zstd-compressed witness payload + its finalization
+/// cert (raw bytes), stored across `COLD_TABLE` / `CERT_TABLE` in lockstep.
+struct ColdEntry {
+    block_number: u64,
+    payload: Vec<u8>,
+    cert: Vec<u8>,
+}
+
 pub struct WitnessHub {
     db: Arc<Database>,
     retention_blocks: u64,
     batch_size: usize,
-    /// Compressed payloads awaiting a batched commit. Flushed when
-    /// `len >= batch_size` or by an explicit `flush_pending` call.
-    buffer: AsyncMutex<Vec<(u64, Vec<u8>)>>,
+    /// Cold entries awaiting a batched commit. Flushed when `len >= batch_size`
+    /// or by an explicit `flush_pending` call.
+    buffer: AsyncMutex<Vec<ColdEntry>>,
 }
 
 impl std::fmt::Debug for WitnessHub {
@@ -64,6 +76,7 @@ impl WitnessHub {
             let write_txn =
                 db.begin_write().map_err(|e| eyre::eyre!("begin_write on fresh cold db: {e}"))?;
             write_txn.open_table(COLD_TABLE).map_err(|e| eyre::eyre!("open COLD_TABLE: {e}"))?;
+            write_txn.open_table(CERT_TABLE).map_err(|e| eyre::eyre!("open CERT_TABLE: {e}"))?;
             write_txn.open_table(META_TABLE).map_err(|e| eyre::eyre!("open META_TABLE: {e}"))?;
             write_txn.commit().map_err(|e| eyre::eyre!("commit fresh cold schema: {e}"))?;
         }
@@ -77,9 +90,9 @@ impl WitnessHub {
     }
 
     /// Single-block commit; returns after redb fsync.
-    pub async fn push(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
+    pub async fn push(&self, block_number: u64, payload: &[u8], cert: &[u8]) -> eyre::Result<()> {
         let compressed = compress_payload(payload).await?;
-        let entries = vec![(block_number, compressed)];
+        let entries = vec![ColdEntry { block_number, payload: compressed, cert: cert.to_vec() }];
         self.commit_entries(entries).await
     }
 
@@ -88,11 +101,16 @@ impl WitnessHub {
     /// the buffer reaches `batch_size`. On crash before flush the buffered
     /// blocks are lost from cold; the driver's re-witness fallback rebuilds them
     /// from MDBX on restart.
-    pub async fn push_batched(&self, block_number: u64, payload: &[u8]) -> eyre::Result<()> {
+    pub async fn push_batched(
+        &self,
+        block_number: u64,
+        payload: &[u8],
+        cert: &[u8],
+    ) -> eyre::Result<()> {
         let compressed = compress_payload(payload).await?;
         let to_flush = {
             let mut buf = self.buffer.lock().await;
-            buf.push((block_number, compressed));
+            buf.push(ColdEntry { block_number, payload: compressed, cert: cert.to_vec() });
             if buf.len() >= self.batch_size {
                 Some(std::mem::take(&mut *buf))
             } else {
@@ -128,6 +146,7 @@ impl WitnessHub {
             let write_txn = db.begin_write()?;
             let (count, bytes) = {
                 let mut cold = write_txn.open_table(COLD_TABLE)?;
+                let mut certs = write_txn.open_table(CERT_TABLE)?;
                 let mut meta = write_txn.open_table(META_TABLE)?;
                 let stale: Vec<(u64, u64)> = cold
                     .range((target + 1)..)?
@@ -137,6 +156,7 @@ impl WitnessHub {
                 let mut bytes_freed = 0u64;
                 for (k, size) in &stale {
                     cold.remove(*k)?;
+                    certs.remove(*k)?;
                     total_bytes = total_bytes.saturating_sub(*size);
                     bytes_freed = bytes_freed.saturating_add(*size);
                 }
@@ -174,21 +194,17 @@ impl WitnessHub {
     pub async fn get_witness(&self, block_number: u64) -> Option<ProveRequest> {
         {
             let buf = self.buffer.lock().await;
-            if let Some(compressed) =
-                buf.iter().rev().find_map(
-                    |(bn, c)| {
-                        if *bn == block_number {
-                            Some(c.clone())
-                        } else {
-                            None
-                        }
-                    },
-                )
-            {
+            if let Some((compressed, cert)) = buf.iter().rev().find_map(|e| {
+                if e.block_number == block_number {
+                    Some((e.payload.clone(), e.cert.clone()))
+                } else {
+                    None
+                }
+            }) {
                 drop(buf);
                 return tokio::task::spawn_blocking(move || -> Option<ProveRequest> {
                     let payload = zstd::decode_all(compressed.as_slice()).ok()?;
-                    Some(ProveRequest { block_number, payload })
+                    Some(ProveRequest { block_number, payload, cert })
                 })
                 .await
                 .ok()?;
@@ -201,13 +217,21 @@ impl WitnessHub {
             let table = read_txn.open_table(COLD_TABLE).ok()?;
             let compressed = table.get(block_number).ok()??.value().to_vec();
             let payload = zstd::decode_all(compressed.as_slice()).ok()?;
-            Some(ProveRequest { block_number, payload })
+            let cert = read_txn
+                .open_table(CERT_TABLE)
+                .ok()?
+                .get(block_number)
+                .ok()
+                .flatten()
+                .map(|v| v.value().to_vec())
+                .unwrap_or_default();
+            Some(ProveRequest { block_number, payload, cert })
         })
         .await
         .ok()?
     }
 
-    async fn commit_entries(&self, entries: Vec<(u64, Vec<u8>)>) -> eyre::Result<()> {
+    async fn commit_entries(&self, entries: Vec<ColdEntry>) -> eyre::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -261,7 +285,7 @@ async fn compress_payload(payload: &[u8]) -> eyre::Result<Vec<u8>> {
 /// if the size cap is exceeded.
 fn commit_batch_blocking(
     db: &Database,
-    entries: Vec<(u64, Vec<u8>)>,
+    entries: Vec<ColdEntry>,
     retention_blocks: u64,
 ) -> Result<(), redb::Error> {
     debug_assert!(!entries.is_empty());
@@ -270,18 +294,21 @@ fn commit_batch_blocking(
     let highest_block;
     {
         let mut cold = write_txn.open_table(COLD_TABLE)?;
+        let mut certs = write_txn.open_table(CERT_TABLE)?;
         let mut meta = write_txn.open_table(META_TABLE)?;
 
         let mut total_bytes = read_total_bytes(&meta)?;
         let mut highest = 0u64;
-        for (block_number, compressed) in &entries {
+        for ColdEntry { block_number, payload: compressed, cert } in &entries {
             let compressed_len = compressed.len() as u64;
             // Replacing an existing entry must update `total_bytes` by net
             // delta, not by addition — otherwise retries / replays inflate
-            // the counter.
+            // the counter. (`total_bytes` tracks COLD payloads only; certs are
+            // tiny and not byte-capped.)
             let prior_len: u64 =
                 cold.get(*block_number)?.map(|v| v.value().len() as u64).unwrap_or(0);
             cold.insert(*block_number, compressed.as_slice())?;
+            certs.insert(*block_number, cert.as_slice())?;
             total_bytes = total_bytes.saturating_sub(prior_len).saturating_add(compressed_len);
             if *block_number > highest {
                 highest = *block_number;
@@ -299,6 +326,7 @@ fn commit_batch_blocking(
                     .collect();
                 for (k, size) in &stale {
                     cold.remove(*k)?;
+                    certs.remove(*k)?;
                     total_bytes = total_bytes.saturating_sub(*size);
                 }
                 if !stale.is_empty() {
@@ -346,7 +374,7 @@ mod tests {
         let file = unique_cold_file("roundtrip");
         let hub = WitnessHub::new(file.clone(), 0, 1).unwrap();
 
-        hub.push(42, &vec![7u8; 1024]).await.unwrap();
+        hub.push(42, &vec![7u8; 1024], &[]).await.unwrap();
 
         let got = hub.get_witness(42).await.expect("block 42");
         assert_eq!(got.block_number, 42);
@@ -362,13 +390,13 @@ mod tests {
         let file = unique_cold_file("overwrite");
         let hub = WitnessHub::new(file.clone(), 0, 1).unwrap();
 
-        hub.push(1, &vec![7u8; 100_000]).await.unwrap();
+        hub.push(1, &vec![7u8; 100_000], &[]).await.unwrap();
         let total1 = {
             let txn = hub.db.begin_read().unwrap();
             txn.open_table(META_TABLE).unwrap().get(TOTAL_BYTES_KEY).unwrap().unwrap().value()
         };
 
-        hub.push(1, &vec![9u8; 100_000]).await.unwrap();
+        hub.push(1, &vec![9u8; 100_000], &[]).await.unwrap();
         let total2 = {
             let txn = hub.db.begin_read().unwrap();
             txn.open_table(META_TABLE).unwrap().get(TOTAL_BYTES_KEY).unwrap().unwrap().value()
@@ -388,10 +416,10 @@ mod tests {
 
         assert_eq!(hub.last_committed_block().unwrap(), None);
 
-        hub.push(10, &vec![1u8; 1024]).await.unwrap();
+        hub.push(10, &vec![1u8; 1024], &[]).await.unwrap();
         assert_eq!(hub.last_committed_block().unwrap(), Some(10));
 
-        hub.push(20, &vec![2u8; 1024]).await.unwrap();
+        hub.push(20, &vec![2u8; 1024], &[]).await.unwrap();
         assert_eq!(hub.last_committed_block().unwrap(), Some(20));
 
         drop(hub);
@@ -404,7 +432,7 @@ mod tests {
         {
             let hub = WitnessHub::new(file.clone(), 0, 1).unwrap();
             for i in 1..=5u64 {
-                hub.push(i, &vec![i as u8; 300 * 1024]).await.unwrap();
+                hub.push(i, &vec![i as u8; 300 * 1024], &[]).await.unwrap();
             }
         }
 
@@ -424,7 +452,7 @@ mod tests {
         let hub = WitnessHub::new(file.clone(), 3, 1).unwrap();
 
         for i in 1..=10u64 {
-            hub.push(i, &vec![i as u8; 1024]).await.unwrap();
+            hub.push(i, &vec![i as u8; 1024], &[]).await.unwrap();
         }
 
         let read_txn = hub.db.begin_read().unwrap();
@@ -448,7 +476,7 @@ mod tests {
         let hub = WitnessHub::new(file.clone(), 0, 1).unwrap();
 
         for i in 1..=20u64 {
-            hub.push(i, &vec![i as u8; 256]).await.unwrap();
+            hub.push(i, &vec![i as u8; 256], &[]).await.unwrap();
         }
 
         let read_txn = hub.db.begin_read().unwrap();
@@ -468,7 +496,7 @@ mod tests {
         let hub = WitnessHub::new(file.clone(), 3, 1).unwrap();
 
         for i in 1..=10u64 {
-            hub.push(i, &vec![i as u8; 300 * 1024]).await.unwrap();
+            hub.push(i, &vec![i as u8; 300 * 1024], &[]).await.unwrap();
         }
 
         let read_txn = hub.db.begin_read().unwrap();
@@ -490,11 +518,11 @@ mod tests {
         let hub = WitnessHub::new(file.clone(), 0, 4).unwrap();
 
         for i in 1..=3u64 {
-            hub.push_batched(i, &vec![i as u8; 256]).await.unwrap();
+            hub.push_batched(i, &vec![i as u8; 256], &[]).await.unwrap();
         }
         assert_eq!(hub.last_committed_block().unwrap(), None);
 
-        hub.push_batched(4, &vec![4u8; 256]).await.unwrap();
+        hub.push_batched(4, &vec![4u8; 256], &[]).await.unwrap();
         assert_eq!(hub.last_committed_block().unwrap(), Some(4));
 
         for i in 1..=4u64 {
@@ -512,7 +540,7 @@ mod tests {
         let file = unique_cold_file("batched_read_own_writes");
         let hub = WitnessHub::new(file.clone(), 0, 128).unwrap();
 
-        hub.push_batched(77, &vec![0xAB; 1024]).await.unwrap();
+        hub.push_batched(77, &vec![0xAB; 1024], &[]).await.unwrap();
         assert_eq!(hub.last_committed_block().unwrap(), None);
         let got = hub.get_witness(77).await.expect("buffered block readable");
         assert_eq!(got.block_number, 77);
@@ -529,7 +557,7 @@ mod tests {
         let hub = WitnessHub::new(file.clone(), 0, 1024).unwrap();
 
         for i in 1..=5u64 {
-            hub.push_batched(i, &vec![i as u8; 256]).await.unwrap();
+            hub.push_batched(i, &vec![i as u8; 256], &[]).await.unwrap();
         }
         assert_eq!(hub.last_committed_block().unwrap(), None);
 
@@ -549,10 +577,10 @@ mod tests {
         let hub = WitnessHub::new(file.clone(), 3, 5).unwrap();
 
         for i in 1..=5u64 {
-            hub.push(i, &vec![i as u8; 256]).await.unwrap();
+            hub.push(i, &vec![i as u8; 256], &[]).await.unwrap();
         }
         for i in 6..=10u64 {
-            hub.push_batched(i, &vec![i as u8; 256]).await.unwrap();
+            hub.push_batched(i, &vec![i as u8; 256], &[]).await.unwrap();
         }
 
         let read_txn = hub.db.begin_read().unwrap();

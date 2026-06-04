@@ -12,6 +12,7 @@
 
 mod blob_builder_mdbx;
 mod block_response_cache;
+mod cert_source;
 mod challenge_db;
 mod challenge_resolver;
 mod db;

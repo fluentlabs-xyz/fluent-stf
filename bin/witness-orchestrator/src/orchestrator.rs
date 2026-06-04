@@ -157,6 +157,8 @@ pub(crate) struct OrchestratorShared {
 struct ExecutionTask {
     block_number: u64,
     payload: Vec<u8>,
+    /// Finalization cert for `block_number` (hex-decoded); empty pre-activation.
+    cert: Vec<u8>,
 }
 
 struct BlockResult {
@@ -270,10 +272,24 @@ async fn execution_worker(
 
         let block_number = task.block_number;
         let process = async {
+            // Wrap the witness payload + finalization cert into the wire body.
+            // The witness store keeps the bare bincode(input) (challenge/cold-hit
+            // paths), so the wrapper is built here at send time without
+            // re-encoding the (large) input — `input_payload` carries its bytes.
+            let body_bytes = match bincode::serialize(&nitro_types::SignBlockExecutionBody {
+                input_payload: task.payload,
+                cert: task.cert,
+            }) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!(err = %e, "bincode SignBlockExecutionBody failed — dropping task");
+                    return false;
+                }
+            };
             #[cfg(feature = "zstd-block-payload")]
             let payload = {
-                let uncompressed_len = task.payload.len();
-                match zstd::encode_all(task.payload.as_slice(), ZSTD_COMPRESSION_LEVEL) {
+                let uncompressed_len = body_bytes.len();
+                match zstd::encode_all(body_bytes.as_slice(), ZSTD_COMPRESSION_LEVEL) {
                     Ok(compressed) => {
                         debug!(
                             uncompressed_len,
@@ -292,7 +308,7 @@ async fn execution_worker(
                 }
             };
             #[cfg(not(feature = "zstd-block-payload"))]
-            let payload = Bytes::from(task.payload);
+            let payload = Bytes::from(body_bytes);
             let mut backoff = Duration::from_millis(50);
             let mut attempts: u32 = 0;
             loop {
@@ -390,7 +406,11 @@ async fn feeder_loop(
 
         match hub.get_witness(next_block).await {
             Some(req) => {
-                let task = ExecutionTask { block_number: req.block_number, payload: req.payload };
+                let task = ExecutionTask {
+                    block_number: req.block_number,
+                    payload: req.payload,
+                    cert: req.cert,
+                };
                 if normal_tx.send(task).await.is_err() {
                     warn!("Feeder: normal_tx closed — exiting");
                     break;
@@ -1178,8 +1198,8 @@ async fn startup_recovery_feeder(
         if shutdown.is_cancelled() {
             return;
         }
-        let payload = match driver.get_or_build_witness(block_number).await {
-            Ok(Some(p)) => p,
+        let (payload, cert) = match driver.get_or_build_witness(block_number).await {
+            Ok(Some(pc)) => pc,
             Ok(None) => {
                 debug!(block_number, "Startup recovery: witness not available — skipping");
                 continue;
@@ -1193,7 +1213,7 @@ async fn startup_recovery_feeder(
                 continue;
             }
         };
-        if high_tx.send(ExecutionTask { block_number, payload }).await.is_err() {
+        if high_tx.send(ExecutionTask { block_number, payload, cert }).await.is_err() {
             warn!("Startup recovery: high_tx closed — exiting");
             return;
         }
@@ -1210,8 +1230,13 @@ fn spawn_re_execution(shared: Arc<OrchestratorShared>, block_number: u64) {
                 return;
             }
             match shared.driver.get_or_build_witness(block_number).await {
-                Ok(Some(payload)) => {
-                    if shared.high_tx.send(ExecutionTask { block_number, payload }).await.is_err() {
+                Ok(Some((payload, cert))) => {
+                    if shared
+                        .high_tx
+                        .send(ExecutionTask { block_number, payload, cert })
+                        .await
+                        .is_err()
+                    {
                         warn!(block_number, "High-priority channel closed during re-execution");
                     }
                     return;

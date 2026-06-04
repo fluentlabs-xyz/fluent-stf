@@ -298,6 +298,16 @@ pub struct DriverConfig {
 struct FetchedBlock {
     block_number: u64,
     alloy_block: alloy_rpc_types::Block,
+}
+
+/// Witness-path fetch result: a finalized block (already a reth `Block`, decoded
+/// from `consensus_getFinalization`) paired with its finalization cert. Distinct
+/// from `FetchedBlock` (eth-RPC `alloy_block`, catch-up only) so the cert rides
+/// through the witness/commit phases to the enclave.
+struct FetchedCertBlock {
+    block_number: u64,
+    prim_block: reth_ethereum_primitives::Block,
+    cert: Vec<u8>,
     fetch_ms: u64,
 }
 
@@ -579,9 +589,12 @@ impl Driver {
     /// Returns `Ok(None)` when `block_number > MDBX tip` (not yet committed)
     /// or `block_number == 0` (no parent state). `Err(_)` only on a fatal
     /// rebuild failure (RPC, executor, serialization).
-    pub async fn get_or_build_witness(&self, block_number: u64) -> eyre::Result<Option<Vec<u8>>> {
+    pub async fn get_or_build_witness(
+        &self,
+        block_number: u64,
+    ) -> eyre::Result<Option<(Vec<u8>, Vec<u8>)>> {
         if let Some(cached) = self.hub.get_witness(block_number).await {
-            return Ok(Some(cached.payload));
+            return Ok(Some((cached.payload, cached.cert)));
         }
 
         if block_number == 0 {
@@ -594,6 +607,7 @@ impl Driver {
         }
 
         let fetched = fetch_block(&self.rpc, block_number).await?;
+        let cert = fetched.cert.clone();
         let payload = rewitness_phase(
             fetched,
             self.factory.clone(),
@@ -601,7 +615,7 @@ impl Driver {
             Arc::clone(&self.hub),
         )
         .await?;
-        Ok(Some(payload))
+        Ok(Some((payload, cert)))
     }
 
     /// Per-block `(L2BlockHeader, merkle leaf)` for every block in
@@ -810,6 +824,7 @@ impl Driver {
                 }
             };
 
+            let cert = fetched.cert.clone();
             let payload = rewitness_phase(
                 fetched,
                 self.factory.clone(),
@@ -818,7 +833,7 @@ impl Driver {
             )
             .await?;
 
-            self.hub.push(block_number, &payload).await?;
+            self.hub.push(block_number, &payload, &cert).await?;
             metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
             state.next = block_number + 1;
             return Ok(Produced::Pushed);
@@ -835,7 +850,11 @@ impl Driver {
                 return Ok(Produced::Idle);
             }
         };
-        if block_number > remote_tip.saturating_sub(self.l2_safe_blocks) {
+        // Cheap upper bound: don't even ask for a block past the head. The
+        // real finality gate is implicit — `fetch_block` (consensus_getFinalization)
+        // errors for a not-yet-finalized height → retry — so the old
+        // `L2_SAFE_BLOCKS` head-lag hack is gone.
+        if block_number > remote_tip {
             return Ok(Produced::Idle);
         }
 
@@ -860,6 +879,10 @@ impl Driver {
             }
         };
 
+        // Extract the cert before `commit_phase` moves `fetched` onto the
+        // blocking pool (commit_phase only needs the block).
+        let cert = fetched.cert.clone();
+
         // Wrap commit_phase in spawn_blocking — heavy sync MDBX + static_files
         // work that must not stall the async runtime.
         let factory_clone = self.factory.clone();
@@ -877,7 +900,7 @@ impl Driver {
         // before the next flush loses the buffered block numbers from cold —
         // the re-witness path rebuilds them from MDBX on restart (cold miss →
         // rewitness_phase).
-        self.hub.push_batched(block_number, &payload).await?;
+        self.hub.push_batched(block_number, &payload, &cert).await?;
 
         state.next = block_number + 1;
         Ok(Produced::Pushed)
@@ -889,18 +912,23 @@ enum Produced {
     Idle,
 }
 
+/// Witness-path block fetch via `consensus_getFinalization` — returns the
+/// finalized block + its cert in one call. A not-yet-finalized height errors
+/// (`Missing`/`NotReady`); callers treat that as "retry later", which is the
+/// implicit finality gate (no `L2_SAFE_BLOCKS` head-lag needed).
 async fn fetch_block(
     rpc: &RootProvider<Ethereum>,
     block_number: u64,
-) -> eyre::Result<FetchedBlock> {
+) -> eyre::Result<FetchedCertBlock> {
     let t_fetch = Instant::now();
-    let alloy_block = rpc
-        .get_block_by_number(block_number.into())
-        .full()
-        .await
-        .map_err(|e| eyre!("rpc get_block({block_number}): {e}"))?
-        .ok_or_else(|| eyre!("rpc returned no block for {block_number}"))?;
-    Ok(FetchedBlock { block_number, alloy_block, fetch_ms: t_fetch.elapsed().as_millis() as u64 })
+    let certified = crate::cert_source::fetch_finalization(rpc, block_number).await?;
+    let (cert, prim_block) = certified.into_parts()?;
+    Ok(FetchedCertBlock {
+        block_number,
+        prim_block,
+        cert,
+        fetch_ms: t_fetch.elapsed().as_millis() as u64,
+    })
 }
 
 /// Fetch `[start ..= end_inclusive]` as a single JSON-RPC batch request —
@@ -916,7 +944,6 @@ async fn fetch_batch(
     end_inclusive: u64,
 ) -> eyre::Result<Vec<FetchedBlock>> {
     debug_assert!(start <= end_inclusive);
-    let t_fetch = Instant::now();
     let mut batch = BatchRequest::new(rpc.client());
 
     let mut waiters = Vec::with_capacity((end_inclusive - start + 1) as usize);
@@ -932,16 +959,13 @@ async fn fetch_batch(
 
     batch.send().await.map_err(|e| eyre!("rpc batch send [{start}..={end_inclusive}]: {e}"))?;
 
-    let total_ms = t_fetch.elapsed().as_millis() as u64;
-    let per_block_ms = total_ms / (end_inclusive - start + 1);
-
     let mut results = Vec::with_capacity(waiters.len());
     for (bn, waiter) in waiters {
         let block = waiter
             .await
             .map_err(|e| eyre!("rpc batch get_block({bn}): {e}"))?
             .ok_or_else(|| eyre!("rpc returned no block for {bn}"))?;
-        results.push(FetchedBlock { block_number: bn, alloy_block: block, fetch_ms: per_block_ms });
+        results.push(FetchedBlock { block_number: bn, alloy_block: block });
     }
 
     Ok(results)
@@ -952,15 +976,14 @@ async fn fetch_batch(
 fn commit_phase(
     factory: &ProviderFactory<DriverNode>,
     chain_spec: &Arc<ChainSpec>,
-    fetched: FetchedBlock,
+    fetched: FetchedCertBlock,
 ) -> eyre::Result<WitnessJob> {
-    let FetchedBlock { block_number, alloy_block, fetch_ms } = fetched;
+    // `prim_block` is already a reth block (decoded from
+    // `consensus_getFinalization`); the cert is extracted by the caller before
+    // this consumes `fetched`.
+    let FetchedCertBlock { block_number, prim_block, cert: _, fetch_ms } = fetched;
     let t_total_start = Instant::now();
 
-    let prim_block =
-        <reth_ethereum_primitives::EthPrimitives as IntoPrimitives<Ethereum>>::into_primitive_block(
-            alloy_block,
-        );
     let recovered = prim_block
         .clone()
         .try_into_recovered()
@@ -1176,7 +1199,7 @@ async fn witness_phase(
 /// parent-state and re-serialize; does NOT commit (block already in MDBX).
 #[tracing::instrument(skip_all, fields(block_number = fetched.block_number))]
 async fn rewitness_phase(
-    fetched: FetchedBlock,
+    fetched: FetchedCertBlock,
     factory: ProviderFactory<DriverNode>,
     host_executor: Arc<EthHostExecutor>,
     hub: Arc<WitnessHub>,
@@ -1195,13 +1218,8 @@ async fn rewitness_phase(
         return Ok(cached.payload);
     }
 
-    let FetchedBlock { block_number, alloy_block, fetch_ms } = fetched;
+    let FetchedCertBlock { block_number, prim_block, cert: _, fetch_ms } = fetched;
     let t_total_start = Instant::now();
-
-    let prim_block =
-        <reth_ethereum_primitives::EthPrimitives as IntoPrimitives<Ethereum>>::into_primitive_block(
-            alloy_block,
-        );
 
     let parent_state_root = factory
         .header_by_number(block_number - 1)
