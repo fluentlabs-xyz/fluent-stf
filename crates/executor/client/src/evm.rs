@@ -298,6 +298,8 @@ impl BlockExecutorFactory for FluentEvmConfig {
                 self.inner.chain_spec(),
                 self.inner.executor_factory.receipt_builder(),
             ),
+            staking_address: fluent_stf_primitives::DPOS_STAKING_ADDRESS,
+            chain_config_address: fluent_stf_primitives::DPOS_CHAIN_CONFIG_ADDRESS,
         }
     }
 }
@@ -343,6 +345,11 @@ impl ConfigureEvm for FluentEvmConfig {
 pub struct FluentBlockExecutor<'a, Evm> {
     /// Inner Ethereum execution strategy.
     inner: EthBlockExecutor<'a, Evm, &'a Arc<ChainSpec>, &'a RethReceiptBuilder>,
+    /// Staking predeploy. [`Address::ZERO`] disables the DPoS pre-execution
+    /// system calls (non-DPoS networks).
+    staking_address: Address,
+    /// ChainConfig predeploy (paired with `staking_address`).
+    chain_config_address: Address,
 }
 
 impl<'db, DB, E> BlockExecutor for FluentBlockExecutor<'_, E>
@@ -360,7 +367,16 @@ where
         // Instead, we can just re-create the store to make sure all data is pruned.
         fluentbase_runtime::runtime::SystemRuntime::reset_cached_runtimes();
         // Invoke parent method
-        self.inner.apply_pre_execution_changes()
+        self.inner.apply_pre_execution_changes()?;
+        // DPoS: replay the node's per-block system calls (processBitmap +
+        // commitEpochCommittee) so re-execution reproduces the node's state root.
+        let extra_data = self.inner.ctx.extra_data.clone();
+        crate::dpos_exec::apply_dpos_pre_execution(
+            self.inner.evm_mut(),
+            &extra_data,
+            self.staking_address,
+            self.chain_config_address,
+        )
     }
     fn execute_transaction_without_commit(
         &mut self,

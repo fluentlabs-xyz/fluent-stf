@@ -9,6 +9,7 @@ use rsp_client_executor::evm::FluentEvmConfig;
 pub use error::Error as HostError;
 pub use host_executor::{EthHostExecutor, HostExecutor};
 
+mod dpos_witness;
 mod error;
 pub mod events_hash;
 mod host_executor;

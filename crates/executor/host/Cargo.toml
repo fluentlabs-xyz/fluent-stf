@@ -30,6 +30,9 @@ rsp-client-executor = { workspace = true, features = ["wasmtime"] }
 rsp-mpt.workspace = true
 fluent-stf-primitives = { workspace = true, default-features = false }
 batch-merkle.workspace = true
+# DPoS committee witness coverage: the host runs the same committee read the
+# enclave runs, so the read's storage slots land in the witness it produces.
+dpos-cert-verify.workspace = true
 
 # reth
 reth-evm.workspace = true
@@ -53,6 +56,7 @@ alloy-rpc-types.workspace = true
 
 [dev-dependencies]
 alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true

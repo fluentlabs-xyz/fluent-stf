@@ -125,6 +125,15 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
             logs_bloom.accrue_bloom(&r.bloom());
         });
 
+        // DPoS: read the committee through `rpc_db` so its storage slots land in
+        // the witness materialised below (the enclave runs the identical read).
+        crate::dpos_witness::cover_committee_witness(
+            &self.evm_config,
+            &rpc_db,
+            current_block.header(),
+            block_number,
+        );
+
         let state = rpc_db.state(&execution_output.state).await?;
 
         // Verify the state root.
@@ -238,6 +247,15 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
         execution_output.result.receipts.iter().for_each(|r| {
             logs_bloom.accrue_bloom(&r.bloom());
         });
+
+        // DPoS: read the committee through `exex_db` so its storage slots land
+        // in the witness materialised below (the enclave runs the identical read).
+        crate::dpos_witness::cover_committee_witness(
+            &self.evm_config,
+            &exex_db,
+            current_block.header(),
+            block_number,
+        );
 
         // Build the sparse trie witness.
         let state = exex_db.state(&execution_output.state)?;
@@ -357,6 +375,15 @@ impl<C: ConfigureEvm, CS> HostExecutor<C, CS> {
         execution_output.result.receipts.iter().for_each(|r| {
             logs_bloom.accrue_bloom(&r.bloom());
         });
+
+        // DPoS: read the committee through `exex_db` so its storage slots land
+        // in the witness materialised below (the enclave runs the identical read).
+        crate::dpos_witness::cover_committee_witness(
+            &self.evm_config,
+            &exex_db,
+            current_block.header(),
+            block_number,
+        );
 
         // Build the sparse trie witness.
         let state = exex_db.state(&execution_output.state)?;
