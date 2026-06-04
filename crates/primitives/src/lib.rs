@@ -41,6 +41,14 @@ mod network {
     /// Solidity's `block.chainid` inside `NitroVerifier.verifyBatch`.
     pub const L1_CHAIN_ID: u64 = 1;
 
+    // DPoS not yet deployed on mainnet (chain predates DPoS). `u64::MAX`
+    // activation disables the in-enclave committee gate until DPoS is scheduled.
+    // FIXME(phase5): set real activation/interval/staking when DPoS deploys.
+    pub const DPOS_ACTIVATION_BLOCK: u64 = u64::MAX;
+    pub const EPOCH_BLOCK_INTERVAL: u32 = 32;
+    pub const DPOS_STAKING_ADDRESS: Address = Address::ZERO;
+    pub const DPOS_CHAIN_CONFIG_ADDRESS: Address = Address::ZERO;
+
     pub const NITRO_VERIFIER_ADDRESS: [u8; 20] = [
         0xfd, 0xb0, 0x4b, 0x67, 0xec, 0xd8, 0x35, 0x2b, 0xa3, 0x88, 0x5f, 0x66, 0xff, 0xfd, 0xdf,
         0x1f, 0x5f, 0x25, 0x29, 0x2f,
@@ -68,6 +76,14 @@ mod network {
     /// Solidity's `block.chainid` inside `NitroVerifier.verifyBatch`.
     pub const L1_CHAIN_ID: u64 = 11155111;
 
+    // DPoS not yet deployed on testnet. `u64::MAX` activation disables the
+    // in-enclave committee gate until DPoS is scheduled.
+    // FIXME(phase5): set real activation/interval/staking when DPoS deploys.
+    pub const DPOS_ACTIVATION_BLOCK: u64 = u64::MAX;
+    pub const EPOCH_BLOCK_INTERVAL: u32 = 32;
+    pub const DPOS_STAKING_ADDRESS: Address = Address::ZERO;
+    pub const DPOS_CHAIN_CONFIG_ADDRESS: Address = Address::ZERO;
+
     pub const NITRO_VERIFIER_ADDRESS: [u8; 20] = [
         0xba, 0x3d, 0x3b, 0x60, 0xb6, 0xf4, 0x62, 0xaa, 0x3f, 0xb2, 0xd6, 0x3f, 0x8b, 0x61, 0x0f,
         0xa8, 0x82, 0x5c, 0x30, 0x19,
@@ -94,6 +110,17 @@ mod network {
     /// Solidity's `block.chainid` inside `NitroVerifier.verifyBatch`.
     pub const L1_CHAIN_ID: u64 = 31337;
 
+    // DPoS committee-cert geometry — genesis-frozen, shared by the enclave
+    // (`bin/client`) and the host orchestrator (`crates/executor/host`) so the
+    // committee read + epoch derivation cannot drift. Devnet values mirror the
+    // `local-dpos-smoke` genesis-bootstrap (see `scripts/lib.sh`).
+    pub const DPOS_ACTIVATION_BLOCK: u64 = 64;
+    pub const EPOCH_BLOCK_INTERVAL: u32 = 32;
+    pub const DPOS_STAKING_ADDRESS: Address =
+        address!("0x0000000000000000000000000000000000005201");
+    pub const DPOS_CHAIN_CONFIG_ADDRESS: Address =
+        address!("0x0000000000000000000000000000000000005202");
+
     pub const NITRO_VERIFIER_ADDRESS: [u8; 20] = [
         0xba, 0x3d, 0x3b, 0x60, 0xb6, 0xf4, 0x62, 0xaa, 0x3f, 0xb2, 0xd6, 0x3f, 0x8b, 0x61, 0x0f,
         0xa8, 0x82, 0x5c, 0x30, 0x19,
@@ -115,6 +142,23 @@ pub use network::*;
 /// `NITRO_VERIFIER_ADDRESS` as an `Address` for host-side code.
 pub const NITRO_VERIFIER_ADDR: alloy_primitives::Address =
     alloy_primitives::Address::new(NITRO_VERIFIER_ADDRESS);
+
+/// Epoch index of `block_number` under the DPoS geometry — the same arithmetic
+/// the on-chain `Staking` uses to bucket blocks into epochs. Saturating and
+/// zero-interval-guarded so a not-yet-initialised `ChainConfig` (interval read
+/// as 0 at runtime) yields epoch 0 rather than a division-by-zero panic. Single
+/// source for the STF replay (`executor/client`), the host witness pass, and the
+/// enclave verify so the three cannot drift.
+pub const fn epoch_of_block(
+    block_number: u64,
+    epoch_block_interval: u32,
+    dpos_activation_block: u64,
+) -> u64 {
+    if epoch_block_interval == 0 {
+        return 0;
+    }
+    block_number.saturating_sub(dpos_activation_block) / epoch_block_interval as u64
+}
 
 pub mod account_proof;
 
