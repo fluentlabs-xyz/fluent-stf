@@ -1,0 +1,33 @@
+[package]
+name = "dpos-cert-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# VENDORED glue (Phase 1, copy-now). Phase 6 replaces this crate with a git-pin
+# dep on fluentbase/crates/dpos-cert-verify. Keep the thin glue here; the heavy
+# cert/scheme types come from commonware (pinned identical to fluentbase).
+
+[dependencies]
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-consensus = { workspace = true }
+commonware-utils = { workspace = true, features = ["std"] }
+commonware-codec = { workspace = true, features = ["std"] }
+commonware-math = { workspace = true, features = ["std"] }
+commonware-parallel = { workspace = true, default-features = false }
+
+bytes = { workspace = true }
+
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true, default-features = false, features = ["json"] }
+
+rand_core = "0.6.4"
+thiserror = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+commonware-math = { workspace = true, features = ["std"] }
+commonware-cryptography = { workspace = true, features = ["std", "mocks"] }
+
+[lints]
+workspace = true

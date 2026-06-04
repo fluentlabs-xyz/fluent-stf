@@ -14,6 +14,7 @@ members = [
     "bin/witness-orchestrator",
     "bin/sp1-executor-canary",
     "crates/tracing-format",
+    "crates/dpos-cert-verify-vendored",
 ]
 exclude = []
 resolver = "2"
@@ -178,6 +179,17 @@ op-alloy-rpc-types = "0.18.12"
 
 kzg-rs = { git = "https://github.com/succinctlabs/kzg-rs" }
 c-kzg = { version = "2.1.7", default-features = false }
+
+# --- commonware (DPoS cert verification — pinned identical to fluentbase) ---
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo", tag = "v2026.4.0", default-features = false }
+commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo", tag = "v2026.4.0", default-features = false }
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", tag = "v2026.4.0", default-features = false }
+commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", tag = "v2026.4.0", default-features = false }
+commonware-math = { git = "https://github.com/commonwarexyz/monorepo", tag = "v2026.4.0", default-features = false }
+commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo", tag = "v2026.4.0", default-features = false }
+
+# --- vendored DPoS cert-verify glue (Phase 6: replace with git-pin to fluentbase) ---
+dpos-cert-verify = { path = "./crates/dpos-cert-verify-vendored" }
 
 [workspace.lints]
 rust.missing_debug_implementations = "warn"
