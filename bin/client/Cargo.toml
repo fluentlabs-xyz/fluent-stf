@@ -37,6 +37,12 @@ nitro = [
     "rsp-client-executor/nitro",
     "dep:c-kzg",
     "dep:brotli",
+    "dep:dpos-cert-verify",
+    "dep:rand_chacha",
+    "dep:reth-evm",
+    "dep:reth-chainspec",
+    "dep:alloy-evm",
+    "dep:revm",
     "dep:hkdf",
     "dep:k256",
     "dep:sha3",
@@ -74,6 +80,14 @@ alloy-primitives = "1.5.7"
 alloy-rlp = "0.3.10"
 c-kzg = { version = "2.1.7", optional = true }
 brotli = {version = "8.0.2", optional = true }
+
+# dpos committee cert verification (nitro only)
+dpos-cert-verify = { path = "../../crates/dpos-cert-verify-vendored", optional = true }
+rand_chacha = { version = "0.3", optional = true }
+reth-evm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched", optional = true }
+reth-chainspec = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v1.11-patched", optional = true }
+alloy-evm = { version = "0.27.2", default-features = false, optional = true }
+revm = { version = "34.0.0", default-features = false, optional = true }
 
 # sp1 (optional)
 kzg-rs = { version = "0.2.8", optional = true }

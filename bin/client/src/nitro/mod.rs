@@ -1,6 +1,7 @@
+mod dpos_verify;
 mod kms;
 mod params;
-mod vsock;
+mod vsock_channel;
 
 use anyhow::Context;
 use hkdf::Hkdf;
@@ -43,7 +44,7 @@ use vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
 use crate::{
     blob,
-    nitro::{kms::KmsClient, vsock::VsockChannel},
+    nitro::{kms::KmsClient, vsock_channel::VsockChannel},
 };
 
 // ---------------------------------------------------------------------------
@@ -401,18 +402,29 @@ struct ExecutionResult {
 
 fn run_block(
     input: EthClientExecutorInput,
+    cert: &[u8],
     block_store: &Mutex<BlockStore>,
 ) -> anyhow::Result<ExecutionResult> {
-    let executor = EthClientExecutor::eth(
-        Arc::new(fluent_stf_primitives::fluent_chainspec()),
-        input.custom_beneficiary,
-    );
+    let chain_spec = Arc::new(fluent_stf_primitives::fluent_chainspec());
+
+    // Read the epoch committee from the witnessed pre-state BEFORE `execute`
+    // consumes `input`. The owned snapshot releases the witness-db borrow.
+    let snapshot = dpos_verify::read_committee_snapshot(&input, cert, chain_spec.clone())?;
+
+    let executor = EthClientExecutor::eth(chain_spec, input.custom_beneficiary);
     let (header, events_hash) =
         executor.execute(input).map_err(|e| anyhow::anyhow!("Block execution failed: {e:?}"))?;
 
     let block_hash = header.hash_slow();
     let parent_hash = header.parent_hash;
     let block_number = header.number;
+
+    // Refuse to attest unless the executed block carries a valid 2f+1 committee
+    // finalization cert (gated on activation + cert presence in the read above).
+    if let Some(snap) = snapshot {
+        let nsm_entropy = get_nsm_entropy().context("NSM entropy for cert verify")?;
+        dpos_verify::verify_executed(&snap, block_hash, cert, &nsm_entropy)?;
+    }
 
     let leaf = compute_leaf(
         parent_hash.as_slice(),
@@ -447,10 +459,11 @@ fn sign_execution(result: &ExecutionResult, signing_key: &SigningKey) -> EthExec
 
 pub(crate) fn execute_block(
     input: EthClientExecutorInput,
+    cert: &[u8],
     signing_key: &SigningKey,
     block_store: &Mutex<BlockStore>,
 ) -> anyhow::Result<EthExecutionResponse> {
-    let result = run_block(input, block_store)?;
+    let result = run_block(input, cert, block_store)?;
     Ok(sign_execution(&result, signing_key))
 }
 
@@ -479,6 +492,7 @@ fn send_response(channel: &mut VsockChannel, resp: &EnclaveResponse) {
 struct ExecuteJob {
     channel: VsockChannel,
     input: EthClientExecutorInput,
+    cert: Vec<u8>,
     identity: Arc<EnclaveIdentity>,
     block_store: Arc<Mutex<BlockStore>>,
 }
@@ -505,9 +519,9 @@ fn spawn_execute_workers(n: usize) -> SyncSender<ExecuteJob> {
             // keep the worker alive instead of silently disappearing from the
             // pool. Without this, a single panic would shrink the pool by one
             // and eventually starve all ExecuteBlock traffic.
-            let ExecuteJob { mut channel, input, identity, block_store } = job;
+            let ExecuteJob { mut channel, input, cert, identity, block_store } = job;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                execute_block(input, &identity.signing_key, &block_store)
+                execute_block(input, &cert, &identity.signing_key, &block_store)
             }));
             let resp = match result {
                 Ok(Ok(output)) => EnclaveResponse::ExecutionResult(output),
@@ -610,7 +624,7 @@ impl Enclave {
                 }
 
                 // ── Phase 1: Normal block execution ──────────────
-                EnclaveIncoming::ExecuteBlock { input } => {
+                EnclaveIncoming::ExecuteBlock { input, cert } => {
                     let Some(ref id) = identity else {
                         let resp = EnclaveResponse::NotInitialized;
                         send_response(&mut channel, &resp);
@@ -620,6 +634,7 @@ impl Enclave {
                     let job = ExecuteJob {
                         channel,
                         input: *input,
+                        cert,
                         identity: Arc::clone(id),
                         block_store: Arc::clone(&block_store),
                     };
