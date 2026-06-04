@@ -43,6 +43,20 @@ pub struct ChallengeSp1Request {
     pub blobs: Vec<Vec<u8>>,
 }
 
+/// Wire body for `POST /sign-block-execution` (orchestrator → proxy).
+///
+/// `input_payload` is the bincode'd `EthClientExecutorInput` witness, carried as
+/// raw bytes so the orchestrator's witness store + challenge path stay on the
+/// bare-input format (no re-encode at send). `cert` is the finalization
+/// certificate hex-decoded from the node's `consensus_getFinalization` (empty
+/// pre-activation; the enclave gates the committee verify on the activation
+/// block). The proxy bincode-decodes this wrapper, then decodes `input_payload`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignBlockExecutionBody {
+    pub input_payload: Vec<u8>,
+    pub cert: Vec<u8>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SubmitBatchResponse {
     pub batch_root: Vec<u8>,
@@ -52,9 +66,23 @@ pub struct SubmitBatchResponse {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum EnclaveIncoming {
-    Handshake { credentials: AwsCredentials },
-    ExecuteBlock { input: Box<EthClientExecutorInput> },
-    SubmitBatch { from: u64, to: u64, responses: Vec<EthExecutionResponse>, blobs: Vec<Vec<u8>> },
+    Handshake {
+        credentials: AwsCredentials,
+    },
+    /// `cert` is the commonware-codec-encoded `Finalization` for `input`'s
+    /// block (the node's `consensus_getFinalization` ships it hex; the proxy
+    /// decodes to bytes). Empty until DPoS activation; the enclave gates the
+    /// committee verify on the hardcoded activation block.
+    ExecuteBlock {
+        input: Box<EthClientExecutorInput>,
+        cert: Vec<u8>,
+    },
+    SubmitBatch {
+        from: u64,
+        to: u64,
+        responses: Vec<EthExecutionResponse>,
+        blobs: Vec<Vec<u8>>,
+    },
 }
 
 /// Response body when `/sign-batch-root` returns 409: the enclave key was

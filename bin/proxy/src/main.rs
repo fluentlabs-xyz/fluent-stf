@@ -284,8 +284,9 @@ async fn build_client_input(
 
 /// `POST /sign-block-execution`
 ///
-/// Body: bincode-serialized `EthClientExecutorInput`, optionally zstd-compressed
-/// (indicated by `Content-Encoding: zstd`).
+/// Body: bincode-serialized `SignBlockExecutionBody` (the `{input_payload, cert}`
+/// wrapper — `input_payload` is itself a bincode'd `EthClientExecutorInput`),
+/// optionally zstd-compressed (indicated by `Content-Encoding: zstd`).
 /// Headers: `Content-Type: application/octet-stream`.
 #[tracing::instrument(skip_all, fields(block_number = tracing::field::Empty))]
 async fn sign_block_execution(
@@ -294,12 +295,17 @@ async fn sign_block_execution(
     body: Bytes,
 ) -> Result<Json<EthExecutionResponse>, HandlerError> {
     let body = maybe_decompress(&headers, &body)?;
-    let input = decode_bincode::<EthClientExecutorInput>(&body)?;
+    let wrapper = decode_bincode::<nitro_types::SignBlockExecutionBody>(&body)?;
+    let input = decode_bincode::<EthClientExecutorInput>(&wrapper.input_payload)?;
+    let cert = wrapper.cert;
     let block_number = input.current_block.header.number;
     tracing::Span::current().record("block_number", block_number);
     info!(event = "sign_block_execution_received", "sign-block-execution request received");
 
-    let response = enclave::execute_block(input, state.nitro, state.att_cfg.clone())
+    // The finalization cert rides in the wrapper (the orchestrator sources it
+    // from `consensus_getFinalization`); empty pre-activation, in which case the
+    // enclave's committee verify stays gated off by the activation block.
+    let response = enclave::execute_block(input, cert, state.nitro, state.att_cfg.clone())
         .await
         .map_err(|e| internal(format!("Enclave execution failed: {e}")))?;
 

@@ -29,10 +29,11 @@ const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 /// Normal block execution — enclave signs with block_hash in the payload.
 pub(crate) async fn execute_block(
     input: EthClientExecutorInput,
+    cert: Vec<u8>,
     enclave_cfg: NitroConfig,
     att_cfg: Option<Arc<AttestationConfig>>,
 ) -> eyre::Result<EthExecutionResponse> {
-    let msg = EnclaveIncoming::ExecuteBlock { input: Box::new(input) };
+    let msg = EnclaveIncoming::ExecuteBlock { input: Box::new(input), cert };
     execute_block_inner(msg, &enclave_cfg, att_cfg.as_ref()).await
 }
 
