@@ -21,6 +21,12 @@ sp1 = [
     "sp1-build",
     "dep:brotli",
     "dep:kzg-rs",
+    "dep:dpos-cert-verify-zk",
+    # In-guest committee read over the witnessed pre-state (EVM system calls).
+    "dep:reth-evm",
+    "dep:reth-chainspec",
+    "dep:alloy-evm",
+    "dep:revm",
 ]
 nitro = [
     "dep:vsock",
@@ -37,8 +43,7 @@ nitro = [
     "rsp-client-executor/nitro",
     "dep:c-kzg",
     "dep:brotli",
-    "dep:dpos-cert-verify",
-    "dep:rand_chacha",
+    "dep:dpos-cert-verify-zk",
     "dep:reth-evm",
     "dep:reth-chainspec",
     "dep:alloy-evm",
@@ -81,9 +86,8 @@ alloy-rlp = "0.3.10"
 c-kzg = { version = "2.1.7", optional = true }
 brotli = {version = "8.0.2", optional = true }
 
-# dpos committee cert verification (nitro only)
-dpos-cert-verify = { path = "../../crates/dpos-cert-verify-vendored", optional = true }
-rand_chacha = { version = "0.3", optional = true }
+# blst-free verify-core, shared by guest (sp1) and enclave (nitro)
+dpos-cert-verify-zk = { path = "../../crates/dpos-cert-verify-zk", optional = true }
 reth-evm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched", optional = true }
 reth-chainspec = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v1.11-patched", optional = true }
 alloy-evm = { version = "0.27.2", default-features = false, optional = true }
@@ -128,6 +132,10 @@ op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "
 
 
 [dev-dependencies]
+# Fixture cert-verify test (nitro path): transcode a real cert with commonware,
+# then assert the blst-free core accepts it — same fixture the SP1 path uses.
+# (`serde_json` for the test is already provided by the `nitro` feature.)
+dpos-cert-verify   = { path = "../../crates/dpos-cert-verify-vendored" }
 reth-chainspec     = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v1.11-patched" }
 tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
 alloy-provider     = { version = "1.8.1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }

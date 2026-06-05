@@ -1,4 +1,3 @@
-mod dpos_verify;
 mod kms;
 mod params;
 mod vsock_channel;
@@ -14,7 +13,7 @@ use aws_nitro_enclaves_nsm_api::{
 
 use k256::{
     ecdsa::{
-        signature::{DigestSigner, Signer, Verifier},
+        signature::{Signer, Verifier},
         RecoveryId, Signature, SigningKey, VerifyingKey,
     },
     elliptic_curve::scalar::IsHigh,
@@ -24,8 +23,11 @@ use k256::{
 use alloy_primitives::{Address, B256};
 use c_kzg::{Blob, KzgSettings, BYTES_PER_BLOB};
 
+use dpos_cert_verify_zk::verify_finalization;
 use fluent_stf_primitives::{L1_CHAIN_ID, NITRO_VERIFIER_ADDRESS};
-use nitro_types::{EnclaveIncoming, EnclaveResponse, EthExecutionResponse, SubmitBatchResponse};
+use nitro_types::{
+    CertVerifyInput, EnclaveIncoming, EnclaveResponse, EthExecutionResponse, SubmitBatchResponse,
+};
 use rsp_client_executor::{executor::EthClientExecutor, io::EthClientExecutorInput};
 
 use serde_bytes::ByteBuf;
@@ -402,14 +404,40 @@ struct ExecutionResult {
 
 fn run_block(
     input: EthClientExecutorInput,
-    cert: &[u8],
+    cert: Option<&CertVerifyInput>,
     block_store: &Mutex<BlockStore>,
 ) -> anyhow::Result<ExecutionResult> {
     let chain_spec = Arc::new(fluent_stf_primitives::fluent_chainspec());
 
     // Read the epoch committee from the witnessed pre-state BEFORE `execute`
-    // consumes `input`. The owned snapshot releases the witness-db borrow.
-    let snapshot = dpos_verify::read_committee_snapshot(&input, cert, chain_spec.clone())?;
+    // consumes `input` (the trust anchor); `None` pre-activation / no cert. The
+    // owned committee releases the witness-db borrow.
+    let block_number = input.current_block.header.number;
+    // Once DPoS is active a finalization cert is mandatory — refuse to attest a
+    // block with no cert. Must live here (attested code), not in the proxy (untrusted).
+    if cert.is_none() && fluent_stf_primitives::dpos_active(block_number) {
+        return Err(anyhow::anyhow!(
+            "DPoS active (block {block_number}): finalization cert required"
+        ));
+    }
+    let committee = match cert {
+        Some(_) if fluent_stf_primitives::dpos_active(block_number) => {
+            let epoch = fluent_stf_primitives::epoch_of_block(
+                block_number,
+                fluent_stf_primitives::EPOCH_BLOCK_INTERVAL,
+                fluent_stf_primitives::DPOS_ACTIVATION_BLOCK,
+            );
+            let snapshot = crate::dpos_committee::read_zk_committee(
+                &input,
+                chain_spec.clone(),
+                epoch,
+                fluent_stf_primitives::DPOS_STAKING_ADDRESS,
+            )
+            .map_err(|e| anyhow::anyhow!("DPoS committee read: {e:?}"))?;
+            Some((epoch, snapshot))
+        }
+        _ => None,
+    };
 
     let executor = EthClientExecutor::eth(chain_spec, input.custom_beneficiary);
     let (header, events_hash) =
@@ -419,11 +447,26 @@ fn run_block(
     let parent_hash = header.parent_hash;
     let block_number = header.number;
 
-    // Refuse to attest unless the executed block carries a valid 2f+1 committee
-    // finalization cert (gated on activation + cert presence in the read above).
-    if let Some(snap) = snapshot {
-        let nsm_entropy = get_nsm_entropy().context("NSM entropy for cert verify")?;
-        dpos_verify::verify_executed(&snap, block_hash, cert, &nsm_entropy)?;
+    // Refuse to attest unless the executed block carries a valid quorum committee
+    // finalization cert. Same blst-free core the SP1 guest runs.
+    if let (Some(ci), Some((epoch, committee))) = (cert, committee.as_ref()) {
+        if ci.round_epoch != *epoch {
+            return Err(anyhow::anyhow!(
+                "cert round epoch {} != block epoch {epoch}",
+                ci.round_epoch
+            ));
+        }
+        verify_finalization(
+            committee,
+            fluent_stf_primitives::FLUENT_CHAIN_ID,
+            ci.round_epoch,
+            ci.round_view,
+            ci.parent_view,
+            block_hash,
+            &ci.sig_g1,
+            &ci.bitmap,
+        )
+        .map_err(|e| anyhow::anyhow!("DPoS committee cert verify failed: {e:?}"))?;
     }
 
     let leaf = compute_leaf(
@@ -459,7 +502,7 @@ fn sign_execution(result: &ExecutionResult, signing_key: &SigningKey) -> EthExec
 
 pub(crate) fn execute_block(
     input: EthClientExecutorInput,
-    cert: &[u8],
+    cert: Option<&CertVerifyInput>,
     signing_key: &SigningKey,
     block_store: &Mutex<BlockStore>,
 ) -> anyhow::Result<EthExecutionResponse> {
@@ -492,7 +535,7 @@ fn send_response(channel: &mut VsockChannel, resp: &EnclaveResponse) {
 struct ExecuteJob {
     channel: VsockChannel,
     input: EthClientExecutorInput,
-    cert: Vec<u8>,
+    cert: Option<CertVerifyInput>,
     identity: Arc<EnclaveIdentity>,
     block_store: Arc<Mutex<BlockStore>>,
 }
@@ -521,7 +564,7 @@ fn spawn_execute_workers(n: usize) -> SyncSender<ExecuteJob> {
             // and eventually starve all ExecuteBlock traffic.
             let ExecuteJob { mut channel, input, cert, identity, block_store } = job;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                execute_block(input, &cert, &identity.signing_key, &block_store)
+                execute_block(input, cert.as_ref(), &identity.signing_key, &block_store)
             }));
             let resp = match result {
                 Ok(Ok(output)) => EnclaveResponse::ExecutionResult(output),
@@ -833,15 +876,15 @@ mod tests {
             store.insert(i, dummy);
         }
         assert_eq!(store.entries.len(), MAX_ENTRIES);
-        assert!(store.entries.get(&0).is_none());
-        assert!(store.entries.get(&99).is_none());
-        assert!(store.entries.get(&100).is_some());
+        assert!(!store.entries.contains_key(&0));
+        assert!(!store.entries.contains_key(&99));
+        assert!(store.entries.contains_key(&100));
     }
 
     #[test]
     fn handle_submit_batch_invalid_signatures() {
         let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
-        let verifying_key = *signing_key.verifying_key();
+        let _verifying_key = *signing_key.verifying_key();
         let store = BlockStore::new();
 
         // Create one valid response (signed by our key) and one invalid (bad signature)
@@ -911,5 +954,82 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fixture_tests {
+    //! The enclave verify path (`run_block`'s post-execute step) accepts a REAL
+    //! devnet finalization cert — the same fixture the SP1 guest is gated on.
+    //! The committee read over witnessed state needs a live witness, so this
+    //! exercises the verify half against the fixture's committee directly.
+    use dpos_cert_verify::transcode_finalization;
+    use dpos_cert_verify_zk::{verify_finalization, ZkCommittee, ZkValidator};
+    use serde_json::Value;
+
+    use super::B256;
+
+    const FIXTURE: &str = include_str!("fixtures/dpos_finalization.json");
+
+    fn hexb(s: &str) -> Vec<u8> {
+        hex::decode(s.strip_prefix("0x").unwrap_or(s)).expect("hex")
+    }
+
+    fn fixture() -> (ZkCommittee, u64, B256, Vec<u8>) {
+        let v: Value = serde_json::from_str(FIXTURE).expect("fixture json");
+        let validators = v["committee"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let peer: [u8; 32] = hexb(m["peer_pubkey"].as_str().unwrap()).try_into().unwrap();
+                let bls: [u8; 96] = hexb(m["bls_pubkey"].as_str().unwrap()).try_into().unwrap();
+                ZkValidator::from_compressed(peer, &bls).expect("committee G2 pubkey")
+            })
+            .collect();
+        let committee = ZkCommittee::new_sorted(v["epoch"].as_u64().unwrap(), validators);
+        let chain_id = v["chain_id"].as_u64().unwrap();
+        let digest = B256::from_slice(&hexb(v["digest"].as_str().unwrap()));
+        let cert = hexb(v["certificate"].as_str().unwrap());
+        (committee, chain_id, digest, cert)
+    }
+
+    #[test]
+    fn nitro_verify_accepts_real_cert() {
+        let (committee, chain_id, digest, cert) = fixture();
+        let parts = transcode_finalization(&cert, committee.validators.len()).expect("transcode");
+        verify_finalization(
+            &committee,
+            chain_id,
+            parts.round_epoch,
+            parts.round_view,
+            parts.parent_view,
+            digest,
+            &parts.sig_g1,
+            &parts.bitmap,
+        )
+        .expect("nitro verify path must accept the real finalization cert");
+    }
+
+    #[test]
+    fn nitro_verify_rejects_tampered_cert() {
+        let (committee, chain_id, digest, cert) = fixture();
+        let mut parts =
+            transcode_finalization(&cert, committee.validators.len()).expect("transcode");
+        parts.sig_g1[10] ^= 0x01;
+        assert!(
+            verify_finalization(
+                &committee,
+                chain_id,
+                parts.round_epoch,
+                parts.round_view,
+                parts.parent_view,
+                digest,
+                &parts.sig_g1,
+                &parts.bitmap,
+            )
+            .is_err(),
+            "tampered cert must be rejected by the nitro verify path"
+        );
     }
 }

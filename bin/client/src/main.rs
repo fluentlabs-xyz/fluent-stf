@@ -3,6 +3,9 @@
 #[cfg(any(feature = "nitro", feature = "sp1"))]
 mod blob;
 
+#[cfg(any(feature = "nitro", feature = "sp1"))]
+mod dpos_committee;
+
 #[cfg(feature = "nitro")]
 pub mod nitro;
 

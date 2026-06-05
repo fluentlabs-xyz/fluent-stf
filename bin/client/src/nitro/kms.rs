@@ -91,7 +91,7 @@ impl KmsClient {
         let (status_line, body_part) = self.split_http(&resp_str);
 
         let status_code = self.parse_status_code(status_line)?;
-        if status_code < 200 || status_code >= 300 {
+        if !(200..300).contains(&status_code) {
             return Err(anyhow::anyhow!("KMS returned HTTP {}: {}", status_code, body_part));
         }
 

@@ -14,7 +14,8 @@ use std::sync::Arc;
 use kzg_rs::{Blob, Bytes48, KzgProof, KzgSettings};
 
 use crate::blob;
-use nitro_types::BlobVerificationInput;
+use dpos_cert_verify_zk::verify_finalization;
+use nitro_types::{BlobVerificationInput, CertVerifyInput};
 
 /// Upper bound on a bincode-serialized `EthClientExecutorInput` / `BlobVerificationInput`
 /// the guest is willing to decode. Bounds memory allocation during deserialization
@@ -23,7 +24,7 @@ const MAX_INPUT_SIZE: u64 = 256 * 1024 * 1024;
 
 pub fn main() {
     // 1. Read and deserialize inputs using read_vec
-    let (executor_input, blob_input) = profile_report!(DESERIALZE_INPUTS, {
+    let (executor_input, blob_input, cert_input) = profile_report!(DESERIALZE_INPUTS, {
         use bincode::Options as _;
         let opts = bincode::DefaultOptions::new()
             .with_fixint_encoding()
@@ -36,7 +37,13 @@ pub fn main() {
         let blob_bytes = sp1_zkvm::io::read_vec();
         let blob_input = opts.deserialize::<BlobVerificationInput>(&blob_bytes).unwrap();
 
-        (exec_input, blob_input)
+        // Input #3: the proxy-transcoded finalization cert. Empty pre-activation
+        // / when no cert is supplied (the host always writes this slot).
+        let cert_bytes = sp1_zkvm::io::read_vec();
+        let cert_input = (!cert_bytes.is_empty())
+            .then(|| opts.deserialize::<CertVerifyInput>(&cert_bytes).unwrap());
+
+        (exec_input, blob_input, cert_input)
     });
 
     // Load pre-compiled Trusted Setup from the crate's internal binary storage (Zero-Copy)
@@ -48,8 +55,56 @@ pub fn main() {
         Arc::new(fluent_stf_primitives::fluent_chainspec()),
         executor_input.custom_beneficiary,
     );
+
+    // DPoS committee read happens BEFORE `execute` consumes `executor_input`:
+    // the committee is read from the witnessed pre-state (the trust anchor), then
+    // the cert is verified against the EXECUTED block hash below. `None` when no
+    // cert was supplied or the block precedes DPoS activation.
+    let block_number = executor_input.current_block.header.number;
+    // Mirror of the enclave gate: once DPoS is active the guest must NOT prove a
+    // block without a finalization cert. Panic ⇒ proof refused.
+    assert!(
+        cert_input.is_some() || !fluent_stf_primitives::dpos_active(block_number),
+        "DPoS active (block {block_number}): finalization cert required",
+    );
+    let dpos_committee = cert_input.as_ref().and_then(|_| {
+        fluent_stf_primitives::dpos_active(block_number).then(|| {
+            let epoch = fluent_stf_primitives::epoch_of_block(
+                block_number,
+                fluent_stf_primitives::EPOCH_BLOCK_INTERVAL,
+                fluent_stf_primitives::DPOS_ACTIVATION_BLOCK,
+            );
+            let snapshot = crate::dpos_committee::read_zk_committee(
+                &executor_input,
+                Arc::new(fluent_stf_primitives::fluent_chainspec()),
+                epoch,
+                fluent_stf_primitives::DPOS_STAKING_ADDRESS,
+            )
+            .expect("DPoS committee read from witnessed pre-state failed");
+            (epoch, snapshot)
+        })
+    });
+
     let (header, events_hash) = executor.execute(executor_input).expect("STF execution failed");
     let stf_block_hash = header.hash_slow();
+
+    // Verify the finalization cert against the committee read from pre-state and
+    // the EXECUTED block hash. A divergent branch cannot produce a cert that
+    // passes here, so it is never proven. Panic ⇒ proof refused.
+    if let (Some(cert), Some((epoch, committee))) = (cert_input.as_ref(), dpos_committee.as_ref()) {
+        assert_eq!(cert.round_epoch, *epoch, "cert round epoch != block epoch");
+        verify_finalization(
+            committee,
+            fluent_stf_primitives::FLUENT_CHAIN_ID,
+            cert.round_epoch,
+            cert.round_view,
+            cert.parent_view,
+            stf_block_hash,
+            &cert.sig_g1,
+            &cert.bitmap,
+        )
+        .expect("DPoS committee cert verification failed");
+    }
 
     // 3. Decanonicalize + brotli-decompress the blob AFTER STF: defers decompression cost past any
     //    early STF panic and keeps the brotli- output buffer out of the hottest allocation phase.

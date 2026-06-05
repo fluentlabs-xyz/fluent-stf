@@ -188,7 +188,6 @@ impl<'a> Iterator for BlockIter<'a> {
 mod tests {
     use super::*;
     use alloy_consensus::Header as ConsensusHeader;
-    use alloy_rlp::Encodable;
 
     /// Build a Go-compatible RLP payload from two empty blocks.
     /// Uses the same manual RLP construction as the blob-builder encoder.
