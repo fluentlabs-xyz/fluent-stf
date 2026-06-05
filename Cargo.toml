@@ -15,6 +15,7 @@ members = [
     "bin/sp1-executor-canary",
     "crates/tracing-format",
     "crates/dpos-cert-verify-vendored",
+    "crates/dpos-cert-verify-zk",
 ]
 exclude = []
 resolver = "2"

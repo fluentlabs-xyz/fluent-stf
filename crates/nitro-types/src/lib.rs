@@ -64,18 +64,36 @@ pub struct SubmitBatchResponse {
     pub signature: Vec<u8>,
 }
 
+/// Proxy-transcoded finalization cert: the commonware `Finalization` decomposed
+/// into the raw points the blst-free verify-core (`dpos-cert-verify-zk`)
+/// consumes, so commonware/blst stays host-side. NOT a trust point — the guest /
+/// enclave re-read the committee from witnessed pre-state and re-run the pairing.
+/// The payload digest is intentionally absent: the verifier binds it to the
+/// executed block hash. Mirrors the SP1-guest `read_vec` envelope.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CertVerifyInput {
+    /// Aggregate signature, compressed G1 (MinSig).
+    #[serde(with = "BigArray")]
+    pub sig_g1: [u8; 48],
+    /// Signer bitmap, LSB-first, `ceil(n/8)` bytes (`n` = committee size).
+    pub bitmap: Vec<u8>,
+    pub round_epoch: u64,
+    pub round_view: u64,
+    pub parent_view: u64,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum EnclaveIncoming {
     Handshake {
         credentials: AwsCredentials,
     },
-    /// `cert` is the commonware-codec-encoded `Finalization` for `input`'s
-    /// block (the node's `consensus_getFinalization` ships it hex; the proxy
-    /// decodes to bytes). Empty until DPoS activation; the enclave gates the
-    /// committee verify on the hardcoded activation block.
+    /// `cert` is the proxy-transcoded finalization cert (raw points the
+    /// blst-free verify-core consumes). `None` until DPoS activation / when no
+    /// cert is supplied; the enclave gates the committee verify on the hardcoded
+    /// activation block.
     ExecuteBlock {
         input: Box<EthClientExecutorInput>,
-        cert: Vec<u8>,
+        cert: Option<CertVerifyInput>,
     },
     SubmitBatch {
         from: u64,

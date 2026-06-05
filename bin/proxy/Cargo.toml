@@ -34,6 +34,7 @@ rsp-client-executor.workspace = true
 rsp-blob-builder.workspace = true
 l1-rollup-client.workspace = true
 nitro-types.workspace = true
+dpos-cert-verify.workspace = true
 
 # alloy
 alloy-primitives.workspace = true

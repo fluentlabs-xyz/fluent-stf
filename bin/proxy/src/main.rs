@@ -282,6 +282,11 @@ async fn build_client_input(
 // Signing endpoints — caller provides EthClientExecutorInput
 // ===========================================================================
 
+/// Upper bound on signers when decoding a finalization cert — a DoS guard on the
+/// commonware bitmap allocation. Far above any real committee; the effective
+/// count comes from the cert's own encoded bitmap length.
+const MAX_CERT_SIGNERS: usize = 4096;
+
 /// `POST /sign-block-execution`
 ///
 /// Body: bincode-serialized `SignBlockExecutionBody` (the `{input_payload, cert}`
@@ -297,14 +302,27 @@ async fn sign_block_execution(
     let body = maybe_decompress(&headers, &body)?;
     let wrapper = decode_bincode::<nitro_types::SignBlockExecutionBody>(&body)?;
     let input = decode_bincode::<EthClientExecutorInput>(&wrapper.input_payload)?;
-    let cert = wrapper.cert;
     let block_number = input.current_block.header.number;
     tracing::Span::current().record("block_number", block_number);
     info!(event = "sign_block_execution_received", "sign-block-execution request received");
 
-    // The finalization cert rides in the wrapper (the orchestrator sources it
-    // from `consensus_getFinalization`); empty pre-activation, in which case the
-    // enclave's committee verify stays gated off by the activation block.
+    // Transcode the raw commonware finalization cert (sourced from
+    // `consensus_getFinalization`) into the raw points the enclave's blst-free
+    // verify-core consumes. Empty pre-activation ⇒ `None`, committee verify gated off.
+    let cert = if wrapper.cert.is_empty() {
+        None
+    } else {
+        let parts = dpos_cert_verify::transcode_finalization(&wrapper.cert, MAX_CERT_SIGNERS)
+            .map_err(|e| internal(format!("cert transcode: {e}")))?;
+        Some(nitro_types::CertVerifyInput {
+            sig_g1: parts.sig_g1,
+            bitmap: parts.bitmap,
+            round_epoch: parts.round_epoch,
+            round_view: parts.round_view,
+            parent_view: parts.parent_view,
+        })
+    };
+
     let response = enclave::execute_block(input, cert, state.nitro, state.att_cfg.clone())
         .await
         .map_err(|e| internal(format!("Enclave execution failed: {e}")))?;
@@ -434,6 +452,10 @@ async fn challenge_sp1_request(
     let serialized_blobs = bincode::serialize(&blob_input)
         .map_err(|e| internal(format!("Failed to serialize blob input: {e}")))?;
     stdin.write_slice(&serialized_blobs);
+
+    // Input #3 (DPoS cert): empty on the L1-challenge path — a dispute proof
+    // re-derives the STF; the guest skips committee verify when this is empty.
+    stdin.write_slice(&[]);
 
     let challenge_id = B256::random();
     let request_id_hex = hex::encode(challenge_id);
@@ -586,6 +608,9 @@ async fn mock_sp1_request(
     let serialized_blobs = bincode::serialize(&blob_input)
         .map_err(|e| internal(format!("Failed to serialize blob input: {e}")))?;
     stdin.write_slice(&serialized_blobs);
+
+    // Input #3 (DPoS cert): empty on the local mock-prove path; guest skips verify.
+    stdin.write_slice(&[]);
 
     info!(event = "mock_sp1_executing", "executing sp1 program locally (cpu)");
 

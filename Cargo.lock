@@ -2020,8 +2020,24 @@ checksum = "a3c196a77437e7cc2fb515ce413a6401291578b5afc8ecb29a3c7ab957f05941"
 dependencies = [
  "ff 0.12.1",
  "group 0.12.1",
- "pairing",
+ "pairing 0.22.0",
  "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
+name = "bls12_381"
+version = "0.8.0"
+source = "git+https://github.com/sp1-patches/bls12_381?tag=patch-0.8.0-sp1-6.0.0#c6a3a331f8bee02913cc2c4eae2805360f888aaa"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+ "ff 0.13.1",
+ "group 0.13.0",
+ "hex",
+ "pairing 0.23.0",
+ "rand_core 0.6.4",
+ "sp1-lib",
  "subtle",
 ]
 
@@ -3745,8 +3761,28 @@ dependencies = [
  "commonware-parallel",
  "commonware-utils",
  "hex",
+ "rand_chacha 0.3.1",
  "rand_core 0.6.4",
+ "serde_json",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "dpos-cert-verify-zk"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "bls12_381 0.8.0",
+ "commonware-codec",
+ "commonware-consensus",
+ "commonware-cryptography",
+ "commonware-utils",
+ "dpos-cert-verify",
+ "hex",
+ "rand_chacha 0.3.1",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -5517,7 +5553,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a575df5f985fe1cd5b2b05664ff6accfc46559032b954529fd225a2168d27b0f"
 dependencies = [
  "bitvec",
- "bls12_381",
+ "bls12_381 0.7.1",
  "ff 0.12.1",
  "group 0.12.1",
  "rand_core 0.6.4",
@@ -7115,6 +7151,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pairing"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81fec4625e73cf41ef4bb6846cafa6d44736525f442ba45e407c4a000a13996f"
+dependencies = [
+ "group 0.13.0",
+]
+
+[[package]]
 name = "parity-scale-codec"
 version = "3.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7660,6 +7705,7 @@ dependencies = [
  "axum 0.8.9",
  "bincode 1.3.3",
  "ciborium",
+ "dpos-cert-verify",
  "eyre",
  "fluent-stf-primitives",
  "l1-rollup-client",
@@ -10974,13 +11020,16 @@ dependencies = [
 name = "sp1-executor-canary"
 version = "0.1.0"
 dependencies = [
+ "alloy-eips",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rlp",
  "alloy-rpc-types",
  "async-channel",
  "axum 0.8.9",
  "bincode 1.3.3",
+ "dpos-cert-verify",
  "eyre",
  "fluent-stf-primitives",
  "futures",
@@ -11074,6 +11123,17 @@ dependencies = [
  "serde",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "sp1-lib"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b96392c1b1c197beaa6b0806099a8d73643a09d5ac0874e26c9c5153a7fcb4c"
+dependencies = [
+ "bincode 1.3.3",
+ "serde",
+ "sp1-primitives 6.1.0",
 ]
 
 [[package]]
@@ -14224,7 +14284,7 @@ dependencies = [
  "ark-std 0.4.0",
  "bitvec",
  "blake2",
- "bls12_381",
+ "bls12_381 0.7.1",
  "byteorder",
  "cfg-if",
  "group 0.12.1",

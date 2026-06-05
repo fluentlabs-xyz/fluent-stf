@@ -74,6 +74,7 @@ pub(crate) async fn run(
             let mut stdin = SP1Stdin::new();
             stdin.write_slice(&task.client_input);
             stdin.write_slice(&task.blob_input);
+            stdin.write_slice(&task.cert_input);
             let elf = Elf::from(Arc::clone(&elf_bytes));
 
             let t_start = std::time::Instant::now();

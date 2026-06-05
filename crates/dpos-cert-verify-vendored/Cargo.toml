@@ -28,6 +28,8 @@ hex = { workspace = true }
 [dev-dependencies]
 commonware-math = { workspace = true, features = ["std"] }
 commonware-cryptography = { workspace = true, features = ["std", "mocks"] }
+serde_json = { workspace = true }
+rand_chacha = "0.3.1"
 
 [lints]
 workspace = true

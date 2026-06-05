@@ -20,6 +20,7 @@ rsp-client-executor = { workspace = true }
 rsp-provider.workspace = true
 fluent-stf-primitives = { workspace = true, default-features = false }
 nitro-types.workspace = true
+dpos-cert-verify.workspace = true
 l1-rollup-client.workspace = true
 tracing-format.workspace = true
 
@@ -36,6 +37,8 @@ alloy-primitives = { workspace = true, features = ["k256"] }
 alloy-provider.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types.workspace = true
+alloy-rlp.workspace = true
+alloy-eips.workspace = true
 
 # sp1
 sp1-sdk = { workspace = true, features = ["network"] }

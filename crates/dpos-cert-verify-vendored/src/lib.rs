@@ -90,6 +90,46 @@ pub fn decode_finalization(bytes: &[u8], max_signers: usize) -> Result<Cert, Err
     Cert::decode_cfg(bytes, &max_signers).map_err(|e| Error::CertDecode(format!("{e:?}")))
 }
 
+/// The commonware `Finalization` decomposed into the raw fields the blst-free
+/// verify-core (`dpos-cert-verify-zk`) consumes. Produced host-side by the proxy
+/// so commonware/blst never enters the guest or enclave. NOT a trust point — the
+/// guest/enclave re-derive the committee and re-run the pairing over these bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawCertParts {
+    /// Aggregate signature, compressed G1 (MinSig).
+    pub sig_g1: [u8; 48],
+    /// Signer bitmap, LSB-first, `ceil(n/8)` bytes where `n` = participant count.
+    pub bitmap: Vec<u8>,
+    pub round_epoch: u64,
+    pub round_view: u64,
+    pub parent_view: u64,
+}
+
+/// Decode a commonware finalization cert and extract [`RawCertParts`]. The
+/// signer bitmap is rebuilt LSB-first from the decoded participant indices; the
+/// aggregate signature is the cert's trailing 48-byte compressed G1 (the fixed
+/// MinSig layout — guaranteed once the decode above succeeds).
+pub fn transcode_finalization(bytes: &[u8], max_signers: usize) -> Result<RawCertParts, Error> {
+    let cert = decode_finalization(bytes, max_signers)?;
+    let n = cert.certificate.signers.len();
+    let mut bitmap = vec![0u8; n.div_ceil(8)];
+    for participant in cert.certificate.signers.iter() {
+        let i = usize::from(participant);
+        bitmap[i / 8] |= 1 << (i % 8);
+    }
+    let sig_g1: [u8; 48] = bytes
+        .get(bytes.len().wrapping_sub(48)..)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| Error::CertDecode("cert shorter than a 48-byte G1 signature".into()))?;
+    Ok(RawCertParts {
+        sig_g1,
+        bitmap,
+        round_epoch: cert.proposal.round.epoch().get(),
+        round_view: cert.proposal.round.view().get(),
+        parent_view: cert.proposal.parent.get(),
+    })
+}
+
 /// Fluent's base BLS namespace (vendored verbatim from
 /// `fluentbase/crates/bls/src/namespace.rs` — a consensus-critical drift-guard:
 /// the enclave MUST sign under the same namespace the Engine does). Layout:

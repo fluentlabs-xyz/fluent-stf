@@ -11,6 +11,9 @@ pub(crate) struct ExecuteTask {
     /// bincode(BlobVerificationInput) — shared across the whole window via
     /// `Arc`; written verbatim into stdin slot 1.
     pub(crate) blob_input: Arc<Vec<u8>>,
+    /// bincode(CertVerifyInput) for the DPoS finalization cert, or empty
+    /// (pre-activation / no cert) — written verbatim into stdin slot 2.
+    pub(crate) cert_input: Vec<u8>,
     pub(crate) expected: BlockExpected,
 }
 

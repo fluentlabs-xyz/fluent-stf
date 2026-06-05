@@ -1,0 +1,33 @@
+[package]
+name = "dpos-cert-verify-zk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# blst-free DPoS finalization-cert verify-core. The SAME crate runs in the SP1
+# guest (sp1-accelerated `bls12_381`) and the Nitro enclave — one trustless
+# impl, no drift. commonware/blst lives only in the host-side proxy, which
+# transcodes a `Finalization` into the raw points this core consumes.
+
+[dependencies]
+# zkcrypto bls12_381, sp1-patches fork: pure-Rust on host, precompile-accelerated
+# under the `riscv32im-succinct-zkvm-elf` target. `experimental` gates hash-to-curve.
+bls12_381 = { git = "https://github.com/sp1-patches/bls12_381", tag = "patch-0.8.0-sp1-6.0.0", default-features = false, features = ["groups", "pairings", "alloc", "experimental"] }
+sha2 = { version = "0.10", default-features = false }
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+
+[dev-dependencies]
+# Reference oracle: decode the real cert with commonware, compare verdict + the
+# reconstructed signed message byte-for-byte against this crate's blst-free path.
+dpos-cert-verify = { workspace = true }
+commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-consensus = { workspace = true }
+commonware-codec = { workspace = true, features = ["std"] }
+commonware-utils = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand_chacha = "0.3.1"
+
+[lints]
+workspace = true

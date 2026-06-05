@@ -38,6 +38,11 @@ use crate::{
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Upper bound on signers when decoding a finalization cert host-side — a DoS
+/// guard on the commonware bitmap allocation. Far above any real committee; the
+/// effective signer count comes from the cert's own encoded bitmap length.
+const MAX_CERT_SIGNERS: usize = 4096;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     driver: Arc<Driver>,
@@ -123,15 +128,31 @@ pub(crate) async fn run(
                 continue;
             }
 
-            let (witness_bytes, _cert) = driver
+            let (witness_bytes, cert) = driver
                 .get_or_build_witness(n)
                 .await?
                 .ok_or_else(|| eyre!("witness unavailable for block {n} despite tip ≥ {n}"))?;
+            // Transcode the commonware finalization cert into the guest's stdin
+            // slot 2. Empty (pre-activation / no cert) ⇒ guest skips committee verify.
+            let cert_input = if cert.is_empty() {
+                Vec::new()
+            } else {
+                let parts = dpos_cert_verify::transcode_finalization(&cert, MAX_CERT_SIGNERS)
+                    .map_err(|e| eyre!("cert transcode for block {n}: {e}"))?;
+                bincode::serialize(&nitro_types::CertVerifyInput {
+                    sig_g1: parts.sig_g1,
+                    bitmap: parts.bitmap,
+                    round_epoch: parts.round_epoch,
+                    round_view: parts.round_view,
+                    parent_view: parts.parent_view,
+                })?
+            };
             let h = &l2_headers[offset];
             let task = ExecuteTask {
                 block_number: n,
                 client_input: witness_bytes,
                 blob_input: Arc::clone(&blob_input_bytes),
+                cert_input,
                 expected: BlockExpected {
                     parent_hash: h.previousBlockHash,
                     block_hash: h.blockHash,

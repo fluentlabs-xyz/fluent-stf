@@ -103,7 +103,11 @@ mod network {
 mod network {
     use alloy_primitives::{address, b256, Address, B256};
 
-    pub const FLUENT_CHAIN_ID: u64 = 0x5201;
+    // local-dpos-smoke runs isolated chainId 2026 (`scripts/lib.sh` CHAIN_ID), and the
+    // DPoS Engine signs the finalize namespace under it — the in-guest/enclave cert-verify
+    // MUST match this value or every devnet cert is rejected. (`0x5201` is the staking
+    // *address*, not a chainId — using it here was the earlier cert-rejection bug.)
+    pub const FLUENT_CHAIN_ID: u64 = 2026;
 
     /// Chain ID of the L1 where `NitroVerifier` is deployed (local Anvil).
     /// Used as the first uint256 in the batch-signature digest, matching
@@ -158,6 +162,30 @@ pub const fn epoch_of_block(
         return 0;
     }
     block_number.saturating_sub(dpos_activation_block) / epoch_block_interval as u64
+}
+
+/// True iff DPoS is active for `block_number` — i.e. its finalization certificate
+/// is mandatory. Single source of truth for the activation gate, shared by the
+/// Nitro enclave and the SP1 guest so the two verify paths cannot drift.
+#[inline]
+pub fn dpos_active(block_number: u64) -> bool {
+    // `block_number >= DPOS_ACTIVATION_BLOCK`, but expressed via `checked_sub` so
+    // the mainnet/testnet `u64::MAX` "DPoS-disabled" sentinel doesn't trip
+    // clippy::absurd_extreme_comparisons (a `>=` against the type maximum). Mirrors
+    // the `saturating_sub` activation arithmetic in `epoch_of_block`.
+    block_number.checked_sub(DPOS_ACTIVATION_BLOCK).is_some()
+}
+
+#[cfg(test)]
+mod dpos_active_tests {
+    use super::{dpos_active, DPOS_ACTIVATION_BLOCK};
+
+    #[test]
+    fn gate_boundary() {
+        assert!(!dpos_active(DPOS_ACTIVATION_BLOCK.saturating_sub(1)));
+        assert!(dpos_active(DPOS_ACTIVATION_BLOCK));
+        assert!(dpos_active(u64::MAX));
+    }
 }
 
 pub mod account_proof;
