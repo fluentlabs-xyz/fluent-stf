@@ -235,7 +235,7 @@ where
             let keys = used_keys
                 .iter()
                 .map(|key| B256::from(*key))
-                .chain(modified_keys.into_iter())
+                .chain(modified_keys)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -303,6 +303,8 @@ where
                 excess_blob_gas: block.header().excess_blob_gas(),
                 parent_beacon_block_root: block.header().parent_beacon_block_root(),
                 requests_hash: block.header().requests_hash(),
+                block_access_list_hash: None,
+                slot_number: None,
             });
         }
 

@@ -456,7 +456,7 @@ fn emit_genesis_struct(out: &mut String, g: &Genesis) {
     out.push_str("            alloc,\n            ..Default::default()\n        }\n");
 }
 
-fn emit_header_fields(out: &mut String, h: &reth_primitives::Header) {
+fn emit_header_fields(out: &mut String, h: &alloy_consensus::Header) {
     out.push_str(&format!("            parent_hash: {},\n", fmt_b256(&h.parent_hash)));
     out.push_str(&format!("            ommers_hash: {},\n", fmt_b256(&h.ommers_hash)));
     out.push_str(&format!(
@@ -490,6 +490,8 @@ fn emit_header_fields(out: &mut String, h: &reth_primitives::Header) {
         fmt_opt_b256(&h.parent_beacon_block_root)
     ));
     out.push_str(&format!("            requests_hash: {},\n", fmt_opt_b256(&h.requests_hash)));
+    out.push_str("            block_access_list_hash: None,\n");
+    out.push_str("            slot_number: None,\n");
 }
 
 // ─── hardforks helper for build step ─────────────────────────────────────────
@@ -596,7 +598,7 @@ pub fn fluent_default_chain_hardforks(osaka_fork: ForkCondition) -> ChainHardfor
                 "fluent mainnet genesis timestamp mismatch (expected 0x69b8194c, got {:#x})",
                 header.timestamp
             );
-            let sealed = reth_primitives::SealedHeader::seal_slow(header);
+            let sealed = reth_primitives_traits::SealedHeader::seal_slow(header);
             let expected_hash = alloy_primitives::b256!(
                 "0x7dd092d6e2aba158839db2a264d8049e7518540b342929822aac85f550c18465"
             );

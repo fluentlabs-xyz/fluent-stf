@@ -56,33 +56,32 @@ Bit-for-bit reproducibility is achieved through a hermetic build pipeline based 
 
 Each network has its own set of cryptographic trust anchors. The values below are updated automatically by `scripts/update_expected_pcr0.py` (for PCR0) and `scripts/update_readme_vkeys.py` (for vkeys + release version) — both are invoked from the single `make build-release` target that builds the enclave, SP1 client, and nitro-validator ELFs for every network in sequence. The release version is read from `bin/client/Cargo.toml` and must match `bin/aws-nitro-validator/Cargo.toml`.
 
-**Versioning rule.** Any change to a PCR0 or a vkey (relative to the previous release committed at `HEAD`) is a backwards-incompatible redeploy — it invalidates the L1 `NitroVerifier` whitelist and every operator / contract pinning the old identity. The release version therefore follows SemVer with a load-bearing rule: **a change to any value in this table requires a MAJOR bump** in all three `Cargo.toml` files. `make build-release` runs `scripts/check_version_bump.py` as its final step to enforce this; it fails the build if identity anchors moved but the MAJOR did not.
 
 **mainnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:mainnet:begin -->`aa60d8f3e82ff2f5bcd1b73f2766c22e72945a3c69b64663dd25d228273821d846af8e014f9a5d8c2b6d34109cb1ff42`<!-- pcr0:mainnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x0085924e73e2b0d0e2626c592825fe092d3cfb63b108757965b2a6c06c8c311b`<!-- nv-vkey:mainnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x00860c0487f78ac293a80f9655bc234cc3e73868a29d35d82b819ebe590ef4db`<!-- rsp-vkey:mainnet:end --> |
+| PCR0 enclave | <!-- pcr0:mainnet:begin -->`a474b8f16b737905c34baccb32f168e2744e5459d9c41f6821f8fc1ea1489c272e37dd05ea4b09997097512b210f5baf`<!-- pcr0:mainnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00fb9ae7af3b4852bd4524789cb15dbf188ee47b1d3838bdd39062821c6182e6`<!-- nv-vkey:mainnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x008d7349be8664fc35e4ca96f5368d679c94134b2f33bd9867cc8a26ee721fcf`<!-- rsp-vkey:mainnet:end --> |
 
 **testnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:testnet:begin -->`9c4c1c41aaaabb15fd65712d1ab75ab859ef1d6b67d998f49e24818464ad13fd29274cc10ed2517991c8829f545897cf`<!-- pcr0:testnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x008059ac42a6cdda819cbc5f04f6028ea9c7fe39a092bfa3a6671d53c3707b1e`<!-- nv-vkey:testnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x001542cb5a66b9e20271941ad56b07f490701be789a6cbd61637a66e67f9eea7`<!-- rsp-vkey:testnet:end --> |
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`fdf01c7615d49bc5ad18701bb79cc1b613f905a61afdfeaa95ee106d9f905b8d8f39927b781d2d96dd6c8ae0d43dbbe7`<!-- pcr0:testnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x0090aaf7b887dfbd2e03ffe10da5aab3585e55cc02da431ff8f11b0c7a2724be`<!-- nv-vkey:testnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x00b9d9cf7125c47e3656b3177210a71b439206a1233f279e087a47bb381c8d05`<!-- rsp-vkey:testnet:end --> |
 
 **devnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:devnet:begin -->`2117af8b88016a29fc3a6b7905b0a371f25c56f378ef3322b749e69ac06733a69d8602804dd244b66eebf56f605c9fcc`<!-- pcr0:devnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:devnet:begin -->`0x00709c3887953c3f1d2a14272c52d81258038e946a285b8307359fddb1d2d58d`<!-- nv-vkey:devnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:devnet:begin -->`0x0014f00929b2945b9e7716490a2a694d9b8e74ee8ada9bb35d0a036955370749`<!-- rsp-vkey:devnet:end --> |
+| PCR0 enclave | <!-- pcr0:devnet:begin -->`fde6c6c721b6fcd1f902d19eebce36d195b47c8117fad9e6efbbdd54f998b49491afc6f2af4543b269042b9ab7326d5f`<!-- pcr0:devnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:devnet:begin -->`0x00ae16b888bf9280f90a8162275d3b18ca26d518b389bbe4fa7493cd270ea1bc`<!-- nv-vkey:devnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:devnet:begin -->`0x00df046d5edbf70fde60f185033f8c12da0e7a15bf3c49cd7d10d1ab1585a408`<!-- rsp-vkey:devnet:end --> |
 
-Values built from release <!-- version:begin -->`v1.0.0`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.0`) and follow the commands in §5.
+Values built from release <!-- version:begin -->`v1.0.3`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.3`) and follow the commands in §5.
 
 ### 3.4 Identity Injection into the ZK Circuit
 

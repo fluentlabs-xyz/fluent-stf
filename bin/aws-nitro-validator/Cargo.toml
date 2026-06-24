@@ -2,7 +2,7 @@
 
 [package]
 name = "nitro-validator"
-version = "0.1.0"
+version = "1.0.3"
 edition = "2021"
 
 # NOTE: This is a standalone SP1 zkVM program — NOT part of the main workspace.
@@ -28,7 +28,7 @@ serde_bytes = { version = "0.11", default-features = false, features = ["alloc"]
 p384 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 sha3 = "0.10"
-sp1-zkvm = "6.0.2"
+sp1-zkvm = "=6.2.4"
 
 [dev-dependencies]
 hex = "0.4"

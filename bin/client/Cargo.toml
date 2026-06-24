@@ -6,7 +6,7 @@
 name = "rsp-client"
 description = ""
 edition = "2021"
-version = "0.1.0"
+version = "1.0.3"
 
 [workspace]
 
@@ -53,7 +53,7 @@ rsp-client-executor = { path = "../../crates/executor/client", default-features 
 fluent-stf-primitives = { path = "../../crates/primitives", default-features = false }
 nitro-types = { path = "../../crates/nitro-types" }
 # sp1
-sp1-zkvm = { version = "6.0.2", optional = true }
+sp1-zkvm = { version = "=6.2.4", optional = true }
 
 # nitro
 vsock = { version = "0.5.2", optional = true }
@@ -68,7 +68,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"], opti
 hmac = { version = "0.12", optional = true }
 rustls = { version = "0.21.12", default-features = false, features = ["tls12"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
-alloy-eips = "1.7.3"
+alloy-eips = "2.0.4"
 alloy-primitives = "1.5.7"
 alloy-rlp = "0.3.10"
 c-kzg = { version = "2.1.7", optional = true }
@@ -99,27 +99,41 @@ p256 = { git = "https://github.com/sp1-patches/elliptic-curves", tag = "patch-p2
 secp256k1 = { git = "https://github.com/sp1-patches/rust-secp256k1", tag = "patch-0.30.0-sp1-6.0.0" }
 
 # revm patches
-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-state = { package = "revm-state", git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-interpreter = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-inspector = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-state = { package = "revm-state", git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-interpreter = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-inspector = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+
+# NOTE: unlike the host workspace, this zkVM program intentionally does NOT patch
+# reth-codecs / reth-primitives-traits to the reth-core-rwasm fork. Dropping the
+# patch lets cargo resolve reth-primitives-traits from crates.io, which floats up
+# to 0.3.2 — the release that decoupled `quanta` from the `std` feature. (0.3.1
+# and the fork still carry `quanta` in `std`, and `quanta` does not compile for
+# the SP1 riscv target: it pulls `libc::clock_gettime`. So 0.3.2 specifically is
+# what unblocks the build.) Correctness is preserved because the fork's only
+# rwasm-specific delta is the `reth_codecs::Compact` Bytecode impl (MDBX on-disk
+# format), which this program never exercises — bytecode arrives via the serde
+# witness as `revm::state::Bytecode` (revm-rwasm v107, identical in both
+# workspaces) and executes through the patched revm. No reth-primitives-traits
+# type is serialized in the witness, so the host (fork 0.3.1) ↔ client (crates.io
+# 0.3.2) minor-version split is byte-compatible across that boundary.
 
 
 [dev-dependencies]
-reth-chainspec     = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v1.11-patched" }
+reth-chainspec     = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v2.2-patched-tree-escrow" }
 tokio              = { version = "1", features = ["rt-multi-thread", "macros"] }
-alloy-provider     = { version = "1.8.1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
-alloy-network      = { version = "1.8.1", default-features = false }
-alloy-consensus    = { version = "1.8.1", default-features = false }
+alloy-provider     = { version = "2.0.4", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
+alloy-network      = { version = "2.0.4", default-features = false }
+alloy-consensus    = { version = "2.0.4", default-features = false }
 url                = { version = "2" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
-sp1-build = {version = "5", optional = true}
+sp1-build = {version = "=6.2.4", optional = true}

@@ -34,7 +34,7 @@ fluent-stf-primitives = { workspace = true, default-features = false }
 reth-consensus.workspace = true
 reth-ethereum-consensus.workspace = true
 reth-consensus-common.workspace = true
-reth-ethereum-primitives = { workspace = true, features = ["serde-bincode-compat"] }
+reth-ethereum-primitives.workspace = true
 reth-execution-types.workspace = true
 reth-primitives-traits.workspace = true
 reth-trie.workspace = true
@@ -56,6 +56,5 @@ alloy-sol-types.workspace = true
 
 fluentbase-revm = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch="devel", default-features = false, features = ["std"]}
 fluentbase-runtime = { git = "https://github.com/fluentlabs-xyz/fluentbase", branch="devel", default-features = false}
-reth-revm.workspace = true
-reth-primitives.workspace = true
+alloy-rlp.workspace = true
 

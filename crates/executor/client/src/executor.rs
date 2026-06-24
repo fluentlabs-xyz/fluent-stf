@@ -148,6 +148,8 @@ where
             excess_blob_gas: input.current_block.header().excess_blob_gas(),
             parent_beacon_block_root: input.current_block.header().parent_beacon_block_root(),
             requests_hash: input.current_block.header().requests_hash(),
+            block_access_list_hash: None,
+            slot_number: None,
         };
 
         Ok((header, BRIDGE_INFO.calculate_bridge_hashes(&executor_outcome)?))
