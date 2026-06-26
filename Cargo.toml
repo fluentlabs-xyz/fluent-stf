@@ -17,7 +17,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "1.0.3"
 license = "MIT OR Apache-2.0"
 authors = ["puma314", "jtguibas", "rkrasiuk"]
 repository = "https://github.com/moongate-forks/minimal-reth"
@@ -80,8 +80,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 brotlic = "0.8"
 
 # --- signing ---
-alloy-signer = "1.8.1"
-alloy-signer-local = { version = "1.8.1", default-features = false }
+alloy-signer = "2.0.4"
+alloy-signer-local = { version = "2.0.4", default-features = false }
 
 # --- misc ---
 bytes = "1.10.1"
@@ -100,73 +100,70 @@ nitro-types = { path = "./crates/nitro-types" }
 witness-orchestrator = { path = "./bin/witness-orchestrator", package = "witness-orchestrator-bin" }
 
 # --- sp1 ---
-sp1-core-executor = { version = "6.1.0", features = ["bigint-rug"] }
-sp1-prover = "6.1.0"
-sp1-sdk = "6.1.0"
+sp1-core-executor = { version = "=6.2.4", features = ["bigint-rug"] }
+sp1-prover = "=6.2.4"
+sp1-sdk = "=6.2.4"
 
 # --- reth ---
-reth-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["alloy-compat", "std"], branch = "v1.11-patched" }
-reth-primitives-traits = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["serde"], branch = "v1.11-patched" }
-reth-consensus = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-ethereum-consensus = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-optimism-consensus = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-consensus-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-evm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-evm-ethereum = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-storage-api = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-storage-errors = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-trie = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-chainspec = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v1.11-patched" }
-reth-execution-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-errors = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-ethereum-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["serde"], branch = "v1.11-patched" }
-reth-optimism-forks = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-provider = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-revm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-node-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-ethereum-engine-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-tasks = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-db-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-chain-state = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-trie-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-prune = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-prune-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
-reth-config = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v1.11-patched" }
+reth-primitives-traits = { version = "0.3.1", default-features = false, features = ["serde"] }
+reth-consensus = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-ethereum-consensus = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-consensus-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-evm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-evm-ethereum = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-storage-api = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-storage-errors = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-trie = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-chainspec = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["std"], branch = "v2.2-patched-tree-escrow" }
+reth-execution-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-errors = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-ethereum-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, features = ["serde"], branch = "v2.2-patched-tree-escrow" }
+reth-provider = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-revm = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-node-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-ethereum-engine-primitives = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-tasks = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-db-common = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-chain-state = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-trie-db = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-prune = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-prune-types = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
+reth-config = { git = "https://github.com/fluentlabs-xyz/reth", default-features = false, branch = "v2.2-patched-tree-escrow" }
 
 
 # --- revm ---
-revm = { version = "34.0.0", default-features = false }
-revm-primitives = { version = "22.0.0", default-features = false }
-revm-bytecode = { version = "8.0.0", default-features = false }
-revm-database = { version = "10.0.0", default-features = false }
-revm-database-interface = { version = "9.0.0", default-features = false }
-revm-state = { version = "9.0.0", default-features = false }
-revm-interpreter = { version = "18.0.0", default-features = false }
-revm-inspector = { version = "9.0.0", default-features = false }
-revm-context = { version = "9.0.0", default-features = false }
-revm-context-interface = { version = "9.0.0", default-features = false }
-op-revm = { version = "9.0.0", default-features = false }
+revm = { version = "38.0.0", default-features = false }
+revm-primitives = { version = "23.0.0", default-features = false }
+revm-bytecode = { version = "10.0.0", default-features = false }
+revm-database = { version = "13.0.1", default-features = false }
+revm-database-interface = { version = "11.0.1", default-features = false }
+revm-state = { version = "11.0.1", default-features = false }
+revm-interpreter = { version = "35.0.1", default-features = false }
+revm-inspector = { version = "19.0.0", default-features = false }
+revm-context = { version = "16.0.1", default-features = false }
+revm-context-interface = { version = "17.0.1", default-features = false }
+op-revm = { version = "19.0.0", default-features = false }
 
 # --- alloy ---
 alloy-chains = { version = "0.2.5", default-features = false }
-alloy-evm = { version = "0.27.2", default-features = false }
+alloy-evm = { version = "0.34.0", default-features = false }
 alloy-primitives = { version = "1.5.7", default-features = false, features = ["sha3-keccak", "map-foldhash", "getrandom"] }
-alloy-provider = { version = "1.8.1", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
-alloy-rpc-types = { version = "1.8.1", default-features = false, features = ["eth"] }
-alloy-rpc-types-debug = { version = "1.8.1", default-features = false }
-alloy-json-rpc = { version = "1.8.1", default-features = false }
-alloy-genesis = { version = "1.8.1", default-features = false }
-alloy-consensus = { version = "1.8.1", default-features = false, features = ["serde", "serde-bincode-compat"] }
-alloy-network = { version = "1.8.1", default-features = false }
-alloy-transport = { version = "1.8.1", default-features = false }
-alloy-transport-http = { version = "1.8.1", default-features = false, features = ["reqwest-rustls-tls"] }
-alloy-transport-ws = { version = "1.8.1" }
-alloy-rpc-client = { version = "1.8.1", default-features = false }
-alloy-eips = { version = "1.8.1", default-features = false }
-alloy-serde = "1.8.1"
+alloy-provider = { version = "2.0.4", default-features = false, features = ["reqwest", "reqwest-rustls-tls"] }
+alloy-rpc-types = { version = "2.0.4", default-features = false, features = ["eth"] }
+alloy-rpc-types-debug = { version = "2.0.4", default-features = false }
+alloy-json-rpc = { version = "2.0.4", default-features = false }
+alloy-genesis = { version = "2.0.4", default-features = false }
+alloy-consensus = { version = "2.0.4", default-features = false, features = ["serde", "serde-bincode-compat"] }
+alloy-network = { version = "2.0.4", default-features = false }
+alloy-transport = { version = "2.0.4", default-features = false }
+alloy-transport-http = { version = "2.0.4", default-features = false, features = ["reqwest-rustls-tls"] }
+alloy-transport-ws = { version = "2.0.4" }
+alloy-rpc-client = { version = "2.0.4", default-features = false }
+alloy-eips = { version = "2.0.4", default-features = false }
+alloy-serde = "2.0.4"
 alloy-rlp = "0.3.10"
-alloy-trie = "0.9.0"
+alloy-trie = "0.9.4"
 alloy-sol-types = { version = "1.5.7", default-features = false, features = ["json"] }
 
 # --- op ---
@@ -186,14 +183,18 @@ rustdoc.all = "warn"
 # ─── patches (single source of truth) ────────────────────────────────────────
 [patch.crates-io]
 # revm patches
-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-state = { package = "revm-state", git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-interpreter = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-inspector = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
-op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v103-patched" }
+revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-bytecode = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-database = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-state = { package = "revm-state", git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-primitives = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-interpreter = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-inspector = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-context = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-context-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+revm-database-interface = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+op-revm = { git = "https://github.com/fluentlabs-xyz/revm-rwasm.git", branch = "v107-patched" }
+
+# reth codecs (rwasm/ownable Bytecode variants — required for build AND on-disk datadir compat)
+reth-codecs = { git = "https://github.com/fluentlabs-xyz/reth-core-rwasm", branch = "v0.3.1-patched" }
+reth-primitives-traits = { git = "https://github.com/fluentlabs-xyz/reth-core-rwasm", branch = "v0.3.1-patched" }

@@ -85,7 +85,7 @@ use alloy_signer_local::PrivateKeySigner;
 use fluent_stf_primitives::fluent_chainspec;
 use reth_chainspec::ChainSpec;
 use reth_provider::BlockNumReader;
-use reth_tasks::Runtime;
+use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
 use rsp_host_executor::EthHostExecutor;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
@@ -451,8 +451,11 @@ async fn main() -> eyre::Result<()> {
     // ── Embedded forward-sync driver ─────────────────────────────────────────────
     let chain_spec: Arc<ChainSpec> = Arc::new(fluent_chainspec());
     let driver_rpc: RootProvider<Ethereum> = l2_provider.clone();
-    let runtime = Runtime::with_existing_handle(Handle::current())
-        .expect("failed to build reth_tasks::Runtime from current handle");
+    let runtime = RuntimeBuilder::new(
+        RuntimeConfig::default().with_tokio(TokioConfig::existing_handle(Handle::current())),
+    )
+    .build()
+    .expect("failed to build reth_tasks::Runtime from current handle");
     let factory = driver::open_writable_factory::<driver::FluentMdbxNode>(
         &datadir,
         chain_spec.clone(),

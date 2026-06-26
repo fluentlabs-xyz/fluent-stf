@@ -431,6 +431,8 @@ fn derive_header(block_header: &impl BlockHeader, state_root: B256, logs_bloom: 
         excess_blob_gas: block_header.excess_blob_gas(),
         parent_beacon_block_root: block_header.parent_beacon_block_root(),
         requests_hash: block_header.requests_hash(),
+        block_access_list_hash: None,
+        slot_number: None,
     }
 }
 

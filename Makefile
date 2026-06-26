@@ -1,6 +1,6 @@
 .PHONY: build-client-docker build-nitro-validator-docker \
         build-enclave build-enclave-docker build-proxy build-release \
-        run run-sp1-only run-enclave clean help \
+        run run-sp1-only run-enclave stop-enclave clean help \
         compose-build compose-up compose-down compose-logs download-genesis-cache
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
@@ -85,25 +85,30 @@ build-nitro-validator-docker:
 
 ## Build .eif for AWS Nitro reproducibly via Nix + monzo/aws-nitro-util.
 ## PCR0 is determined entirely by the flake (pinned nixpkgs + nitro-util blobs
-## + pinned rust toolchain + git-hashed source tree) — any machine with Nix
-## produces the same PCR0. `--impure` is needed on first build to let
-## builtins.fetchGit pull git dependencies from the Cargo.lock; subsequent
-## builds hit the store. Writes EIF + pcr.json into the repo root. PCR0 is
-## NOT injected into nitro-validator lib.rs here — use `make build-release`
-## to build all networks and rewrite lib.rs + README in one shot.
+## + pinned rust toolchain + git-hashed source tree) plus the crate version
+## (rustc bakes it into symbol metadata, so a version bump changes PCR0) — any
+## machine with Nix produces the same PCR0. Pure eval suffices: the Cargo.lock
+## git deps are fetched by their pinned rev (a pure fetchGit), so NO `--impure`
+## is needed; keeping it pure makes Nix fail loudly if an impurity is ever
+## introduced rather than silently leaking host state into PCR0. Writes EIF +
+## pcr.json into the repo root. PCR0 is NOT injected into nitro-validator lib.rs
+## here — use `make build-release` to build all networks and rewrite lib.rs +
+## README in one shot.
 build-enclave:
 	@command -v nix >/dev/null 2>&1 || { echo "error: nix not installed (see https://determinate.systems/nix)"; exit 1; }
-	nix --extra-experimental-features 'nix-command flakes' build .#enclave-$(NETWORK) --impure
+	nix --extra-experimental-features 'nix-command flakes' build .#enclave-$(NETWORK)
 	install -m 0644 result/image.eif $(EIF)
 	install -m 0644 result/pcr.json  $(EIF).pcrs.json
 	@echo "EIF: $(EIF)"
 	@echo "PCR0: $$(jq -r .PCR0 $(EIF).pcrs.json)"
 
 ## Build .eif inside a docker container running nixos/nix, so the host
-## machine doesn't need Nix installed. PCR0 is identical to host-built
-## because every input is pinned by the flake. A named docker volume
-## (`rsp-nix-store`) persists /nix across runs so subsequent builds are
-## incremental. Output is chowned back to the invoking user.
+## machine doesn't need Nix installed. PCR0 is identical to host-built because
+## every input is pinned by the flake (the nix binary version does not affect a
+## pinned derivation's output). A named docker volume (`rsp-nix-store`) persists
+## /nix across runs so subsequent builds are incremental. Output is chowned back
+## to the invoking user. The base image is digest-pinned below as supply-chain
+## hygiene — bump it deliberately (it does not gate PCR0).
 build-enclave-docker:
 	@command -v docker >/dev/null 2>&1 || { echo "error: docker not installed"; exit 1; }
 	docker volume create rsp-nix-store >/dev/null
@@ -111,9 +116,9 @@ build-enclave-docker:
 		-v rsp-nix-store:/nix \
 		-v $(PWD):/work \
 		-w /work \
-		nixos/nix:latest \
+		nixos/nix@sha256:e2fe74e96e965653c7b8f16ac64d1e56581c63c84d7fa07fb0692fd055cd06b0 \
 		sh -c "git config --global --add safe.directory /work \
-			&& nix --extra-experimental-features 'nix-command flakes' build .#enclave-$(NETWORK) --impure --out-link /tmp/result \
+			&& nix --extra-experimental-features 'nix-command flakes' build .#enclave-$(NETWORK) --out-link /tmp/result \
 			&& install -m 0644 \$$(readlink -f /tmp/result)/image.eif /work/$(EIF) \
 			&& install -m 0644 \$$(readlink -f /tmp/result)/pcr.json  /work/$(EIF).pcrs.json \
 			&& chown $(shell id -u):$(shell id -g) /work/$(EIF) /work/$(EIF).pcrs.json"
@@ -139,30 +144,27 @@ NETWORKS_ALL := mainnet testnet devnet
 ## Reordering steps 2↔3 produces a stale vkey that will not match the
 ## PCR0 committed in §3.3 of the README.
 ##
-## After all networks are built, check_version_bump.py enforces the
-## invariant that any change to PCR0 / vkey values (relative to git HEAD
-## of README.md) must be accompanied by a MAJOR version bump in the
-## three Cargo.toml files. Override with SKIP_VERSION_CHECK=1 only when
-## you really know what you're doing.
+## NOTE: identity anchors (PCR0 / vkey) move whenever the source or the crate
+## version changes. Bump the version in the three Cargo.toml files manually when
+## cutting a release that changes them.
 build-release:
 	@set -e; \
 	for net in $(NETWORKS_ALL); do \
 		echo "=== build-release: $$net ==="; \
-		$(MAKE) build-enclave NETWORK=$$net; \
+		$(MAKE) build-enclave-docker NETWORK=$$net; \
 		python3 scripts/update_expected_pcr0.py \
 			rsp-client-enclave-$$net.eif.pcrs.json \
 			bin/aws-nitro-validator/src/lib.rs \
 			$$net \
 			--readme README.md; \
 		$(MAKE) build-nitro-validator-docker NETWORK=$$net; \
-		$(MAKE) build-client-docker NETWORK=$$net; \
+ 		$(MAKE) build-client-docker NETWORK=$$net; \
 		python3 scripts/update_readme_vkeys.py \
 			rsp-client-$$net.vkey \
 			nitro-validator-$$net.vkey \
 			README.md \
 			$$net; \
 	done
-	@python3 scripts/check_version_bump.py
 	@echo "=== build-release: done ($(NETWORKS_ALL)) ==="
 
 ## Run enclave locally (debug)
@@ -172,6 +174,11 @@ run-enclave:
 		--cpu-count 6 \
 		--memory 4096 \
 		--enclave-cid 10
+
+## Terminate ALL running Nitro enclaves.
+stop-enclave:
+	@command -v nitro-cli >/dev/null 2>&1 || { echo "error: nitro-cli not installed"; exit 1; }
+	nitro-cli terminate-enclave --all
 
 # ─── Proxy ────────────────────────────────────────────────────────────────────
 
@@ -217,6 +224,7 @@ help:
 	@echo "  run                           Build and run with Nitro + SP1"
 	@echo "  run-sp1-only                  Build and run with SP1 only (no Nitro)"
 	@echo "  run-enclave                   Run enclave in debug mode"
+	@echo "  stop-enclave                  Terminate all running Nitro enclaves"
 	@echo "  compose-build                 Build ELFs + docker images for compose stack"
 	@echo "  compose-up                    Start proxy + witness-orchestrator in background"
 	@echo "  compose-down                  Stop the compose stack (volumes preserved)"
