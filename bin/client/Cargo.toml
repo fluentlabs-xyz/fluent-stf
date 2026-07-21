@@ -6,7 +6,7 @@
 name = "rsp-client"
 description = ""
 edition = "2021"
-version = "1.0.3"
+version = "1.0.4"
 
 [workspace]
 
@@ -53,7 +53,7 @@ rsp-client-executor = { path = "../../crates/executor/client", default-features 
 fluent-stf-primitives = { path = "../../crates/primitives", default-features = false }
 nitro-types = { path = "../../crates/nitro-types" }
 # sp1
-sp1-zkvm = { version = "=6.2.4", optional = true }
+sp1-zkvm = { version = "=6.3.1", optional = true }
 
 # nitro
 vsock = { version = "0.5.2", optional = true }
@@ -136,4 +136,4 @@ url                = { version = "2" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
-sp1-build = {version = "=6.2.4", optional = true}
+sp1-build = {version = "=6.3.1", optional = true}

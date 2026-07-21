@@ -17,7 +17,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "1.0.3"
+version = "1.0.4"
 license = "MIT OR Apache-2.0"
 authors = ["puma314", "jtguibas", "rkrasiuk"]
 repository = "https://github.com/moongate-forks/minimal-reth"
@@ -100,9 +100,9 @@ nitro-types = { path = "./crates/nitro-types" }
 witness-orchestrator = { path = "./bin/witness-orchestrator", package = "witness-orchestrator-bin" }
 
 # --- sp1 ---
-sp1-core-executor = { version = "=6.2.4", features = ["bigint-rug"] }
-sp1-prover = "=6.2.4"
-sp1-sdk = "=6.2.4"
+sp1-core-executor = { version = "=6.3.1", features = ["bigint-rug"] }
+sp1-prover = "=6.3.1"
+sp1-sdk = "=6.3.1"
 
 # --- reth ---
 reth-primitives-traits = { version = "0.3.1", default-features = false, features = ["serde"] }
