@@ -82,7 +82,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 ###############################################################################
 FROM rust:1.94-bookworm AS sp1-tools
 
-ARG SP1_VERSION=v6.2.4
+ARG SP1_VERSION=v6.3.1
 
 # curl/git: needed by the sp1up installer. clang/libssl/pkg-config: needed by
 # some SP1-program build scripts (k256, etc).
