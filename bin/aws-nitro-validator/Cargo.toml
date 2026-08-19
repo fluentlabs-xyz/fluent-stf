@@ -2,7 +2,7 @@
 
 [package]
 name = "nitro-validator"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 
 # NOTE: This is a standalone SP1 zkVM program — NOT part of the main workspace.

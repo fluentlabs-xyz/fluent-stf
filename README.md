@@ -61,27 +61,27 @@ Each network has its own set of cryptographic trust anchors. The values below ar
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:mainnet:begin -->`70405a4727bfc554c73278819a473ca1be4f3668e26b5d2626b01aa1d8da647220479ee16e781b266daf715686806462`<!-- pcr0:mainnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00e726560b91ff68e7e232d79536f4a8fb951f1f0197f97f7377b3f21e7e641e`<!-- nv-vkey:mainnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x006d0fab3845f0b7bfb6500ec6b5e6ed71718c4a9cfee560fe35c81810cfd09b`<!-- rsp-vkey:mainnet:end --> |
+| PCR0 enclave | <!-- pcr0:mainnet:begin -->`b4d5ed439a864afd2e4a4851c897f3e1b024b50edcb7bb1cc677e43b4d416ccd28c984c4978cce851c1e49972c453944`<!-- pcr0:mainnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00637b56bd0f68aa55fa7128386e6a61a73df18a3d7a50a47c8c02d672346915`<!-- nv-vkey:mainnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x0025567068c227d447b3bc30914d1d0f0ea7295fa2968a3ecdcba8900627884b`<!-- rsp-vkey:mainnet:end --> |
 
 **testnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:testnet:begin -->`570cce8611365cc80931f60a4270d3b59feea268de851e0af31fdfa67840994b4b9c8008b4d0d437032118c1da718083`<!-- pcr0:testnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x00de39fb519b1f08c2812681438a69ed2553b38cb7dcde16c0123f2e5ab27e8a`<!-- nv-vkey:testnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x0069f58fe92920245c9051ca96ef60d26ca7765b7c00e2142f5ae59ca59c1697`<!-- rsp-vkey:testnet:end --> |
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`002c5275d271e5a6a37ae52e40ada6086254843f5c7172705a70e72248081eb07f0d5ad3bde96b7a1a1fc3a2fc17ffa1`<!-- pcr0:testnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x0021007e50f75a596dfeea48b73c191bc076bafe2f466c8234c05766fde0aa89`<!-- nv-vkey:testnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x00a3203a5b5137e08f2793a48f6d49ea3fcc25759a7363c29682af8cad519082`<!-- rsp-vkey:testnet:end --> |
 
 **devnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:devnet:begin -->`05b4fbe673074417aba2b8336502c789aafb7aeb744be49b88d3e60c4451a37c2a4851ab17cab6e96d80c3c55b7feb54`<!-- pcr0:devnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:devnet:begin -->`0x00a7ab91f8e4c967841276afdfb425e23425e269b44d8372d6bac7dd2c906d90`<!-- nv-vkey:devnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:devnet:begin -->`0x00821acef2e484b6f40d6d0009d137ea1cfe324316e2bf094e14824284f46ad5`<!-- rsp-vkey:devnet:end --> |
+| PCR0 enclave | <!-- pcr0:devnet:begin -->`b5ff2a2ca93b10be6b2cff4f2799e581112760a05e641f956e8401a57dd532c4eb54da25b2232386ebc6d9d9230d3415`<!-- pcr0:devnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:devnet:begin -->`0x00f080c9ea919582ff98b62967a9cd9a4aa4fbaff3842ab22526d4dcf2cafabc`<!-- nv-vkey:devnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:devnet:begin -->`0x00ec5cce0ada55a46a0ab5979ad0eb507cc20207b27ee2c1982334a03fbc60c2`<!-- rsp-vkey:devnet:end --> |
 
-Values built from release <!-- version:begin -->`v1.0.4`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.4`) and follow the commands in §5.
+Values built from release <!-- version:begin -->`v1.0.5`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.5`) and follow the commands in §5.
 
 ### 3.4 Identity Injection into the ZK Circuit
 
