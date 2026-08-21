@@ -44,9 +44,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: "${{ inputs.tag }}"
-          # Full history: `nix build` walks parents from HEAD to compute revCount
-          # for the flake source, which a shallow clone cannot satisfy.
-          fetch-depth: 0
           persist-credentials: false
 
       # Fail before any build work if the release is missing or the tag does
