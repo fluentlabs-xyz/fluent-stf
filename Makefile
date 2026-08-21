@@ -1,7 +1,8 @@
 .PHONY: build-client-docker build-nitro-validator-docker \
         build-enclave build-enclave-docker build-proxy build-release \
         run run-sp1-only run-enclave stop-enclave clean help \
-        compose-build compose-up compose-down compose-logs download-genesis-cache
+        compose-build compose-up compose-down compose-logs download-genesis-cache \
+        update-to-latest
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 CLIENT_DIR   := bin/client
@@ -229,6 +230,7 @@ help:
 	@echo "  compose-up                    Start proxy + witness-orchestrator in background"
 	@echo "  compose-down                  Stop the compose stack (volumes preserved)"
 	@echo "  compose-logs                  Tail compose logs"
+	@echo "  update-to-latest              Pull a release and restart the stack in order"
 	@echo "  clean                         Remove build artifacts"
 	@echo ""
 	@echo "Overrides:"
@@ -297,3 +299,18 @@ compose-down:
 ## Tail compose logs.
 compose-logs:
 	$(DOCKER_COMPOSE) logs -f --tail=200
+
+# ─── Update the deployed stack ────────────────────────────────────────────────
+
+## Pull a release's images and enclave EIF and restart the stack in the order
+## the on-chain identity handshake requires. Defaults to the newest GitHub
+## release; VERSION=v1.0.6 pins one (which is also how a downgrade is expressed).
+##
+## NETWORK is forwarded ONLY when the caller set it explicitly — otherwise this
+## Makefile's own `NETWORK ?= mainnet` default would override what .env says the
+## host actually runs, and the script would pull mainnet artifacts onto a
+## testnet host.
+update-to-latest:
+	@NETWORK_OVERRIDE="$(if $(filter command line environment,$(origin NETWORK)),$(NETWORK),)" \
+	 VERSION="$(VERSION)" \
+	 ./scripts/update-to-latest.sh

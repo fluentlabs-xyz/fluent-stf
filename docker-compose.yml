@@ -25,7 +25,7 @@ services:
       target: rsp-proxy
       args:
         NETWORK: ${NETWORK}
-    image: fluent-stf/proxy:${NETWORK}
+    image: ${PROXY_IMAGE:-fluent-stf/proxy:${NETWORK}}
     container_name: fluent-proxy
     restart: unless-stopped
     init: true
@@ -111,7 +111,7 @@ services:
       target: rsp-witness-orchestrator
       args:
         NETWORK: ${NETWORK}
-    image: fluent-stf/witness-orchestrator:${NETWORK}
+    image: ${ORCHESTRATOR_IMAGE:-fluent-stf/witness-orchestrator:${NETWORK}}
     container_name: fluent-witness-orchestrator
     restart: unless-stopped
     init: true
