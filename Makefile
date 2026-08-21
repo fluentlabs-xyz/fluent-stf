@@ -121,7 +121,11 @@ build-enclave:
 ## SRC_PATHS is the flake's allowlist (flake.nix `inWanted`) plus the flake
 ## files themselves; widening it beyond the allowlist cannot change PCR0, but
 ## narrowing it below the allowlist would break the build.
-ENCLAVE_SRC_VOLUME := rsp-enclave-src
+# Network-scoped: the populate step wipes this volume, and nothing serializes
+# two builds for different networks — not the release workflow, whose
+# concurrency group is per-network, and not a developer building two
+# networks at once.
+ENCLAVE_SRC_VOLUME := rsp-enclave-src-$(NETWORK)
 ENCLAVE_SRC_PATHS  := flake.nix flake.lock Cargo.toml Cargo.lock crates bin/client
 NIX_IMAGE          := nixos/nix@sha256:e2fe74e96e965653c7b8f16ac64d1e56581c63c84d7fa07fb0692fd055cd06b0
 # Only untars the source and cats the artifacts back out. Digest-pinned for the
