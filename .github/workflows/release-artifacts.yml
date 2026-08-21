@@ -97,6 +97,33 @@ jobs:
             echo "note: newest release is ${latest_tag:-none}, so this run will not move <net>-latest"
           fi
 
+      # TEMPORARY probe — remove once the enclave build's bind mount is fixed.
+      # `make build-enclave-docker` passes $(PWD) to `docker run -v`, which the
+      # daemon resolves in ITS namespace, not this job's. Print enough to tell
+      # which translation the sibling container needs.
+      - name: "Probe runner docker namespace"
+        shell: bash
+        run: |
+          set +e
+          echo "== job side =="
+          echo "PWD=$PWD"
+          find "$PWD" -maxdepth 1 | head -5
+          echo "containerized: $([ -f /.dockerenv ] && echo yes || echo no)"
+          echo "hostname=$(hostname)"
+          echo
+          echo "== does the daemon see this path? =="
+          docker run --rm -v "$PWD":/probe alpine:3 sh -c 'find /probe -maxdepth 1 | head -5; echo "flake.nix: $([ -f /probe/flake.nix ] && echo present || echo MISSING)"'
+          echo
+          echo "== runner container mounts (empty output = not a container id) =="
+          docker inspect "$(hostname)" --format '{{range .Mounts}}{{.Type}} {{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+          echo
+          echo "== same path via --volumes-from =="
+          docker run --rm --volumes-from "$(hostname)" -w "$PWD" alpine:3 sh -c 'pwd; echo "flake.nix: $([ -f flake.nix ] && echo present || echo MISSING)"'
+          echo
+          echo "== daemon view =="
+          docker info -f 'name={{.Name}} root={{.DockerRootDir}}'
+          exit 0
+
       - name: "Download genesis cache"
         shell: bash
         run: make download-genesis-cache
