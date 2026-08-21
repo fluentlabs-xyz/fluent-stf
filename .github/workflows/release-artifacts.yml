@@ -1,0 +1,273 @@
+name: "Release artifacts"
+
+# Manual release build: one network per run, one set of artifacts from one
+# tagged commit. The tag's release must already exist — this workflow only
+# attaches assets to it.
+on:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: "Network to build"
+        required: true
+        type: choice
+        options:
+          - mainnet
+          - testnet
+          - devnet
+      tag:
+        description: "Release tag to build from and upload assets to (e.g. v1.0.5)"
+        required: true
+        type: string
+
+# Two runs for one network would push identical image tags and compete for the
+# same rsp-nix-store volume and BuildKit cache on the machine. Queue rather than
+# cancel: killing a run mid-`nix build` leaves the store lock held.
+concurrency:
+  group: "release-artifacts-${{ inputs.network }}"
+  cancel-in-progress: false
+
+env:
+  IMAGE_BASE: "ghcr.io/${{ github.repository }}"
+
+jobs:
+  build:
+    name: "Build ${{ inputs.network }} artifacts"
+    runs-on: self-hosted
+    # A cold runner bootstraps /nix and recompiles both SP1 programs from
+    # scratch; warm, the same run takes ~15 min.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: "Checkout release tag"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: "${{ inputs.tag }}"
+          # Full history: `nix build` walks parents from HEAD to compute revCount
+          # for the flake source, which a shallow clone cannot satisfy.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Fail before any build work if the release is missing or the tag does
+      # not match the crate version: update_readme_vkeys.py writes the README
+      # `version` sentinel from bin/client/Cargo.toml, so a mismatch would
+      # otherwise surface 40 minutes later as an unexplained README diff.
+      - name: "Check release and crate version"
+        id: release
+        shell: bash
+        env:
+          INPUT_TAG: "${{ inputs.tag }}"
+          REPO: "${{ github.repository }}"
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          set -euo pipefail
+          cargo_ver=$(grep -m1 '^version' bin/client/Cargo.toml | cut -d'"' -f2)
+          if [ "${INPUT_TAG#v}" != "$cargo_ver" ]; then
+            echo "tag ${INPUT_TAG} does not match bin/client/Cargo.toml version ${cargo_ver}" >&2
+            exit 1
+          fi
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/releases/tags/${INPUT_TAG}")
+          case "$status" in
+            200) ;;
+            404)
+              echo "no published release for tag ${INPUT_TAG} — create it first" >&2
+              echo "(a draft release is not addressable by tag; publish it)" >&2
+              exit 1 ;;
+            *)
+              echo "release lookup for ${INPUT_TAG} failed with HTTP ${status}" >&2
+              exit 1 ;;
+          esac
+          # `<net>-latest` may only ever move forward. /releases/latest is the
+          # newest non-draft, non-prerelease release, so rebuilding an older tag
+          # (the documented recovery path when asset upload failed) leaves the
+          # moving tag where it is instead of silently downgrading consumers.
+          latest_tag=$(curl -sS \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/releases/latest" \
+            | jq -r '.tag_name // empty')
+          if [ "$latest_tag" = "$INPUT_TAG" ]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            echo "note: newest release is ${latest_tag:-none}, so this run will not move <net>-latest"
+          fi
+
+      - name: "Download genesis cache"
+        shell: bash
+        run: make download-genesis-cache
+
+      # Enclave first: build-client-docker rewrites README.md as a side effect,
+      # and a clean tree keeps `nix build` from warning about a dirty source.
+      - name: "Build enclave EIF"
+        shell: bash
+        env:
+          NETWORK: "${{ inputs.network }}"
+        run: make build-enclave-docker NETWORK="$NETWORK"
+
+      - name: "Build SP1 ELFs"
+        shell: bash
+        env:
+          NETWORK: "${{ inputs.network }}"
+        run: |
+          set -euo pipefail
+          make build-nitro-validator-docker NETWORK="$NETWORK"
+          make build-client-docker NETWORK="$NETWORK"
+
+      # Rewrite the anchors from the artifacts just built, then require the
+      # tree to be unchanged. This is the reproduction procedure from README §5.
+      - name: "Verify identity anchors"
+        shell: bash
+        env:
+          NETWORK: "${{ inputs.network }}"
+          INPUT_TAG: "${{ inputs.tag }}"
+        run: |
+          set -euo pipefail
+          python3 scripts/update_expected_pcr0.py \
+            "rsp-client-enclave-${NETWORK}.eif.pcrs.json" \
+            bin/aws-nitro-validator/src/lib.rs \
+            "$NETWORK" \
+            --readme README.md
+          python3 scripts/update_readme_vkeys.py \
+            "rsp-client-${NETWORK}.vkey" \
+            "nitro-validator-${NETWORK}.vkey" \
+            README.md \
+            "$NETWORK"
+          if ! git diff --quiet README.md bin/aws-nitro-validator/src/lib.rs; then
+            {
+              echo "### Identity anchors do not match ${INPUT_TAG}"
+              echo
+              echo "Rebuilt PCR0/vkeys differ from the values committed at the tag."
+              echo '```diff'
+              git diff README.md bin/aws-nitro-validator/src/lib.rs
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      # The commit comes from the workspace, not from github.sha: under
+      # workflow_dispatch github.sha is the tip of the ref the run was launched
+      # from (this workflow only exists on devel, so it can never be the tag),
+      # while checkout put inputs.tag's commit on disk.
+      - name: "Resolve image tags"
+        id: tags
+        shell: bash
+        env:
+          NETWORK: "${{ inputs.network }}"
+          INPUT_TAG: "${{ inputs.tag }}"
+          IS_LATEST: "${{ steps.release.outputs.is_latest }}"
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          tags="${NETWORK}-${INPUT_TAG} ${NETWORK}-${sha:0:7}"
+          if [ "$IS_LATEST" = "true" ]; then
+            tags="${tags} ${NETWORK}-latest"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "list=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: "Log in to GHCR"
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: "${{ github.actor }}"
+          password: "${{ secrets.GITHUB_TOKEN }}"
+
+      # Plain docker build (not build-push-action): the ELF/enclave builds above
+      # already run against the host BuildKit, and its --mount=type=cache dirs
+      # are what keeps a rebuild cheap. A per-run buildx container would compile
+      # against an empty cache every time.
+      - name: "Build and push images"
+        shell: bash
+        env:
+          IMAGE_BASE: "${{ env.IMAGE_BASE }}"
+          NETWORK: "${{ inputs.network }}"
+          TAG_LIST: "${{ steps.tags.outputs.list }}"
+          INPUT_TAG: "${{ inputs.tag }}"
+          BUILT_SHA: "${{ steps.tags.outputs.sha }}"
+          SRC_URL: "${{ github.server_url }}/${{ github.repository }}"
+        run: |
+          set -euo pipefail
+          for svc in proxy witness-orchestrator; do
+            image="${IMAGE_BASE}/${svc}"
+            tag_args=()
+            for t in ${TAG_LIST}; do tag_args+=(-t "${image}:${t}"); done
+            DOCKER_BUILDKIT=1 docker build \
+              --target "rsp-${svc}" \
+              --build-arg "NETWORK=${NETWORK}" \
+              --label "org.opencontainers.image.source=${SRC_URL}" \
+              --label "org.opencontainers.image.revision=${BUILT_SHA}" \
+              --label "org.opencontainers.image.version=${INPUT_TAG}" \
+              "${tag_args[@]}" \
+              -f Dockerfile .
+            for t in ${TAG_LIST}; do docker push "${image}:${t}"; done
+          done
+
+      - name: "Upload enclave artifacts"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: "enclave-${{ inputs.network }}"
+          path: |
+            rsp-client-enclave-${{ inputs.network }}.eif
+            rsp-client-enclave-${{ inputs.network }}.eif.pcrs.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: "Summary"
+        shell: bash
+        env:
+          NETWORK: "${{ inputs.network }}"
+          INPUT_TAG: "${{ inputs.tag }}"
+          IMAGE_BASE: "${{ env.IMAGE_BASE }}"
+          TAG_LIST: "${{ steps.tags.outputs.list }}"
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${NETWORK} @ ${INPUT_TAG}"
+            echo
+            echo "| Anchor | Value |"
+            echo "|---|---|"
+            echo "| PCR0 | \`$(jq -r .PCR0 "rsp-client-enclave-${NETWORK}.eif.pcrs.json")\` |"
+            echo "| rsp-client vkey | \`$(cat "rsp-client-${NETWORK}.vkey")\` |"
+            echo "| nitro-validator vkey | \`$(cat "nitro-validator-${NETWORK}.vkey")\` |"
+            echo
+            echo "Images:"
+            for svc in proxy witness-orchestrator; do
+              for t in ${TAG_LIST}; do echo "- \`${IMAGE_BASE}/${svc}:${t}\`"; done
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: "Attach enclave to release"
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: "Download enclave artifacts"
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: "enclave-${{ inputs.network }}"
+          path: dist
+
+      # --clobber deletes a same-named asset before uploading the replacement,
+      # so a failed re-upload loses the old one. Acceptable here: the artifact
+      # from this run is still downloadable for 7 days.
+      - name: "Upload assets to release"
+        shell: bash
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_REPO: "${{ github.repository }}"
+          NETWORK: "${{ inputs.network }}"
+          INPUT_TAG: "${{ inputs.tag }}"
+        run: |
+          set -euo pipefail
+          gh release upload "$INPUT_TAG" \
+            "dist/rsp-client-enclave-${NETWORK}.eif" \
+            "dist/rsp-client-enclave-${NETWORK}.eif.pcrs.json" \
+            --clobber
