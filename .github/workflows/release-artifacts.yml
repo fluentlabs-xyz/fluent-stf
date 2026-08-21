@@ -18,6 +18,10 @@ on:
         description: "Release tag to build from and upload assets to (e.g. v1.0.5). Ignored when dry_run is set."
         required: false
         type: string
+      build_ref:
+        description: "Build this ref instead of the tag's tree (for rebuilding a tag whose build tooling predates a fix). Must differ from the tag only in .github/ or Makefile."
+        required: false
+        type: string
       dry_run:
         description: "Rehearse from the selected branch: no release touched, images pushed only as dryrun-*"
         required: false
@@ -52,7 +56,7 @@ jobs:
       - name: "Checkout release tag"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: "${{ inputs.dry_run && github.ref || inputs.tag }}"
+          ref: "${{ inputs.dry_run && github.ref || inputs.build_ref || inputs.tag }}"
           persist-credentials: false
 
       # Fail before any build work if the release is missing or the tag does
@@ -107,6 +111,31 @@ jobs:
             echo "is_latest=false" >> "$GITHUB_OUTPUT"
             echo "note: newest release is ${latest_tag:-none}, so this run will not move <net>-latest"
           fi
+
+      # Guard for build_ref: publishing artifacts under a tag is a claim that
+      # they are that tag's artifacts, so the tree being built may differ from
+      # the tag only in files that cannot reach any artifact. The Makefile is
+      # the build driver and never an input (the flake's source allowlist and
+      # .dockerignore both exclude it), and .github/ never enters a build at
+      # all. Everything else — sources, manifests, the flake, the Dockerfile,
+      # scripts/ and the README that carry the anchors — must be identical.
+      - name: "Check build_ref is artifact-equivalent to the tag"
+        if: ${{ inputs.build_ref != '' && !inputs.dry_run }}
+        shell: bash
+        env:
+          INPUT_TAG: "${{ inputs.tag }}"
+          BUILD_REF: "${{ inputs.build_ref }}"
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth 1 origin "+refs/tags/${INPUT_TAG}:refs/tags/${INPUT_TAG}"
+          changed=$(git diff --name-only "refs/tags/${INPUT_TAG}" HEAD \
+            | grep -Ev '^(\.github/|Makefile$|\.claude/)' || true)
+          if [ -n "$changed" ]; then
+            echo "${BUILD_REF} differs from ${INPUT_TAG} in files that can affect the artifacts:" >&2
+            echo "$changed" >&2
+            exit 1
+          fi
+          echo "${BUILD_REF} differs from ${INPUT_TAG} only in build tooling — artifacts are the tag's"
 
       - name: "Download genesis cache"
         shell: bash
