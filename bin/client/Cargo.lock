@@ -537,7 +537,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-serde 2.1.1",
  "alloy-sol-types",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "serde",
  "serde_json",
  "serde_with",
@@ -685,7 +685,7 @@ checksum = "0e79a2c1793afc61eed9ca0963da370a988b27d2bbfa67c78013e262d47424c4"
 dependencies = [
  "alloy-json-rpc",
  "alloy-transport",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "reqwest 0.13.4",
  "serde_json",
  "tower",
@@ -2612,7 +2612,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2737,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "fluent-stf-primitives"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -2755,8 +2755,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-codec"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "alloy-primitives",
  "byteorder",
@@ -2768,8 +2768,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-codec-derive"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "convert_case 0.6.0",
  "crypto-hashes",
@@ -2781,8 +2781,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-crypto"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -2794,8 +2794,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-evm"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "bincode 2.0.1",
  "bitvec",
@@ -2811,8 +2811,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-revm"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -2828,8 +2828,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-runtime"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -2848,8 +2848,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-sdk"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "alloy-rlp",
  "alloy-sol-types",
@@ -2866,8 +2866,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-sdk-derive"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "alloy-sol-macro-input",
  "crypto-hashes",
@@ -2880,8 +2880,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-sdk-derive-core"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "alloy-sol-macro-input",
  "anyhow",
@@ -2903,8 +2903,8 @@ dependencies = [
 
 [[package]]
 name = "fluentbase-types"
-version = "1.3.2"
-source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.3.2#d6d8d2e739f50daa8174b299cb5170a9ce7e7974"
+version = "1.4.0"
+source = "git+https://github.com/fluentlabs-xyz/fluentbase?tag=v1.4.0#0fd4ded21a684b1bc702eb9ca081959eb7a7df49"
 dependencies = [
  "alloy-primitives",
  "bincode 2.0.1",
@@ -4025,7 +4025,7 @@ dependencies = [
 
 [[package]]
 name = "nitro-types"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "alloy-primitives",
  "base64 0.22.1",
@@ -4131,13 +4131,13 @@ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "num-derive"
-version = "0.4.2"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+checksum = "e4e98dc3b890f6c23a0f9d3d491a2823d0dea0fa656302a13dd225fa924112a8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.2",
 ]
 
 [[package]]
@@ -5088,7 +5088,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6044,7 +6044,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-client"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.1.1",
@@ -6087,7 +6087,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-client-executor"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "alloy-consensus",
  "alloy-evm",
@@ -6122,7 +6122,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-mpt"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -6221,7 +6221,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6290,7 +6290,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6329,9 +6329,9 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rwasm"
-version = "0.4.5"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44e76cddefd31473f933059faa2b11efca2489337b2b785c2e2b7110fac45e1f"
+checksum = "ba058d30cf12de60276718864a5c31b05b53aab709297556e5a324093d013267"
 dependencies = [
  "bincode 2.0.1",
  "bitvec",
@@ -7319,10 +7319,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8443,7 +8443,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
