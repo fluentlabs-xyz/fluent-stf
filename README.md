@@ -61,17 +61,17 @@ Each network has its own set of cryptographic trust anchors. The values below ar
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:mainnet:begin -->`b4d5ed439a864afd2e4a4851c897f3e1b024b50edcb7bb1cc677e43b4d416ccd28c984c4978cce851c1e49972c453944`<!-- pcr0:mainnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00637b56bd0f68aa55fa7128386e6a61a73df18a3d7a50a47c8c02d672346915`<!-- nv-vkey:mainnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x0025567068c227d447b3bc30914d1d0f0ea7295fa2968a3ecdcba8900627884b`<!-- rsp-vkey:mainnet:end --> |
+| PCR0 enclave | <!-- pcr0:mainnet:begin -->`0841079935525d680f62622c74f736415cc2bea95903789f78a5380d6bb5df682d656e74359192019c6e49fe75e187f0`<!-- pcr0:mainnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00022b9b7769bd21b7bc4171ba458ffc80b46cab6f5fbd5629fa2d873df676fc`<!-- nv-vkey:mainnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x009c9ebf2784363e7b9060fa837b153e0ea9d055e6464edb5fcd6a59fdf40b48`<!-- rsp-vkey:mainnet:end --> |
 
 **testnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:testnet:begin -->`002c5275d271e5a6a37ae52e40ada6086254843f5c7172705a70e72248081eb07f0d5ad3bde96b7a1a1fc3a2fc17ffa1`<!-- pcr0:testnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x0021007e50f75a596dfeea48b73c191bc076bafe2f466c8234c05766fde0aa89`<!-- nv-vkey:testnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x00a3203a5b5137e08f2793a48f6d49ea3fcc25759a7363c29682af8cad519082`<!-- rsp-vkey:testnet:end --> |
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`217b31c6ef3f4e24aa950e27bf5c220b81ce54509a8b19b32b26cedec28eb6c087d1cb97a7d84cd1f60c167a025f6cbd`<!-- pcr0:testnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x00d2f234bfb5e53f3937c4fcc409e4dc447fb393b7df67e332afa5e9edfcb97a`<!-- nv-vkey:testnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x0011bf0d765eb3aa35baf6deec52dd5bbb6aef64de56fbd255ded22aa47b6c02`<!-- rsp-vkey:testnet:end --> |
 
 **devnet**
 
