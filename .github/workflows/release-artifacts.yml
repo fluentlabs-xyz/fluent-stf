@@ -132,9 +132,16 @@ jobs:
         env:
           INPUT_TAG: "${{ inputs.tag }}"
           BUILD_REF: "${{ inputs.build_ref }}"
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         run: |
           set -euo pipefail
-          git fetch --no-tags --depth 1 origin "+refs/tags/${INPUT_TAG}:refs/tags/${INPUT_TAG}"
+          # The checkout runs with persist-credentials: false, so the clone
+          # carries no credentials and fetching from a private repo would stop
+          # on a username prompt. Pass the run's token for this one fetch the
+          # way actions/checkout does, without writing it into .git/config.
+          auth=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 -w0)
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            fetch --no-tags --depth 1 origin "+refs/tags/${INPUT_TAG}:refs/tags/${INPUT_TAG}"
           changed=$(git diff --name-only "refs/tags/${INPUT_TAG}" HEAD \
             | grep -Ev '^(\.github/|Makefile$|\.claude/)' || true)
           if [ -n "$changed" ]; then
