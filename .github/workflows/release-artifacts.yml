@@ -109,11 +109,33 @@ jobs:
 
       # Enclave first: build-client-docker rewrites README.md as a side effect,
       # and a clean tree keeps `nix build` from warning about a dirty source.
+      # NOT `make build-enclave-docker`: that target bind-mounts $(PWD) into the
+      # nixos/nix container, but this runner is itself a container sharing the
+      # host's docker socket. The daemon resolves -v paths on the host, where
+      # /_work/... does not exist, so it mounts an empty dir and nix fails with
+      # "could not find a flake.nix file". Copy the tree in and the artifacts
+      # back out instead — no host path involved. The Makefile cannot be fixed
+      # for this run: it is checked out from inputs.tag, not from this ref.
       - name: "Build enclave EIF"
         shell: bash
         env:
           NETWORK: "${{ inputs.network }}"
-        run: make build-enclave-docker NETWORK="$NETWORK"
+          NIX_IMAGE: "nixos/nix@sha256:e2fe74e96e965653c7b8f16ac64d1e56581c63c84d7fa07fb0692fd055cd06b0"
+        run: |
+          set -euo pipefail
+          eif="rsp-client-enclave-${NETWORK}.eif"
+          docker volume create rsp-nix-store >/dev/null
+          cid=$(docker create -v rsp-nix-store:/nix -w /work "$NIX_IMAGE" sh -c \
+            "git config --global --add safe.directory /work \
+             && nix --extra-experimental-features 'nix-command flakes' build .#enclave-${NETWORK} --out-link /tmp/result \
+             && install -m 0644 \$(readlink -f /tmp/result)/image.eif /work/${eif} \
+             && install -m 0644 \$(readlink -f /tmp/result)/pcr.json  /work/${eif}.pcrs.json")
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker cp . "$cid:/work"
+          docker start -a "$cid"
+          docker cp "$cid:/work/${eif}" "${eif}"
+          docker cp "$cid:/work/${eif}.pcrs.json" "${eif}.pcrs.json"
+          echo "PCR0: $(jq -r .PCR0 "${eif}.pcrs.json")"
 
       - name: "Build SP1 ELFs"
         shell: bash
