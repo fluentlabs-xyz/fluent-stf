@@ -107,22 +107,52 @@ build-enclave:
 ## machine doesn't need Nix installed. PCR0 is identical to host-built because
 ## every input is pinned by the flake (the nix binary version does not affect a
 ## pinned derivation's output). A named docker volume (`rsp-nix-store`) persists
-## /nix across runs so subsequent builds are incremental. Output is chowned back
-## to the invoking user. The base image is digest-pinned below as supply-chain
-## hygiene — bump it deliberately (it does not gate PCR0).
+## /nix across runs so subsequent builds are incremental. The base image is
+## digest-pinned below as supply-chain hygiene — bump it deliberately (it does
+## not gate PCR0).
+##
+## The source is streamed into a second named volume rather than bind-mounted
+## from $(PWD). A bind mount is resolved by the docker daemon in ITS namespace,
+## which breaks wherever the caller is itself a container without the working
+## tree on a shared host path — CI runners in particular, where the checkout
+## lives inside the runner container's own layer and no host path for it exists.
+## `git ls-files` selects exactly the tracked files the flake would take from a
+## git tree, so the filtered source (and therefore PCR0) is the same as a
+## bind-mounted build, while target/ and .git never enter the container.
+## SRC_PATHS is the flake's allowlist (flake.nix `inWanted`) plus the flake
+## files themselves; widening it beyond the allowlist cannot change PCR0, but
+## narrowing it below the allowlist would break the build.
+# Network-scoped: the populate step wipes this volume, and nothing serializes
+# two builds for different networks — not the release workflow, whose
+# concurrency group is per-network, and not a developer building two
+# networks at once.
+ENCLAVE_SRC_VOLUME := rsp-enclave-src-$(NETWORK)
+ENCLAVE_SRC_PATHS  := flake.nix flake.lock Cargo.toml Cargo.lock crates bin/client
+NIX_IMAGE          := nixos/nix@sha256:e2fe74e96e965653c7b8f16ac64d1e56581c63c84d7fa07fb0692fd055cd06b0
+# Only untars the source and cats the artifacts back out. Digest-pinned for the
+# same reason as NIX_IMAGE; it cannot affect PCR0, since anything it smuggled
+# into the source volume would change the anchors and fail verification.
+BUSYBOX_IMAGE      := alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
 build-enclave-docker:
 	@command -v docker >/dev/null 2>&1 || { echo "error: docker not installed"; exit 1; }
 	docker volume create rsp-nix-store >/dev/null
+	docker volume create $(ENCLAVE_SRC_VOLUME) >/dev/null
+	git ls-files -z -- $(ENCLAVE_SRC_PATHS) | tar --null -T - -cf - \
+		| docker run --rm -i -v $(ENCLAVE_SRC_VOLUME):/work $(BUSYBOX_IMAGE) \
+			sh -c 'find /work -mindepth 1 -delete && tar -x -C /work'
 	docker run --rm \
 		-v rsp-nix-store:/nix \
-		-v $(PWD):/work \
+		-v $(ENCLAVE_SRC_VOLUME):/work \
 		-w /work \
-		nixos/nix@sha256:e2fe74e96e965653c7b8f16ac64d1e56581c63c84d7fa07fb0692fd055cd06b0 \
-		sh -c "git config --global --add safe.directory /work \
-			&& nix --extra-experimental-features 'nix-command flakes' build .#enclave-$(NETWORK) --out-link /tmp/result \
-			&& install -m 0644 \$$(readlink -f /tmp/result)/image.eif /work/$(EIF) \
-			&& install -m 0644 \$$(readlink -f /tmp/result)/pcr.json  /work/$(EIF).pcrs.json \
-			&& chown $(shell id -u):$(shell id -g) /work/$(EIF) /work/$(EIF).pcrs.json"
+		$(NIX_IMAGE) \
+		sh -c "nix --extra-experimental-features 'nix-command flakes' build .#enclave-$(NETWORK) --out-link /tmp/result \
+			&& mkdir -p /work/out \
+			&& install -m 0644 \$$(readlink -f /tmp/result)/image.eif /work/out/image.eif \
+			&& install -m 0644 \$$(readlink -f /tmp/result)/pcr.json  /work/out/pcr.json"
+	docker run --rm -v $(ENCLAVE_SRC_VOLUME):/work $(BUSYBOX_IMAGE) cat /work/out/image.eif > $(EIF)
+	docker run --rm -v $(ENCLAVE_SRC_VOLUME):/work $(BUSYBOX_IMAGE) cat /work/out/pcr.json  > $(EIF).pcrs.json
+	@chmod 0644 $(EIF) $(EIF).pcrs.json
 	@echo "EIF: $(EIF)"
 	@echo "PCR0: $$(jq -r .PCR0 $(EIF).pcrs.json)"
 

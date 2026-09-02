@@ -15,9 +15,18 @@ on:
           - testnet
           - devnet
       tag:
-        description: "Release tag to build from and upload assets to (e.g. v1.0.5)"
-        required: true
+        description: "Release tag to build from and upload assets to (e.g. v1.0.5). Ignored when dry_run is set."
+        required: false
         type: string
+      build_ref:
+        description: "Build this ref instead of the tag's tree (for rebuilding a tag whose build tooling predates a fix). Must differ from the tag only in .github/ or Makefile."
+        required: false
+        type: string
+      dry_run:
+        description: "Rehearse from the selected branch: no release touched, images pushed only as dryrun-*"
+        required: false
+        default: false
+        type: boolean
 
 # Two runs for one network would push identical image tags and compete for the
 # same rsp-nix-store volume and BuildKit cache on the machine. Queue rather than
@@ -40,13 +49,14 @@ jobs:
       contents: read
       packages: write
     steps:
+      # Every build step runs the make targets of the checked-out tree, so a tag
+      # predating a change to those targets cannot be built with it. dry_run
+      # checks out the dispatch ref instead, which is how a tooling change is
+      # rehearsed end to end before it is worth cutting a tag.
       - name: "Checkout release tag"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: "${{ inputs.tag }}"
-          # Full history: `nix build` walks parents from HEAD to compute revCount
-          # for the flake source, which a shallow clone cannot satisfy.
-          fetch-depth: 0
+          ref: "${{ inputs.dry_run && github.ref || inputs.build_ref || inputs.tag }}"
           persist-credentials: false
 
       # Fail before any build work if the release is missing or the tag does
@@ -56,10 +66,12 @@ jobs:
       - name: "Check release and crate version"
         id: release
         # Temporarily disabled: the release tag is ahead of the crate version
-        # in bin/client/Cargo.toml, which this step refuses to build from.
+        # in bin/client/Cargo.toml, which this step refuses to build from. It
+        # was already skipped under dry_run; `if: false` skips it always.
         # While it is skipped it emits no `is_latest` output, so "Resolve image
         # tags" pushes `<net>-latest` unconditionally instead of only when the
-        # tag is the newest release.
+        # tag is the newest release. The build_ref guard below still holds the
+        # line that matters — that the tree being built is the tag's.
         if: false
         shell: bash
         env:
@@ -68,6 +80,10 @@ jobs:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         run: |
           set -euo pipefail
+          if [ -z "$INPUT_TAG" ]; then
+            echo "tag is required unless dry_run is set" >&2
+            exit 1
+          fi
           cargo_ver=$(grep -m1 '^version' bin/client/Cargo.toml | cut -d'"' -f2)
           if [ "${INPUT_TAG#v}" != "$cargo_ver" ]; then
             echo "tag ${INPUT_TAG} does not match bin/client/Cargo.toml version ${cargo_ver}" >&2
@@ -102,6 +118,31 @@ jobs:
             echo "is_latest=false" >> "$GITHUB_OUTPUT"
             echo "note: newest release is ${latest_tag:-none}, so this run will not move <net>-latest"
           fi
+
+      # Guard for build_ref: publishing artifacts under a tag is a claim that
+      # they are that tag's artifacts, so the tree being built may differ from
+      # the tag only in files that cannot reach any artifact. The Makefile is
+      # the build driver and never an input (the flake's source allowlist and
+      # .dockerignore both exclude it), and .github/ never enters a build at
+      # all. Everything else — sources, manifests, the flake, the Dockerfile,
+      # scripts/ and the README that carry the anchors — must be identical.
+      - name: "Check build_ref is artifact-equivalent to the tag"
+        if: ${{ inputs.build_ref != '' && !inputs.dry_run }}
+        shell: bash
+        env:
+          INPUT_TAG: "${{ inputs.tag }}"
+          BUILD_REF: "${{ inputs.build_ref }}"
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth 1 origin "+refs/tags/${INPUT_TAG}:refs/tags/${INPUT_TAG}"
+          changed=$(git diff --name-only "refs/tags/${INPUT_TAG}" HEAD \
+            | grep -Ev '^(\.github/|Makefile$|\.claude/)' || true)
+          if [ -n "$changed" ]; then
+            echo "${BUILD_REF} differs from ${INPUT_TAG} in files that can affect the artifacts:" >&2
+            echo "$changed" >&2
+            exit 1
+          fi
+          echo "${BUILD_REF} differs from ${INPUT_TAG} only in build tooling — artifacts are the tag's"
 
       - name: "Download genesis cache"
         shell: bash
@@ -165,10 +206,15 @@ jobs:
         env:
           NETWORK: "${{ inputs.network }}"
           INPUT_TAG: "${{ inputs.tag }}"
+          DRY_RUN: "${{ inputs.dry_run }}"
         run: |
           set -euo pipefail
           sha=$(git rev-parse HEAD)
-          tags="${NETWORK}-${INPUT_TAG} ${NETWORK}-${sha:0:7} ${NETWORK}-latest"
+          if [ "$DRY_RUN" = "true" ]; then
+            tags="dryrun-${NETWORK}-${sha:0:7}"
+          else
+            tags="${NETWORK}-${INPUT_TAG} ${NETWORK}-${sha:0:7} ${NETWORK}-latest"
+          fi
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "list=${tags}" >> "$GITHUB_OUTPUT"
 
@@ -203,7 +249,7 @@ jobs:
               --build-arg "NETWORK=${NETWORK}" \
               --label "org.opencontainers.image.source=${SRC_URL}" \
               --label "org.opencontainers.image.revision=${BUILT_SHA}" \
-              --label "org.opencontainers.image.version=${INPUT_TAG}" \
+              --label "org.opencontainers.image.version=${INPUT_TAG:-dry-run}" \
               "${tag_args[@]}" \
               -f Dockerfile .
             for t in ${TAG_LIST}; do docker push "${image}:${t}"; done
@@ -229,7 +275,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "### ${NETWORK} @ ${INPUT_TAG}"
+            echo "### ${NETWORK} @ ${INPUT_TAG:-dry run}"
             echo
             echo "| Anchor | Value |"
             echo "|---|---|"
@@ -246,6 +292,7 @@ jobs:
   publish:
     name: "Attach enclave to release"
     needs: build
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
