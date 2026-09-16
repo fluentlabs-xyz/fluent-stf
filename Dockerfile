@@ -38,7 +38,7 @@ COPY --from=planner /app/recipe.json recipe.json
 
 # Pre-downloaded genesis cache. crates/primitives/build.rs resolves its cache
 # dir via directories::ProjectDirs — on Linux with HOME=/root it lands here.
-# Without this COPY, build.rs would HTTPS-pull three genesis.json.gz files
+# Without this COPY, build.rs would HTTPS-pull the genesis.json.gz files
 # from GitHub on every cold build.
 COPY .docker-cache/genesis /root/.cache/fluent/genesis
 

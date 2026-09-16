@@ -72,4 +72,3 @@ serde_bytes = "0.11.19"
 default = ["mainnet"]
 mainnet = ["fluent-stf-primitives/mainnet", "rsp-host-executor/mainnet"]
 testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet"]
-devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet"]

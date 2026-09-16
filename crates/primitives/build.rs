@@ -12,14 +12,13 @@ use std::{
     str::FromStr,
 };
 
-pub const FLUENT_DEVNET_CHAIN_ID: u64 = 0x5201;
 pub const FLUENT_TESTNET_CHAIN_ID: u64 = 0x5202;
 pub const FLUENT_MAINNET_CHAIN_ID: u64 = 25363;
 
 // ─── network definitions ────────────────────────────────────────────────────
 
 struct NetworkDef {
-    /// Cargo feature name (e.g. "mainnet", "testnet", "devnet").
+    /// Cargo feature name (e.g. "mainnet", "testnet").
     feature: &'static str,
     /// GitHub release tag
     tag: &'static str,
@@ -47,13 +46,6 @@ fn network_defs() -> Vec<NetworkDef> {
             channel: None,
             osaka_fork: ForkCondition::Block(21_300_000),
             chain_id: FLUENT_TESTNET_CHAIN_ID,
-        },
-        NetworkDef {
-            feature: "devnet",
-            tag: "v0.5.7", // FLUENT_DEVNET_GENESIS_TAG
-            channel: None,
-            osaka_fork: ForkCondition::Block(0),
-            chain_id: FLUENT_DEVNET_CHAIN_ID,
         },
     ]
 }

@@ -9,7 +9,7 @@ sentinel block inside a README.
 Usage:
     update_expected_pcr0.py <pcr.json> <lib.rs> <network> [--readme <README.md>]
 
-`network` must be one of: mainnet, testnet, devnet.
+`network` must be one of: mainnet, testnet.
 Only the `#[cfg(feature = "<network>")] pub const EXPECTED_PCR0 …` block is rewritten
 in `lib.rs`. If `--readme` is supplied, the single
 `<!-- pcr0:<network>:begin -->…<!-- pcr0:<network>:end -->` block is
@@ -21,7 +21,7 @@ import pathlib
 import re
 import sys
 
-NETWORKS = ("mainnet", "testnet", "devnet")
+NETWORKS = ("mainnet", "testnet")
 
 
 def patch_lib_rs(lib_rs: pathlib.Path, network: str, pcr0_hex: str) -> None:

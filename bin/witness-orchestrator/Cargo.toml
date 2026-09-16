@@ -83,7 +83,6 @@ alloy-rlp.workspace = true
 default = ["mainnet", "zstd-block-payload"]
 mainnet = ["fluent-stf-primitives/mainnet", "rsp-host-executor/mainnet"]
 testnet = ["fluent-stf-primitives/testnet", "rsp-host-executor/testnet", "zstd-block-payload"]
-devnet  = ["fluent-stf-primitives/devnet",  "rsp-host-executor/devnet"]
 # Compress `/sign-block-execution` request bodies with zstd. Disable to send
 # the raw bincode witness uncompressed (useful for local proxies or when the
 # receiving side negotiates a different encoding).

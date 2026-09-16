@@ -13,11 +13,15 @@ on:
         options:
           - mainnet
           - testnet
-          - devnet
       tag:
         description: "Release tag to build from and upload assets to (e.g. v1.0.5)"
         required: true
         type: string
+      sp1_client:
+        description: "Build the SP1 client ELF (off = keep the README rsp-client vkey as committed)"
+        required: false
+        type: boolean
+        default: true
 
 # Two runs for one network would push identical image tags and compete for the
 # same rsp-nix-store volume and BuildKit cache on the machine. Queue rather than
@@ -141,10 +145,15 @@ jobs:
         shell: bash
         env:
           NETWORK: "${{ inputs.network }}"
+          SP1_CLIENT: "${{ inputs.sp1_client && '1' || '0' }}"
         run: |
           set -euo pipefail
-          make build-nitro-validator-docker NETWORK="$NETWORK"
-          make build-client-docker NETWORK="$NETWORK"
+          make build-nitro-validator-docker NETWORK="$NETWORK" SP1_CLIENT="$SP1_CLIENT"
+          if [ "$SP1_CLIENT" = "1" ]; then
+            make build-client-docker NETWORK="$NETWORK"
+          else
+            echo "sp1_client=false — SP1 client ELF not built; rsp-client vkey left as committed"
+          fi
 
       # Rewrite the anchors from the artifacts just built, then require the
       # tree to be unchanged. This is the reproduction procedure from README §5.
@@ -153,6 +162,7 @@ jobs:
         env:
           NETWORK: "${{ inputs.network }}"
           INPUT_TAG: "${{ inputs.tag }}"
+          SP1_CLIENT: "${{ inputs.sp1_client && '1' || '0' }}"
         run: |
           set -euo pipefail
           python3 scripts/update_expected_pcr0.py \
@@ -160,8 +170,10 @@ jobs:
             bin/aws-nitro-validator/src/lib.rs \
             "$NETWORK" \
             --readme README.md
+          rsp_vkey="rsp-client-${NETWORK}.vkey"
+          [ "$SP1_CLIENT" = "1" ] || rsp_vkey="-"
           python3 scripts/update_readme_vkeys.py \
-            "rsp-client-${NETWORK}.vkey" \
+            "$rsp_vkey" \
             "nitro-validator-${NETWORK}.vkey" \
             README.md \
             "$NETWORK"
@@ -256,7 +268,11 @@ jobs:
             echo "| Anchor | Value |"
             echo "|---|---|"
             echo "| PCR0 | \`$(jq -r .PCR0 "rsp-client-enclave-${NETWORK}.eif.pcrs.json")\` |"
-            echo "| rsp-client vkey | \`$(cat "rsp-client-${NETWORK}.vkey")\` |"
+            if [ -f "rsp-client-${NETWORK}.vkey" ]; then
+              echo "| rsp-client vkey | \`$(cat "rsp-client-${NETWORK}.vkey")\` |"
+            else
+              echo "| rsp-client vkey | _not built (sp1_client=false)_ |"
+            fi
             echo "| nitro-validator vkey | \`$(cat "nitro-validator-${NETWORK}.vkey")\` |"
             echo
             echo "Images:"

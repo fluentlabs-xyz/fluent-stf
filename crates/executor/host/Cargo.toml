@@ -18,7 +18,6 @@ execution-witness = [
 ]
 mainnet = ["fluent-stf-primitives/mainnet", "rsp-client-executor/mainnet"]
 testnet = ["fluent-stf-primitives/testnet", "rsp-client-executor/testnet"]
-devnet  = ["fluent-stf-primitives/devnet",  "rsp-client-executor/devnet"]
 
 [dependencies]
 thiserror.workspace = true

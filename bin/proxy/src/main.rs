@@ -78,9 +78,6 @@ pub fn rpc_url() -> String {
     #[cfg(feature = "testnet")]
     return "https://rpc.testnet.fluent.xyz".to_string();
 
-    #[cfg(feature = "devnet")]
-    return "https://rpc.devnet.fluent.xyz".to_string();
-
     #[allow(unreachable_code)]
     "http://localhost:8545".to_string()
 }

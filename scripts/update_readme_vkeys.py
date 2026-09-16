@@ -7,6 +7,9 @@ the identity table of a README, from the SP1-verifier keys emitted by
 Usage:
     update_readme_vkeys.py <rsp-client.vkey> <nitro-validator.vkey> <README.md> <network>
 
+Pass `-` as <rsp-client.vkey> to leave the rsp-client cell untouched (release
+built with SP1_CLIENT=0, i.e. without the SP1 client ELF).
+
 Patches three sentinel blocks:
     <!-- rsp-vkey:<network>:begin -->`0x…`<!-- rsp-vkey:<network>:end -->
     <!-- nv-vkey:<network>:begin -->`0x…`<!-- nv-vkey:<network>:end -->
@@ -21,7 +24,7 @@ import pathlib
 import re
 import sys
 
-NETWORKS = ("mainnet", "testnet", "devnet")
+NETWORKS = ("mainnet", "testnet")
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLIENT_CARGO_TOML = REPO_ROOT / "bin" / "client" / "Cargo.toml"
@@ -86,12 +89,13 @@ def main() -> None:
     if network not in NETWORKS:
         sys.exit(f"network must be one of {NETWORKS}, got {network!r}")
 
-    rsp_vkey = read_vkey(rsp_vkey_path)
+    rsp_vkey = None if str(rsp_vkey_path) == "-" else read_vkey(rsp_vkey_path)
     nv_vkey = read_vkey(nv_vkey_path)
     version = f"v{read_release_version()}"
 
     src = readme.read_text()
-    src = patch_sentinel(src, f"rsp-vkey:{network}", rsp_vkey)
+    if rsp_vkey is not None:
+        src = patch_sentinel(src, f"rsp-vkey:{network}", rsp_vkey)
     src = patch_sentinel(src, f"nv-vkey:{network}", nv_vkey)
     src = patch_sentinel(src, "version", version)
     readme.write_text(src)
