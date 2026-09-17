@@ -6,7 +6,7 @@
 name = "rsp-client"
 description = ""
 edition = "2021"
-version = "1.0.5"
+version = "1.0.7"
 
 [workspace]
 
@@ -14,7 +14,6 @@ version = "1.0.5"
 default = ["sp1", "mainnet"]
 mainnet = ["fluent-stf-primitives/mainnet", "rsp-client-executor/mainnet"]
 testnet = ["fluent-stf-primitives/testnet", "rsp-client-executor/testnet"]
-devnet  = ["fluent-stf-primitives/devnet", "rsp-client-executor/devnet"]
 sp1 = [
     "dep:sp1-zkvm",
     "rsp-client-executor/sp1",

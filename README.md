@@ -61,27 +61,21 @@ Each network has its own set of cryptographic trust anchors. The values below ar
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:mainnet:begin -->`0841079935525d680f62622c74f736415cc2bea95903789f78a5380d6bb5df682d656e74359192019c6e49fe75e187f0`<!-- pcr0:mainnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00022b9b7769bd21b7bc4171ba458ffc80b46cab6f5fbd5629fa2d873df676fc`<!-- nv-vkey:mainnet:end --> |
+| PCR0 enclave | <!-- pcr0:mainnet:begin -->`c85ba4283676ad11323ffc24d30b92036c57cd69dff2d64a114a9d8eaffdafe9b55d1a480b0efcb9ee411fd96f8ef93e`<!-- pcr0:mainnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00f291835495d0af627923c963f18395bb9a7e6783b694497460f757866ea34b`<!-- nv-vkey:mainnet:end --> |
 | rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x009c9ebf2784363e7b9060fa837b153e0ea9d055e6464edb5fcd6a59fdf40b48`<!-- rsp-vkey:mainnet:end --> |
 
 **testnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:testnet:begin -->`217b31c6ef3f4e24aa950e27bf5c220b81ce54509a8b19b32b26cedec28eb6c087d1cb97a7d84cd1f60c167a025f6cbd`<!-- pcr0:testnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x00d2f234bfb5e53f3937c4fcc409e4dc447fb393b7df67e332afa5e9edfcb97a`<!-- nv-vkey:testnet:end --> |
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`744456159254e08a8d20353c5d70c496990ae2bcbf88f428aaf3f0b95aa5f385b63f70543832f94e416e0dbd96e99668`<!-- pcr0:testnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x00e50228f81bb6b4f4990c0a3dd8d3e27ced16e31606a3f31acaea3fabc4578c`<!-- nv-vkey:testnet:end --> |
 | rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x0011bf0d765eb3aa35baf6deec52dd5bbb6aef64de56fbd255ded22aa47b6c02`<!-- rsp-vkey:testnet:end --> |
 
-**devnet**
+Values built from release <!-- version:begin -->`v1.0.7`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.5`) and follow the commands in §5.
 
-| Anchor | Value |
-|--------|-------|
-| PCR0 enclave | <!-- pcr0:devnet:begin -->`b5ff2a2ca93b10be6b2cff4f2799e581112760a05e641f956e8401a57dd532c4eb54da25b2232386ebc6d9d9230d3415`<!-- pcr0:devnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:devnet:begin -->`0x00f080c9ea919582ff98b62967a9cd9a4aa4fbaff3842ab22526d4dcf2cafabc`<!-- nv-vkey:devnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:devnet:begin -->`0x00ec5cce0ada55a46a0ab5979ad0eb507cc20207b27ee2c1982334a03fbc60c2`<!-- rsp-vkey:devnet:end --> |
-
-Values built from release <!-- version:begin -->`v1.0.5`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.5`) and follow the commands in §5.
+> **SP1 client not rebuilt in this release.** The `rsp-client vkey` cells above still carry the `v1.0.6` values: the release was produced with `make build-release SP1_CLIENT=0`, which skips the SP1 client ELF. The SP1 client is currently disabled; the enclave and `nitro-validator` anchors are current.
 
 ### 3.4 Identity Injection into the ZK Circuit
 
@@ -139,7 +133,7 @@ All commands below run from the repository root. To independently verify that th
 
 # Option A — reproduce a single network (inspect raw artifacts manually).
 #
-# NETWORK ∈ {mainnet, testnet, devnet}.
+# NETWORK ∈ {mainnet, testnet}.
 make build-enclave-docker         NETWORK=mainnet # runs nixos/nix inside Docker
 make build-client-docker          NETWORK=mainnet
 make build-nitro-validator-docker NETWORK=mainnet
@@ -149,10 +143,12 @@ jq -r .PCR0 rsp-client-enclave-mainnet.eif.pcrs.json    # must match §3.3
 cat rsp-client-mainnet.vkey                             # must match §3.3
 cat nitro-validator-mainnet.vkey                        # must match §3.3
 
-# Option B — reproduce the full release (all three networks) and
-# rewrite PCR0 / vkey / version cells in lib.rs + README in place, so
+# Option B — reproduce the full release (all networks) and rewrite
+# PCR0 / vkey / version cells in lib.rs + README in place, so
 # `git diff` against the tagged commit must be empty if the build was
-# reproducible.
+# reproducible. Add SP1_CLIENT=0 for a release whose SP1 client was not
+# rebuilt (see the note under §3.3); `make build-client-docker` above is
+# then skipped as well.
 make build-release
 git diff --exit-code README.md bin/aws-nitro-validator/src/lib.rs
 ```

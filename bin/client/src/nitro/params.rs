@@ -32,19 +32,19 @@ pub const KMS_TIMEOUT_SECS: u64 = 30;
 pub const KMS_MAX_RESPONSE_BYTES: u64 = 512 * 1024;
 
 /// The AWS Region where the KMS service is located.
-#[cfg(not(any(feature = "testnet", feature = "devnet")))]
+#[cfg(not(feature = "testnet"))]
 pub const REGION: &str = "eu-central-2";
 
 /// The AWS Region where the KMS service is located.
-#[cfg(any(feature = "testnet", feature = "devnet"))]
+#[cfg(feature = "testnet")]
 pub const REGION: &str = "us-east-1";
 
 /// The DNS hostname for the AWS KMS endpoint.
-#[cfg(not(any(feature = "testnet", feature = "devnet")))]
+#[cfg(not(feature = "testnet"))]
 pub const KMS_HOST: &str = "kms.eu-central-2.amazonaws.com";
 
 /// The DNS hostname for the AWS KMS endpoint.
-#[cfg(any(feature = "testnet", feature = "devnet"))]
+#[cfg(feature = "testnet")]
 pub const KMS_HOST: &str = "kms.us-east-1.amazonaws.com";
 
 /// Required Content-Type header for AWS JSON RPC requests.

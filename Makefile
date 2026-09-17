@@ -11,10 +11,10 @@ PROXY_DIR    := bin/proxy
 # ─── Docker Compose (v2 plugin or standalone) ─────────────────────────────────
 DOCKER_COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
 
-# ─── Network (mainnet | testnet | devnet) ────────────────────────────────────
+# ─── Network (mainnet | testnet) ─────────────────────────────────────────────
 NETWORK      ?= mainnet
-ifeq ($(filter $(NETWORK),mainnet testnet devnet),)
-$(error NETWORK must be one of: mainnet, testnet, devnet (got '$(NETWORK)'))
+ifeq ($(filter $(NETWORK),mainnet testnet),)
+$(error NETWORK must be one of: mainnet, testnet (got '$(NETWORK)'))
 endif
 
 # ─── Nitro / enclave (network-tagged artifacts) ───────────────────────────────
@@ -26,6 +26,11 @@ ELF          := rsp-client-$(NETWORK).elf
 # ─── Nitro validator (attestation proving) ────────────────────────────────────
 NITRO_VALIDATOR_DIR := bin/aws-nitro-validator
 NITRO_VALIDATOR_ELF := nitro-validator-$(NETWORK).elf
+
+# ─── SP1 client ELF in release builds (1 | 0) ─────────────────────────────────
+# 0 skips build-client-docker in build-release and leaves the rsp-client vkey
+# cells in README.md at their previous-release values.
+SP1_CLIENT   ?= 1
 
 # ─── Config (override via env or CLI) ─────────────────────────────────────────
 EIF_PATH     ?= $(EIF)
@@ -72,7 +77,13 @@ build-nitro-validator-docker:
 		--output type=local,dest=. \
 		--no-cache \
 		-f Dockerfile .
-	@if [ -f rsp-client-$(NETWORK).vkey ]; then \
+	@if [ "$(SP1_CLIENT)" = "0" ]; then \
+		python3 scripts/update_readme_vkeys.py \
+			- \
+			nitro-validator-$(NETWORK).vkey \
+			README.md \
+			$(NETWORK); \
+	elif [ -f rsp-client-$(NETWORK).vkey ]; then \
 		python3 scripts/update_readme_vkeys.py \
 			rsp-client-$(NETWORK).vkey \
 			nitro-validator-$(NETWORK).vkey \
@@ -128,7 +139,7 @@ build-enclave-docker:
 
 # ─── Release build (all networks) ────────────────────────────────────────────
 
-NETWORKS_ALL := mainnet testnet devnet
+NETWORKS_ALL := mainnet testnet
 
 ## Build enclave + rsp-client ELF + nitro-validator ELF for every network,
 ## then rewrite EXPECTED_PCR0 in bin/aws-nitro-validator/src/lib.rs and the
@@ -139,7 +150,8 @@ NETWORKS_ALL := mainnet testnet devnet
 ##   1. build-enclave                  → PCR0 in <eif>.pcrs.json
 ##   2. update_expected_pcr0.py        → writes PCR0 into lib.rs
 ##   3. build-nitro-validator-docker   → bakes that PCR0 into the vkey
-##   4. build-client-docker            → independent vkey
+##   4. build-client-docker            → independent vkey (skipped when
+##                                       SP1_CLIENT=0; README cell kept)
 ##   5. update_readme_vkeys.py         → writes both vkeys + release version
 ##
 ## Reordering steps 2↔3 produces a stale vkey that will not match the
@@ -158,15 +170,21 @@ build-release:
 			bin/aws-nitro-validator/src/lib.rs \
 			$$net \
 			--readme README.md; \
-		$(MAKE) build-nitro-validator-docker NETWORK=$$net; \
- 		$(MAKE) build-client-docker NETWORK=$$net; \
+		$(MAKE) build-nitro-validator-docker NETWORK=$$net SP1_CLIENT=$(SP1_CLIENT); \
+		if [ "$(SP1_CLIENT)" = "0" ]; then \
+			echo "note: SP1_CLIENT=0 — skipping build-client-docker; rsp-client vkey for $$net left unchanged"; \
+			rsp_vkey=-; \
+		else \
+			$(MAKE) build-client-docker NETWORK=$$net; \
+			rsp_vkey=rsp-client-$$net.vkey; \
+		fi; \
 		python3 scripts/update_readme_vkeys.py \
-			rsp-client-$$net.vkey \
+			$$rsp_vkey \
 			nitro-validator-$$net.vkey \
 			README.md \
 			$$net; \
 	done
-	@echo "=== build-release: done ($(NETWORKS_ALL)) ==="
+	@echo "=== build-release: done ($(NETWORKS_ALL), SP1_CLIENT=$(SP1_CLIENT)) ==="
 
 ## Run enclave locally (debug)
 run-enclave:
@@ -234,33 +252,32 @@ help:
 	@echo "  clean                         Remove build artifacts"
 	@echo ""
 	@echo "Overrides:"
-	@echo "  NETWORK=$(NETWORK)            (mainnet | testnet | devnet)"
+	@echo "  NETWORK=$(NETWORK)            (mainnet | testnet)"
 	@echo "  EIF_PATH=$(EIF_PATH)"
 	@echo "  ELF_PATH=$(ELF_PATH)"
 	@echo "  API_KEY=$(API_KEY)"
 	@echo "  LISTEN_ADDR=$(LISTEN_ADDR)"
 	@echo "  SP1_PROVER=$(SP1_PROVER)"
+	@echo "  SP1_CLIENT=$(SP1_CLIENT)            (0 = build-release without the SP1 client ELF)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build-client-docker                    # mainnet (default)"
 	@echo "  make build-client-docker NETWORK=testnet    # testnet"
-	@echo "  make build-enclave NETWORK=devnet           # devnet"
 
 # ─── Genesis pre-download (for reproducible docker builds) ───────────────────
 
 GENESIS_CACHE_DIR := .docker-cache/genesis
 
 ## Pre-download genesis.json.gz for all networks into build context.
-## crates/primitives/build.rs iterates all three networks regardless of active
-## feature, so we must pre-download all three — otherwise cargo build inside
+## crates/primitives/build.rs iterates all networks regardless of active
+## feature, so we must pre-download all of them — otherwise cargo build inside
 ## docker would pull from GitHub at compile time.
 download-genesis-cache:
 	@mkdir -p $(GENESIS_CACHE_DIR)
 	@set -e; \
 	for spec in \
 		"v1.0.0:genesis-mainnet-v1.0.0.json.gz" \
-		"v0.3.4-dev:genesis-v0.3.4-dev.json.gz" \
-		"v0.5.7:genesis-v0.5.7.json.gz"; do \
+		"v0.3.4-dev:genesis-v0.3.4-dev.json.gz"; do \
 		tag=$$(echo $$spec | cut -d: -f1); \
 		name=$$(echo $$spec | cut -d: -f2); \
 		path="$(GENESIS_CACHE_DIR)/$$name"; \

@@ -52,8 +52,8 @@ if [ -z "$NETWORK" ]; then
     [ -n "$NETWORK" ] || die "NETWORK is not set in .env"
 fi
 case "$NETWORK" in
-    mainnet|testnet|devnet) ;;
-    *) die "NETWORK must be one of: mainnet, testnet, devnet (got '$NETWORK')" ;;
+    mainnet|testnet) ;;
+    *) die "NETWORK must be one of: mainnet, testnet (got '$NETWORK')" ;;
 esac
 
 # ── 1. Resolve the version ───────────────────────────────────────────────────

@@ -11,7 +11,6 @@ repository.workspace = true
 default = ["mainnet"]
 mainnet = []
 testnet = []
-devnet  = []
 
 [dependencies]
 # reth

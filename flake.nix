@@ -45,10 +45,6 @@
           url = "https://github.com/fluentlabs-xyz/fluentbase/releases/download/v0.3.4-dev/genesis-v0.3.4-dev.json.gz";
           sha256 = "8cd30358c5664375e6739bc48302445e7ee10fd0158bedb788505e5c590983bd";
         };
-        genesisDevnet = pkgs.fetchurl {
-          url = "https://github.com/fluentlabs-xyz/fluentbase/releases/download/v0.5.7/genesis-v0.5.7.json.gz";
-          sha256 = "91b9a427805d45dd14e46a0cd517bcc85f350fe7dfc38fa96f6ff0ebf5e864da";
-        };
 
         # Crane vendors git deps per-commit (not per-name), so duplicate-name
         # crates like ecdsa-0.16.9 (appearing as both registry + git in the
@@ -162,7 +158,6 @@
               mkdir -p "$HOME/.cache/fluent/genesis"
               install -m 0644 ${genesisMainnet} "$HOME/.cache/fluent/genesis/genesis-mainnet-v1.0.0.json.gz"
               install -m 0644 ${genesisTestnet} "$HOME/.cache/fluent/genesis/genesis-v0.3.4-dev.json.gz"
-              install -m 0644 ${genesisDevnet}  "$HOME/.cache/fluent/genesis/genesis-v0.5.7.json.gz"
             '';
 
             doCheck = false;
@@ -202,11 +197,9 @@
         packages = {
           rsp-client-mainnet = mkRspClient "mainnet";
           rsp-client-testnet = mkRspClient "testnet";
-          rsp-client-devnet  = mkRspClient "devnet";
 
           enclave-mainnet = mkEnclave "mainnet";
           enclave-testnet = mkEnclave "testnet";
-          enclave-devnet  = mkEnclave "devnet";
 
           default = mkEnclave "mainnet";
         };

@@ -2,7 +2,7 @@
 
 [package]
 name = "nitro-validator"
-version = "1.0.5"
+version = "1.0.7"
 edition = "2021"
 
 # NOTE: This is a standalone SP1 zkVM program — NOT part of the main workspace.
@@ -20,7 +20,6 @@ test = false
 default = ["mainnet"]
 mainnet = []
 testnet = []
-devnet  = []
 
 [dependencies]
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
