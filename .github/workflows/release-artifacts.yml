@@ -226,6 +226,7 @@ jobs:
           INPUT_TAG: "${{ inputs.tag }}"
           BUILT_SHA: "${{ steps.tags.outputs.sha }}"
           SRC_URL: "${{ github.server_url }}/${{ github.repository }}"
+          SP1_CLIENT: "${{ inputs.sp1_client && '1' || '0' }}"
         run: |
           set -euo pipefail
           for svc in proxy witness-orchestrator; do
@@ -235,6 +236,7 @@ jobs:
             DOCKER_BUILDKIT=1 docker build \
               --target "rsp-${svc}" \
               --build-arg "NETWORK=${NETWORK}" \
+              --build-arg "SP1_CLIENT=${SP1_CLIENT}" \
               --label "org.opencontainers.image.source=${SRC_URL}" \
               --label "org.opencontainers.image.revision=${BUILT_SHA}" \
               --label "org.opencontainers.image.version=${INPUT_TAG}" \

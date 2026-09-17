@@ -75,7 +75,7 @@ Each network has its own set of cryptographic trust anchors. The values below ar
 
 Values built from release <!-- version:begin -->`v1.0.7`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.5`) and follow the commands in §5.
 
-> **SP1 client not rebuilt in this release.** The `rsp-client vkey` cells above still carry the `v1.0.6` values: the release was produced with `make build-release SP1_CLIENT=0`, which skips the SP1 client ELF. The SP1 client is currently disabled; the enclave and `nitro-validator` anchors are current.
+> **`rsp-client vkey` is unchanged in this release.** The SP1 client was not rebuilt for `v1.0.7`: the `rsp-client vkey` cells above are the values published with `v1.0.6`, carried over as-is. Only the enclave (PCR0) and `nitro-validator` anchors were rebuilt from this tag. Until a release rebuilds the SP1 client, the released `proxy` runs without it and the SP1 fault-proof endpoints (`/challenge/sp1/*`) are unavailable. Reproduction: §5, Option B with `SP1_CLIENT=0`.
 
 ### 3.4 Identity Injection into the ZK Circuit
 

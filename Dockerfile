@@ -1,3 +1,9 @@
+# 1 = the proxy image ships rsp-client-<network>.elf and enables the SP1
+# endpoints; 0 = the ELF was not built for this release (make build-release
+# SP1_CLIENT=0) and the proxy starts with SP1_ELF_PATH unset. Only used to
+# select the rsp-proxy base stage below.
+ARG SP1_CLIENT=1
+
 FROM lukemathwalker/cargo-chef:latest-rust-1-bookworm AS chef
 WORKDIR /app
 
@@ -217,7 +223,7 @@ RUN mkdir -p /out/var/lib/proxy /out/opt/elfs && \
 #                              Proxy Runtime                                  #
 #                                                                             #
 ###############################################################################
-FROM gcr.io/distroless/cc-debian12:nonroot AS rsp-proxy
+FROM gcr.io/distroless/cc-debian12:nonroot AS rsp-proxy-base
 
 ARG NETWORK=mainnet
 
@@ -228,13 +234,11 @@ COPY --from=busybox:1.37.0-musl /bin/busybox /busybox
 COPY --from=rsp-proxy-prep --chown=65532:65532 /out/var/lib/proxy /var/lib/proxy
 COPY --from=rsp-proxy-prep /out/opt/elfs /opt/elfs
 
-COPY rsp-client-${NETWORK}.elf       /opt/elfs/sp1-client.elf
 COPY nitro-validator-${NETWORK}.elf  /opt/elfs/nitro-validator.elf
 
 COPY --from=builder /app/proxy /usr/local/bin/proxy
 
-ENV SP1_ELF_PATH=/opt/elfs/sp1-client.elf \
-    NITRO_VALIDATOR_ELF_PATH=/opt/elfs/nitro-validator.elf \
+ENV NITRO_VALIDATOR_ELF_PATH=/opt/elfs/nitro-validator.elf \
     PROXY_DB_PATH=/var/lib/proxy/proxy.db \
     HOME=/var/lib/proxy
 
@@ -242,6 +246,21 @@ USER nonroot:nonroot
 WORKDIR /var/lib/proxy
 
 ENTRYPOINT ["/usr/local/bin/proxy"]
+
+# SP1_CLIENT selects one of these two as the final stage. BuildKit only
+# resolves the stage the target depends on, so with SP1_CLIENT=0 the missing
+# rsp-client-<network>.elf is never looked up in the build context.
+FROM rsp-proxy-base AS rsp-proxy-sp1-0
+
+FROM rsp-proxy-base AS rsp-proxy-sp1-1
+
+ARG NETWORK=mainnet
+
+COPY rsp-client-${NETWORK}.elf /opt/elfs/sp1-client.elf
+
+ENV SP1_ELF_PATH=/opt/elfs/sp1-client.elf
+
+FROM rsp-proxy-sp1-${SP1_CLIENT} AS rsp-proxy
 
 ###############################################################################
 #                                                                             #
