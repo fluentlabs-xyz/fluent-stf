@@ -13164,6 +13164,7 @@ dependencies = [
  "reth-storage-api",
  "reth-tasks",
  "reth-trie",
+ "reth-trie-db",
  "rsp-blob-builder",
  "rsp-client-executor",
  "rsp-host-executor",

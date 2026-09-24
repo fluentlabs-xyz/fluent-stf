@@ -86,6 +86,7 @@ use fluent_stf_primitives::fluent_chainspec;
 use reth_chainspec::ChainSpec;
 use reth_provider::BlockNumReader;
 use reth_tasks::{RuntimeBuilder, RuntimeConfig, TokioConfig};
+use reth_trie_db::ChangesetCache;
 use rsp_host_executor::EthHostExecutor;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
@@ -456,11 +457,13 @@ async fn main() -> eyre::Result<()> {
     )
     .build()
     .expect("failed to build reth_tasks::Runtime from current handle");
+    let changeset_cache = ChangesetCache::new();
     let factory = driver::open_writable_factory::<driver::FluentMdbxNode>(
         &datadir,
         chain_spec.clone(),
         mdbx_max_size,
         runtime,
+        changeset_cache.clone(),
     )
     .expect("failed to open writable ProviderFactory");
 
@@ -504,7 +507,7 @@ async fn main() -> eyre::Result<()> {
                  orchestrator DB if stale batch/response rows matter for recovery"
             );
         }
-        driver::unwind_to(factory.clone(), Arc::clone(&hub), target).await?;
+        driver::unwind_to(factory.clone(), Arc::clone(&hub), &changeset_cache, target).await?;
     }
 
     let host_executor = Arc::new(EthHostExecutor::eth(chain_spec.clone(), None));
@@ -534,6 +537,7 @@ async fn main() -> eyre::Result<()> {
             witness_from_block,
             orchestrator_checkpoint,
             l2_safe_blocks,
+            changeset_cache,
         })
         .expect("Driver::new failed"),
     );
