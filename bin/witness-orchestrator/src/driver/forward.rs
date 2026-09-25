@@ -928,7 +928,7 @@ fn commit_phase(
 /// provider_rw without commit and relies on `heal_static_files_if_needed` at
 /// the next startup to re-sync static files to the MDBX tip.
 ///
-/// Produces no `WitnessJob` — the catch-up path does not produce witnesses.
+/// Produces no witnesses — the catch-up path only advances MDBX.
 fn commit_batch(
     factory: &ProviderFactory<DriverNode>,
     chain_spec: &Arc<ChainSpec>,
@@ -1077,9 +1077,19 @@ async fn rewitness_phase(
         .ok_or_else(|| eyre!("missing header N-1 during re-witness of block {block_number}"))?
         .state_root;
 
-    let built =
-        build_witness(block_number, prim_block, parent_state_root, factory, host_executor).await;
-    changeset_cache.evict(u64::MAX);
+    // Detached so the cache is cleared even when the caller is dropped (an
+    // HTTP client timing out): the blocking trie walk cannot be cancelled and
+    // keeps inserting after that.
+    let changeset_cache = changeset_cache.clone();
+    let built = tokio::spawn(async move {
+        let built =
+            build_witness(block_number, prim_block, parent_state_root, factory, host_executor)
+                .await;
+        changeset_cache.evict(u64::MAX);
+        built
+    })
+    .await
+    .map_err(|e| eyre!("re-witness task join: {e}"))?;
     let BuiltWitness { payload, witness_ms, serialize_ms } =
         built.map_err(|e| eyre!("re-witness of block {block_number}: {e}"))?;
 
