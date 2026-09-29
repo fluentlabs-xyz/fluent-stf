@@ -61,21 +61,19 @@ Each network has its own set of cryptographic trust anchors. The values below ar
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:mainnet:begin -->`c85ba4283676ad11323ffc24d30b92036c57cd69dff2d64a114a9d8eaffdafe9b55d1a480b0efcb9ee411fd96f8ef93e`<!-- pcr0:mainnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00f291835495d0af627923c963f18395bb9a7e6783b694497460f757866ea34b`<!-- nv-vkey:mainnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x009c9ebf2784363e7b9060fa837b153e0ea9d055e6464edb5fcd6a59fdf40b48`<!-- rsp-vkey:mainnet:end --> |
+| PCR0 enclave | <!-- pcr0:mainnet:begin -->`b7057363660fe026cf98824ca6299d0af2f1563a0a74b57a7c13321c6529e449476ba783ebef99b96ede270f480ae326`<!-- pcr0:mainnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00e73cac25586aecbccdc405867794bda8e4d6843f4cd1612ed7e2c82943411f`<!-- nv-vkey:mainnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x0024bf1b82aaf5121a4de84b33ca12f96f6d741904c0eddc753eebe64e21d8a7`<!-- rsp-vkey:mainnet:end --> |
 
 **testnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:testnet:begin -->`744456159254e08a8d20353c5d70c496990ae2bcbf88f428aaf3f0b95aa5f385b63f70543832f94e416e0dbd96e99668`<!-- pcr0:testnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x00e50228f81bb6b4f4990c0a3dd8d3e27ced16e31606a3f31acaea3fabc4578c`<!-- nv-vkey:testnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x0011bf0d765eb3aa35baf6deec52dd5bbb6aef64de56fbd255ded22aa47b6c02`<!-- rsp-vkey:testnet:end --> |
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`b4b8b3c82170bf6910d28915d61b7399ce181ba22cb38341a75572ee4b3cdc89af5e1fccd95cdc441382671da9b19959`<!-- pcr0:testnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x00effc079e453d3ac512a0d6bd1b676d384fc388f6c0fdfe4f3832df9702418a`<!-- nv-vkey:testnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x007d78e7428ecc5e301d03e7e9ebda387db6a321a2a1ec968a6f4fd30e0717c7`<!-- rsp-vkey:testnet:end --> |
 
-Values built from release <!-- version:begin -->`v1.0.7`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.5`) and follow the commands in §5.
-
-> **`rsp-client vkey` is unchanged in this release.** The SP1 client was not rebuilt for `v1.0.7`: the `rsp-client vkey` cells above are the values published with `v1.0.6`, carried over as-is. Only the enclave (PCR0) and `nitro-validator` anchors were rebuilt from this tag. Until a release rebuilds the SP1 client, the released `proxy` runs without it and the SP1 fault-proof endpoints (`/challenge/sp1/*`) are unavailable. Reproduction: §5, Option B with `SP1_CLIENT=0`.
+Values built from release <!-- version:begin -->`v1.0.8`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.5`) and follow the commands in §5.
 
 ### 3.4 Identity Injection into the ZK Circuit
 
