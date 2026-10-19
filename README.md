@@ -61,16 +61,16 @@ Each network has its own set of cryptographic trust anchors. The values below ar
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:mainnet:begin -->`35865c3ae734c65828c3a2683a70617478fb692c64721a7c6d07f46111a53ce6371199ca91b52cd45f7babe62fe48bda`<!-- pcr0:mainnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x0085fdb0972b2348d4fc59b7d0cbf9f99dec1de7e155ae71e521b50d68b1eaca`<!-- nv-vkey:mainnet:end --> |
+| PCR0 enclave | <!-- pcr0:mainnet:begin -->`9a4adcaf3e870434a132a775d1ee2b094057fbf1cd046c4cfe2812066ec20ff13cf23b3370a3a60c43bcfa9791021e4a`<!-- pcr0:mainnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x0031cd16db870b6b18b417b17a976071016ad8b7c134a914f24d300f618ce157`<!-- nv-vkey:mainnet:end --> |
 | rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x00ee19983bb44104a4f74b0c9b53bbcba05b16cbaf259ad0a0c8a85344e1ba30`<!-- rsp-vkey:mainnet:end --> |
 
 **testnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:testnet:begin -->`8e14fb3ba0db07e12df1e1bb63e93e8b3f1f8d8c568c3d56e87630ff92e400bc3c1daa81c61f71888465bfeab8edff03`<!-- pcr0:testnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x0099dd350cea9061e540ff638c1cd6414ef61aa6cb13a11fa3e597df2c09a05e`<!-- nv-vkey:testnet:end --> |
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`f7c397bf0a858ec513677ce207762984d7cbba51a3b141b79890d59fc3ef45047b5a82f1cb5704c6a029966f9510b4e3`<!-- pcr0:testnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x00d43d89d621e042de41eb394741e68d4a7e268e1ac52482d55e9e42bc4c8698`<!-- nv-vkey:testnet:end --> |
 | rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x0051dc3620c050687f7f312a54e5137bd936ed73e11099f1119ac46819d07f55`<!-- rsp-vkey:testnet:end --> |
 
 Values built from release <!-- version:begin -->`v1.0.9`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.5`) and follow the commands in §5.
