@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "fluent-stf-primitives"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -4193,7 +4193,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "nitro-types"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-primitives",
  "base64 0.22.1",
@@ -6219,7 +6219,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-client"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.1.1",
@@ -6262,7 +6262,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-client-executor"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus",
  "alloy-evm",
@@ -6275,6 +6275,7 @@ dependencies = [
  "fluent-stf-primitives",
  "fluentbase-revm",
  "fluentbase-runtime",
+ "fluentbase-types",
  "itertools 0.13.0",
  "reth-chainspec",
  "reth-consensus",
@@ -6297,7 +6298,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-mpt"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",

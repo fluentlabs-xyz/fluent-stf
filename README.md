@@ -61,19 +61,19 @@ Each network has its own set of cryptographic trust anchors. The values below ar
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:mainnet:begin -->`b7057363660fe026cf98824ca6299d0af2f1563a0a74b57a7c13321c6529e449476ba783ebef99b96ede270f480ae326`<!-- pcr0:mainnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x00e73cac25586aecbccdc405867794bda8e4d6843f4cd1612ed7e2c82943411f`<!-- nv-vkey:mainnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x0024bf1b82aaf5121a4de84b33ca12f96f6d741904c0eddc753eebe64e21d8a7`<!-- rsp-vkey:mainnet:end --> |
+| PCR0 enclave | <!-- pcr0:mainnet:begin -->`35865c3ae734c65828c3a2683a70617478fb692c64721a7c6d07f46111a53ce6371199ca91b52cd45f7babe62fe48bda`<!-- pcr0:mainnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:mainnet:begin -->`0x0085fdb0972b2348d4fc59b7d0cbf9f99dec1de7e155ae71e521b50d68b1eaca`<!-- nv-vkey:mainnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:mainnet:begin -->`0x00ee19983bb44104a4f74b0c9b53bbcba05b16cbaf259ad0a0c8a85344e1ba30`<!-- rsp-vkey:mainnet:end --> |
 
 **testnet**
 
 | Anchor | Value |
 |--------|-------|
-| PCR0 enclave | <!-- pcr0:testnet:begin -->`b4b8b3c82170bf6910d28915d61b7399ce181ba22cb38341a75572ee4b3cdc89af5e1fccd95cdc441382671da9b19959`<!-- pcr0:testnet:end --> |
-| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x00effc079e453d3ac512a0d6bd1b676d384fc388f6c0fdfe4f3832df9702418a`<!-- nv-vkey:testnet:end --> |
-| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x007d78e7428ecc5e301d03e7e9ebda387db6a321a2a1ec968a6f4fd30e0717c7`<!-- rsp-vkey:testnet:end --> |
+| PCR0 enclave | <!-- pcr0:testnet:begin -->`8e14fb3ba0db07e12df1e1bb63e93e8b3f1f8d8c568c3d56e87630ff92e400bc3c1daa81c61f71888465bfeab8edff03`<!-- pcr0:testnet:end --> |
+| nitro-validator vkey | <!-- nv-vkey:testnet:begin -->`0x0099dd350cea9061e540ff638c1cd6414ef61aa6cb13a11fa3e597df2c09a05e`<!-- nv-vkey:testnet:end --> |
+| rsp-client vkey | <!-- rsp-vkey:testnet:begin -->`0x0051dc3620c050687f7f312a54e5137bd936ed73e11099f1119ac46819d07f55`<!-- rsp-vkey:testnet:end --> |
 
-Values built from release <!-- version:begin -->`v1.0.8`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.5`) and follow the commands in §5.
+Values built from release <!-- version:begin -->`v1.0.9`<!-- version:end -->. For independent verification, run `git checkout <version>` (e.g. `git checkout v1.0.5`) and follow the commands in §5.
 
 ### 3.4 Identity Injection into the ZK Circuit
 

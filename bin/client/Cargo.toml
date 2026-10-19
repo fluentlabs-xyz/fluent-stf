@@ -6,7 +6,7 @@
 name = "rsp-client"
 description = ""
 edition = "2021"
-version = "1.0.8"
+version = "1.0.9"
 
 [workspace]
 
