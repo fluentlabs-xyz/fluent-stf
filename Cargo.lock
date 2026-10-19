@@ -8986,6 +8986,7 @@ dependencies = [
  "fluent-stf-primitives",
  "fluentbase-revm",
  "fluentbase-runtime",
+ "fluentbase-types",
  "itertools 0.13.0",
  "reth-chainspec",
  "reth-consensus",
