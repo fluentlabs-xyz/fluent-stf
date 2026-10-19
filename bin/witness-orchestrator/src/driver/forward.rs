@@ -42,6 +42,7 @@ use reth_prune_types::MINIMUM_UNWIND_SAFE_DISTANCE;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::BlockExecutionWriter;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
+use reth_trie_db::ChangesetCache;
 use rsp_client_executor::{evm::FluentEvmConfig, IntoPrimitives};
 use rsp_host_executor::EthHostExecutor;
 use tokio::sync::Mutex as AsyncMutex;
@@ -82,11 +83,16 @@ const CATCHUP_BATCH_PIPELINE: usize = 2;
 
 /// Open a writable `ProviderFactory<N>` against a fresh or existing
 /// reth datadir. Layout: `<datadir>/{db,static_files,rocksdb}`.
+///
+/// `changeset_cache` replaces the factory's own cache so the caller keeps a
+/// handle to evict it: reth evicts only from its engine tree, which is not
+/// embedded here.
 pub(crate) fn open_writable_factory<N>(
     datadir: &Path,
     chain_spec: Arc<ChainSpec>,
     mdbx_max_size: u64,
     runtime: reth_tasks::Runtime,
+    changeset_cache: ChangesetCache,
 ) -> eyre::Result<ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>>
 where
     N: NodeTypesForProvider<
@@ -119,7 +125,8 @@ where
     let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, DatabaseEnv>>::new(
         db, chain_spec, sf, rocks, runtime,
     )
-    .map_err(|e| eyre!("provider_factory: {e}"))?;
+    .map_err(|e| eyre!("provider_factory: {e}"))?
+    .with_changeset_cache(changeset_cache);
 
     heal_static_files_if_needed(&factory)?;
 
@@ -263,6 +270,8 @@ pub(crate) struct DriverConfig {
     /// `advance_to_witness_from_block` and `try_take_new_block` as
     /// `remote_tip.saturating_sub(l2_safe_blocks)`.
     pub l2_safe_blocks: u64,
+    /// The cache installed into `factory` by `open_writable_factory`.
+    pub changeset_cache: ChangesetCache,
 }
 
 /// A block fetched from RPC together with the time it took to pull.
@@ -272,17 +281,18 @@ struct FetchedBlock {
     fetch_ms: u64,
 }
 
-/// Commit-phase output — everything the witness phase needs plus the
-/// pre-witness per-phase timings.
-struct WitnessJob {
-    block_number: u64,
-    prim_block: reth_ethereum_primitives::Block,
-    parent_state_root: alloy_primitives::B256,
-    fetch_ms: u64,
+/// Per-phase timings of `commit_phase`.
+struct CommitTimings {
     execute_ms: u64,
     trie_ms: u64,
     save_ms: u64,
-    t_total_start: Instant,
+}
+
+/// Serialized witness plus the timings of its two phases.
+struct BuiltWitness {
+    payload: Vec<u8>,
+    witness_ms: u64,
+    serialize_ms: u64,
 }
 
 /// Pull-shaped forward-sync driver. Construct once, then drive through the
@@ -305,6 +315,7 @@ pub(crate) struct Driver {
     /// here while another call is in flight (MDBX writable txn is single-writer).
     state: AsyncMutex<DriverState>,
     l2_safe_blocks: u64,
+    changeset_cache: ChangesetCache,
 }
 
 struct DriverState {
@@ -396,6 +407,7 @@ impl Driver {
             ready: AtomicBool::new(false),
             state: AsyncMutex::new(DriverState { next, pruner: cfg.pruner }),
             l2_safe_blocks: cfg.l2_safe_blocks,
+            changeset_cache: cfg.changeset_cache,
         })
     }
 
@@ -591,6 +603,7 @@ impl Driver {
             self.factory.clone(),
             Arc::clone(&self.host_executor),
             Arc::clone(&self.hub),
+            &self.changeset_cache,
         )
         .await?;
         Ok(Some(payload))
@@ -652,6 +665,7 @@ impl Driver {
                 self.factory.clone(),
                 Arc::clone(&self.host_executor),
                 Arc::clone(&self.hub),
+                &self.changeset_cache,
             )
             .await?;
 
@@ -693,18 +707,54 @@ impl Driver {
             }
         };
 
+        let FetchedBlock { block_number, alloy_block, fetch_ms } = fetched;
+        let t_total_start = Instant::now();
+        let prim_block =
+            <reth_ethereum_primitives::EthPrimitives as IntoPrimitives<Ethereum>>::into_primitive_block(
+                alloy_block,
+            );
+        let parent_state_root = self
+            .factory
+            .header_by_number(block_number - 1)
+            .map_err(|e| eyre!("header_by_number({}): {e}", block_number - 1))?
+            .ok_or_else(|| eyre!("missing header N-1 for block {block_number}"))?
+            .state_root;
+
+        // Built while the parent is still the MDBX tip: reth then serves the
+        // parent state as latest instead of reverting trie changesets from N.
+        let BuiltWitness { payload, witness_ms, serialize_ms } = build_witness(
+            block_number,
+            prim_block.clone(),
+            parent_state_root,
+            self.factory.clone(),
+            Arc::clone(&self.host_executor),
+        )
+        .await?;
+
         // Wrap commit_phase in spawn_blocking — it does heavy sync MDBX +
         // static_files work that must not stall the async runtime.
         let factory_clone = self.factory.clone();
         let chain_spec_clone = Arc::clone(&self.chain_spec);
-        let job = tokio::task::spawn_blocking(move || {
-            commit_phase(&factory_clone, &chain_spec_clone, fetched)
-        })
-        .await
-        .map_err(|e| eyre!("commit_phase join: {e}"))??;
+        let CommitTimings { execute_ms, trie_ms, save_ms } =
+            tokio::task::spawn_blocking(move || {
+                commit_phase(&factory_clone, &chain_spec_clone, block_number, prim_block)
+            })
+            .await
+            .map_err(|e| eyre!("commit_phase join: {e}"))??;
 
-        let payload =
-            witness_phase(job, self.factory.clone(), Arc::clone(&self.host_executor)).await?;
+        info!(
+            block_number,
+            total_ms = t_total_start.elapsed().as_millis() as u64,
+            fetch_ms,
+            execute_ms,
+            trie_ms,
+            save_ms,
+            witness_ms,
+            serialize_ms,
+            payload_bytes = payload.len() as u64,
+            "Block witness built"
+        );
+        metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
 
         // Buffered cold write: batches redb fsyncs across many blocks. A crash
         // before the next flush loses the buffered block numbers from cold —
@@ -811,21 +861,14 @@ async fn fetch_batch(
     Ok(results)
 }
 
-/// Commit phase: alloy → primitive → execute → trie → save_blocks(Full) → commit.
+/// Commit phase: execute → trie → save_blocks(Full) → commit.
 fn commit_phase(
     factory: &ProviderFactory<DriverNode>,
     chain_spec: &Arc<ChainSpec>,
-    fetched: FetchedBlock,
-) -> eyre::Result<WitnessJob> {
-    let FetchedBlock { block_number, alloy_block, fetch_ms } = fetched;
-    let t_total_start = Instant::now();
-
-    let prim_block =
-        <reth_ethereum_primitives::EthPrimitives as IntoPrimitives<Ethereum>>::into_primitive_block(
-            alloy_block,
-        );
+    block_number: u64,
+    prim_block: reth_ethereum_primitives::Block,
+) -> eyre::Result<CommitTimings> {
     let recovered = prim_block
-        .clone()
         .try_into_recovered()
         .map_err(|_| eyre!("recover_senders failed for block {block_number}"))?;
 
@@ -871,21 +914,7 @@ fn commit_phase(
     provider_rw.commit().map_err(|e| eyre!("commit: {e}"))?;
     let save_ms = t_save.elapsed().as_millis() as u64;
 
-    let parent_state_root = factory
-        .header_by_number(block_number - 1)?
-        .ok_or_else(|| eyre!("missing header N-1 after commit"))?
-        .state_root;
-
-    Ok(WitnessJob {
-        block_number,
-        prim_block,
-        parent_state_root,
-        fetch_ms,
-        execute_ms,
-        trie_ms,
-        save_ms,
-        t_total_start,
-    })
+    Ok(CommitTimings { execute_ms, trie_ms, save_ms })
 }
 
 /// Catch-up commit phase: MDBX-commit a consecutive range of blocks in ONE
@@ -899,7 +928,7 @@ fn commit_phase(
 /// provider_rw without commit and relies on `heal_static_files_if_needed` at
 /// the next startup to re-sync static files to the MDBX tip.
 ///
-/// Produces no `WitnessJob` — the catch-up path does not produce witnesses.
+/// Produces no witnesses — the catch-up path only advances MDBX.
 fn commit_batch(
     factory: &ProviderFactory<DriverNode>,
     chain_spec: &Arc<ChainSpec>,
@@ -958,25 +987,16 @@ fn commit_batch(
     Ok(())
 }
 
-/// Witness phase: execute_exex_with_block + bincode (on blocking pool).
+/// Witness build: execute_exex_with_block + bincode (on blocking pool).
 /// Returns the serialized payload, leaving storage/channel side-effects to
 /// the caller.
-async fn witness_phase(
-    job: WitnessJob,
+async fn build_witness(
+    block_number: u64,
+    prim_block: reth_ethereum_primitives::Block,
+    parent_state_root: alloy_primitives::B256,
     factory: ProviderFactory<DriverNode>,
     host_executor: Arc<EthHostExecutor>,
-) -> eyre::Result<Vec<u8>> {
-    let WitnessJob {
-        block_number,
-        prim_block,
-        parent_state_root,
-        fetch_ms,
-        execute_ms,
-        trie_ms,
-        save_ms,
-        t_total_start,
-    } = job;
-
+) -> eyre::Result<BuiltWitness> {
     let t_witness = Instant::now();
     // execute_exex_with_block walks tries and runs EVM — heavy sync work;
     // push it onto the blocking pool so the async runtime stays responsive.
@@ -988,7 +1008,7 @@ async fn witness_phase(
             .map_err(|e| eyre!("execute_exex_with_block: {e}"))
     })
     .await
-    .map_err(|e| eyre!("witness_phase join: {e}"))??;
+    .map_err(|e| eyre!("build_witness join: {e}"))??;
     let witness_ms = t_witness.elapsed().as_millis() as u64;
 
     let t_ser = Instant::now();
@@ -1004,24 +1024,8 @@ async fn witness_phase(
         }
     };
     let serialize_ms = t_ser.elapsed().as_millis() as u64;
-    let payload_bytes = payload.len() as u64;
 
-    let total_ms = t_total_start.elapsed().as_millis() as u64;
-    info!(
-        block_number,
-        total_ms,
-        fetch_ms,
-        execute_ms,
-        trie_ms,
-        save_ms,
-        witness_ms,
-        serialize_ms,
-        payload_bytes,
-        "Block witness built"
-    );
-    metrics::gauge!(crate::metrics::LAST_BLOCK_WITNESS_BUILT).set(block_number as f64);
-
-    Ok(payload)
+    Ok(BuiltWitness { payload, witness_ms, serialize_ms })
 }
 
 /// Re-witness phase: regenerate the witness for a block already in MDBX.
@@ -1035,11 +1039,16 @@ async fn witness_phase(
 /// Slow path: reads parent state root from MDBX, runs `execute_exex_with_block`
 /// against the existing state, and serializes. Does NOT commit — the block is
 /// already present.
+///
+/// The slow path reads historical state, which fills `changeset_cache` with
+/// trie reverts for every block from `N` to the MDBX tip; it is cleared once
+/// the build returns.
 async fn rewitness_phase(
     fetched: FetchedBlock,
     factory: ProviderFactory<DriverNode>,
     host_executor: Arc<EthHostExecutor>,
     hub: Arc<WitnessHub>,
+    changeset_cache: &ChangesetCache,
 ) -> eyre::Result<Vec<u8>> {
     let block_number = fetched.block_number;
     let fetch_ms = fetched.fetch_ms;
@@ -1068,31 +1077,21 @@ async fn rewitness_phase(
         .ok_or_else(|| eyre!("missing header N-1 during re-witness of block {block_number}"))?
         .state_root;
 
-    let t_witness = Instant::now();
-    let input = tokio::task::spawn_blocking(move || -> eyre::Result<_> {
-        let read_view =
-            BlockchainProvider::new(factory).map_err(|e| eyre!("BlockchainProvider::new: {e}"))?;
-        host_executor
-            .execute_exex_with_block(prim_block, parent_state_root, read_view, None)
-            .map_err(|e| eyre!("execute_exex_with_block (rewitness): {e}"))
+    // Detached so the cache is cleared even when the caller is dropped (an
+    // HTTP client timing out): the blocking trie walk cannot be cancelled and
+    // keeps inserting after that.
+    let changeset_cache = changeset_cache.clone();
+    let built = tokio::spawn(async move {
+        let built =
+            build_witness(block_number, prim_block, parent_state_root, factory, host_executor)
+                .await;
+        changeset_cache.evict(u64::MAX);
+        built
     })
     .await
-    .map_err(|e| eyre!("rewitness_phase join: {e}"))??;
-    let witness_ms = t_witness.elapsed().as_millis() as u64;
-
-    let t_ser = Instant::now();
-    let payload = match tokio::task::spawn_blocking(move || bincode::serialize(&input)).await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(e)) => {
-            error!(block_number, err = %e, "bincode serialize failed (rewitness)");
-            return Err(eyre!("bincode: {e}"));
-        }
-        Err(e) => {
-            error!(block_number, err = %e, "serialize task panicked (rewitness)");
-            return Err(eyre!("serialize task: {e}"));
-        }
-    };
-    let serialize_ms = t_ser.elapsed().as_millis() as u64;
+    .map_err(|e| eyre!("re-witness task join: {e}"))?;
+    let BuiltWitness { payload, witness_ms, serialize_ms } =
+        built.map_err(|e| eyre!("re-witness of block {block_number}: {e}"))?;
 
     info!(
         block_number,
@@ -1120,6 +1119,7 @@ async fn rewitness_phase(
 pub(crate) async fn unwind_to(
     factory: ProviderFactory<DriverNode>,
     hub: Arc<WitnessHub>,
+    changeset_cache: &ChangesetCache,
     target: u64,
 ) -> eyre::Result<()> {
     let mdbx_tip_before =
@@ -1156,6 +1156,8 @@ pub(crate) async fn unwind_to(
     })
     .await
     .map_err(|e| eyre!("unwind: spawn_blocking join: {e}"))??;
+    // The unwind reverts trie tables through the cache, keyed by now-removed block hashes.
+    changeset_cache.evict(u64::MAX);
 
     let mdbx_tip_after = factory
         .best_block_number()
