@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "fluent-stf-primitives"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus 2.1.1",
  "alloy-genesis",
@@ -5411,7 +5411,7 @@ dependencies = [
 
 [[package]]
 name = "l1-rollup-client"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus 2.1.1",
  "alloy-eips 2.1.1",
@@ -5880,7 +5880,7 @@ dependencies = [
 
 [[package]]
 name = "nitro-types"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-primitives",
  "base64 0.22.1",
@@ -7276,7 +7276,7 @@ dependencies = [
 
 [[package]]
 name = "proxy"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-network 2.1.1",
  "alloy-primitives",
@@ -8957,7 +8957,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-blob-builder"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus 2.1.1",
  "alloy-eips 2.1.1",
@@ -8973,7 +8973,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-client-executor"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus 2.1.1",
  "alloy-evm",
@@ -9009,7 +9009,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-host-executor"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus 2.1.1",
  "alloy-network 2.1.1",
@@ -9042,7 +9042,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-mpt"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -9057,7 +9057,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-provider"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-json-rpc 2.1.1",
  "alloy-provider",
@@ -9070,7 +9070,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-rpc-db"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus 2.1.1",
  "alloy-primitives",
@@ -9096,7 +9096,7 @@ dependencies = [
 
 [[package]]
 name = "rsp-witness-db"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-primitives",
  "reth-storage-errors",
@@ -13128,7 +13128,7 @@ dependencies = [
 
 [[package]]
 name = "witness-orchestrator-bin"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "alloy-consensus 2.1.1",
  "alloy-eips 2.1.1",
